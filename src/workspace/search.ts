@@ -1,8 +1,10 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
-import { Workspace } from "./manager.js";
+import { Workspace, WorkspaceError } from "./manager.js";
+import { redactSensitiveText } from "../security/redaction.js";
+import { findBinary } from "../tunnel/detect.js";
 
 export interface SearchOptions {
   query: string;
@@ -23,10 +25,10 @@ export interface SearchResult {
   matchCount: number;
   truncated: boolean;
   engine: "ripgrep" | "node";
+  redactionCount: number;
 }
 
 const RG_CANDIDATES = [
-  "rg",
   "/opt/homebrew/bin/rg",
   "/usr/local/bin/rg",
   "/usr/bin/rg",
@@ -34,24 +36,48 @@ const RG_CANDIDATES = [
   "/Applications/Visual Studio Code.app/Contents/Resources/app/node_modules/@vscode/ripgrep/bin/rg",
 ];
 
+const SEARCH_TIMEOUT_MS = 15_000;
+const MAX_NODE_FILES_SCANNED = 20_000;
+
 let cachedRg: string | null | undefined;
+
+function validatedExecutable(candidate: string): string | null {
+  if (!path.isAbsolute(candidate)) return null;
+  try {
+    const canonical = fs.realpathSync.native(candidate);
+    const components = canonical.split(/[\\/]+/).map((part) => part.toLowerCase());
+    if (components.some((part, index) => part === "node_modules" && components[index + 1] === ".bin")) {
+      return null;
+    }
+    if (!fs.statSync(canonical).isFile()) return null;
+    fs.accessSync(canonical, fs.constants.X_OK);
+    return canonical;
+  } catch {
+    return null;
+  }
+}
+
+function ripgrepEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { RIPGREP_CONFIG_PATH: "" };
+  for (const key of ["SystemRoot", "WINDIR", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL"]) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  return env;
+}
 
 export function findRipgrep(): string | null {
   if (process.env.C2C_DISABLE_RG === "1") return null;
   if (cachedRg !== undefined) return cachedRg;
-  if (process.env.C2C_RG_PATH) {
-    cachedRg = process.env.C2C_RG_PATH;
-    return cachedRg;
+  const onPath = findBinary("rg", { includePath: false });
+  if (onPath) {
+    cachedRg = onPath;
+    return onPath;
   }
   for (const candidate of RG_CANDIDATES) {
-    try {
-      const result = spawnSync(candidate, ["--version"], { stdio: "ignore", timeout: 3000 });
-      if (result.status === 0) {
-        cachedRg = candidate;
-        return candidate;
-      }
-    } catch {
-      // try next candidate
+    const executable = validatedExecutable(candidate);
+    if (executable) {
+      cachedRg = executable;
+      return executable;
     }
   }
   cachedRg = null;
@@ -70,16 +96,27 @@ async function searchWithRipgrep(
   opts: SearchOptions,
   limit: number
 ): Promise<SearchResult> {
-  const args = ["--json", "--max-filesize", "2M", "--max-count", "20"];
+  const args = ["--no-config", "--json", "--max-filesize", "2M", "--max-count", "20"];
   if (!opts.regex) args.push("-F");
   args.push("--smart-case");
   if (opts.glob) args.push("-g", opts.glob);
   args.push("--", opts.query, searchAbs);
 
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(rgBin, args, { cwd: ws.root });
+    const child = spawn(rgBin, args, {
+      cwd: ws.root,
+      env: ripgrepEnv(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stderr.resume();
     const matches: SearchMatch[] = [];
     let truncated = false;
+    let redactionCount = 0;
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+    }, SEARCH_TIMEOUT_MS);
     const rl = readline.createInterface({ input: child.stdout });
     rl.on("line", (line) => {
       if (matches.length >= limit) {
@@ -95,18 +132,32 @@ async function searchWithRipgrep(
         if (event.type !== "match" || !event.data?.path?.text) return;
         const rel = path.relative(ws.root, event.data.path.text).split(path.sep).join("/");
         if (rel.startsWith("..") || ws.ignoreRules.isHidden(rel)) return;
+        const redacted = redactSensitiveText((event.data.lines?.text ?? "").trimEnd().slice(0, 500));
+        redactionCount += redacted.redactionCount;
         matches.push({
           path: rel,
           line: event.data.line_number ?? 0,
-          text: (event.data.lines?.text ?? "").trimEnd().slice(0, 500),
+          text: redacted.text,
         });
       } catch {
         // ignore malformed json lines
       }
     });
-    child.on("error", reject);
-    child.on("close", () => {
-      resolvePromise({ matches, matchCount: matches.length, truncated, engine: "ripgrep" });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      if (timedOut) {
+        reject(new Error("ripgrep search exceeded the local time limit"));
+        return;
+      }
+      if (!truncated && code !== 0 && code !== 1 && signal === null) {
+        reject(new Error(`ripgrep failed with exit code ${code}`));
+        return;
+      }
+      resolvePromise({ matches, matchCount: matches.length, truncated, engine: "ripgrep", redactionCount });
     });
   });
 }
@@ -122,9 +173,15 @@ async function searchWithNode(
   const globRegex = opts.glob ? globToRegex(opts.glob) : null;
   const matches: SearchMatch[] = [];
   let truncated = false;
+  let redactionCount = 0;
+  let scannedFiles = 0;
+  const deadline = Date.now() + SEARCH_TIMEOUT_MS;
 
   const walk = async (dirAbs: string, dirRel: string): Promise<void> => {
-    if (truncated) return;
+    if (truncated || Date.now() > deadline || scannedFiles >= MAX_NODE_FILES_SCANNED) {
+      truncated = true;
+      return;
+    }
     let entries: fs.Dirent[];
     try {
       entries = await fs.promises.readdir(dirAbs, { withFileTypes: true });
@@ -139,6 +196,11 @@ async function searchWithNode(
       if (entry.isDirectory()) {
         await walk(childAbs, childRel);
       } else if (entry.isFile()) {
+        scannedFiles++;
+        if (scannedFiles > MAX_NODE_FILES_SCANNED || Date.now() > deadline) {
+          truncated = true;
+          return;
+        }
         if (globRegex && !globRegex.test(childRel)) continue;
         let stat: fs.Stats;
         try {
@@ -159,7 +221,9 @@ async function searchWithNode(
           const line = lines[i];
           const hit = matcher ? matcher.test(line) : line.toLowerCase().includes(needle);
           if (hit) {
-            matches.push({ path: childRel, line: i + 1, text: line.trimEnd().slice(0, 500) });
+            const redacted = redactSensitiveText(line.trimEnd().slice(0, 500));
+            redactionCount += redacted.redactionCount;
+            matches.push({ path: childRel, line: i + 1, text: redacted.text });
             if (matches.length >= limit) {
               truncated = true;
               return;
@@ -172,7 +236,7 @@ async function searchWithNode(
 
   const startRel = path.relative(ws.root, searchAbs).split(path.sep).join("/");
   await walk(searchAbs, startRel === "" ? "" : startRel);
-  return { matches, matchCount: matches.length, truncated, engine: "node" };
+  return { matches, matchCount: matches.length, truncated, engine: "node", redactionCount };
 }
 
 function globToRegex(glob: string): RegExp {
@@ -187,7 +251,7 @@ function globToRegex(glob: string): RegExp {
 
 export async function searchWorkspace(ws: Workspace, opts: SearchOptions): Promise<SearchResult> {
   if (!opts.query || opts.query.length < 2) {
-    return { matches: [], matchCount: 0, truncated: false, engine: "node" };
+    return { matches: [], matchCount: 0, truncated: false, engine: "node", redactionCount: 0 };
   }
   const limit = Math.min(200, Math.max(1, Math.floor(opts.limit ?? 50)));
   const { abs } = ws.resolve(opts.path ?? ".");
@@ -195,9 +259,16 @@ export async function searchWorkspace(ws: Workspace, opts: SearchOptions): Promi
   if (rg) {
     try {
       return await searchWithRipgrep(ws, rg, abs, opts, limit);
-    } catch {
+    } catch (error) {
+      if (opts.regex) throw error;
       // fall through to node engine
     }
+  }
+  if (opts.regex) {
+    throw new WorkspaceError(
+      "UNSUPPORTED_REGEX",
+      "Regex search requires ripgrep; refusing unsafe JavaScript-regex fallback."
+    );
   }
   return searchWithNode(ws, abs, opts, limit);
 }

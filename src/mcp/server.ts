@@ -28,9 +28,10 @@ function fail(code: string, message: string): ToolResult {
   };
 }
 
-function mapError(error: unknown): ToolResult {
+function mapError(error: unknown, logger: Logger): ToolResult {
   if (error instanceof WorkspaceError) return fail(error.code, error.message);
-  return fail("INTERNAL_ERROR", error instanceof Error ? error.message : String(error));
+  logger.error("MCP tool failed", { message: error instanceof Error ? error.message : String(error) });
+  return fail("INTERNAL_ERROR", "The local operation failed. Inspect the bridge logs for details.");
 }
 
 function requireScope(authInfo: AuthInfo | undefined, scope: string): ToolResult | null {
@@ -83,7 +84,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
           },
         });
       } catch (error) {
-        return mapError(error);
+        return mapError(error, ctx.logger);
       }
     }
   );
@@ -96,10 +97,10 @@ export function createMcpServer(ctx: McpContext): McpServer {
         `List files and directories under a workspace-relative path. High-noise directories ` +
         `(node_modules, .git, build output) are omitted. Supports pagination. ${UNTRUSTED_NOTE}`,
       inputSchema: {
-        path: z.string().default(".").describe("Workspace-relative path, e.g. 'src'"),
+        path: z.string().max(4096).default(".").describe("Workspace-relative path, e.g. 'src'"),
         depth: z.number().int().min(1).max(4).default(1).describe("Recursion depth (1-4)"),
         limit: z.number().int().min(1).max(1000).default(200),
-        offset: z.number().int().min(0).default(0),
+        offset: z.number().int().min(0).max(10_000).default(0),
       },
       annotations: { readOnlyHint: true },
     },
@@ -109,7 +110,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
       try {
         return ok(await workspace.listDirectory(args.path, args));
       } catch (error) {
-        return mapError(error);
+        return mapError(error, ctx.logger);
       }
     }
   );
@@ -120,10 +121,10 @@ export function createMcpServer(ctx: McpContext): McpServer {
       title: "Read file",
       description:
         `Read a text file from the workspace with line-range pagination. Defaults to the first ` +
-        `400 lines; use start_line/end_line to page through large files. Sensitive files ` +
-        `(.env, keys, credentials) are always denied. ${UNTRUSTED_NOTE}`,
+        `400 lines; use start_line/end_line to page through large files. Sensitive paths are ` +
+        `always denied and credential-shaped values are redacted. ${UNTRUSTED_NOTE}`,
       inputSchema: {
-        path: z.string().describe("Workspace-relative file path"),
+        path: z.string().min(1).max(4096).describe("Workspace-relative file path"),
         start_line: z.number().int().min(1).optional().describe("1-based first line to return"),
         end_line: z.number().int().min(1).optional().describe("1-based last line to return"),
       },
@@ -135,7 +136,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
       try {
         return ok(await workspace.readFile(args.path, { startLine: args.start_line, endLine: args.end_line }));
       } catch (error) {
-        return mapError(error);
+        return mapError(error, ctx.logger);
       }
     }
   );
@@ -148,9 +149,9 @@ export function createMcpServer(ctx: McpContext): McpServer {
         `Search file contents across the workspace (ripgrep when available). Returns matching ` +
         `lines with file paths and line numbers. ${UNTRUSTED_NOTE}`,
       inputSchema: {
-        query: z.string().min(2).describe("Text to search for (literal by default)"),
-        path: z.string().optional().describe("Restrict search to this workspace-relative path"),
-        glob: z.string().optional().describe("Filename glob filter, e.g. '*.ts'"),
+        query: z.string().min(2).max(512).describe("Text to search for (literal by default)"),
+        path: z.string().max(4096).optional().describe("Restrict search to this workspace-relative path"),
+        glob: z.string().max(256).optional().describe("Filename glob filter, e.g. '*.ts'"),
         limit: z.number().int().min(1).max(200).default(50),
         regex: z.boolean().default(false).describe("Treat query as a regular expression"),
       },
@@ -162,7 +163,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
       try {
         return ok(await searchWorkspace(workspace, args));
       } catch (error) {
-        return mapError(error);
+        return mapError(error, ctx.logger);
       }
     }
   );
@@ -181,7 +182,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
       try {
         return ok(gitStatus(workspace.root));
       } catch (error) {
-        return mapError(error);
+        return mapError(error, ctx.logger);
       }
     }
   );
@@ -192,11 +193,12 @@ export function createMcpServer(ctx: McpContext): McpServer {
       title: "Git diff",
       description:
         `Git diff with byte-offset pagination. mode: 'unstaged' (default), 'staged', or 'head' ` +
-        `(working tree vs HEAD). When has_more is true, call again with offset=next_offset. ${UNTRUSTED_NOTE}`,
+        `(working tree vs HEAD). Sensitive paths are omitted and credential-shaped values are ` +
+        `redacted. When has_more is true, call again with offset=next_offset. ${UNTRUSTED_NOTE}`,
       inputSchema: {
         mode: z.enum(["unstaged", "staged", "head"]).default("unstaged"),
-        path: z.string().optional().describe("Limit the diff to one workspace-relative path"),
-        offset: z.number().int().min(0).default(0).describe("Byte offset for pagination"),
+        path: z.string().max(4096).optional().describe("Limit the diff to one workspace-relative path"),
+        offset: z.number().int().min(0).max(16 * 1024 * 1024).default(0).describe("Byte offset for pagination"),
         max_bytes: z.number().int().min(1024).max(262144).default(65536),
       },
       annotations: { readOnlyHint: true },
@@ -217,7 +219,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
           )
         );
       } catch (error) {
-        return mapError(error);
+        return mapError(error, ctx.logger);
       }
     }
   );

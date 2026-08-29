@@ -1,12 +1,33 @@
 {
   "name": "codex-with-chatgpt",
-  "version": "0.1.0",
-  "description": "ChatGPT thinks. Codex works. Use ChatGPT as the planning brain while keeping the Codex harness.",
+  "version": "0.2.0-hardened.1",
+  "description": "A consent-driven, read-only MCP bridge between ChatGPT planning and Codex execution.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/OPP-studio-macchino/codex-with-chatgpt.git"
+  },
+  "bugs": {
+    "url": "https://github.com/OPP-studio-macchino/codex-with-chatgpt/security/advisories/new"
+  },
+  "homepage": "https://github.com/OPP-studio-macchino/codex-with-chatgpt#readme",
   "bin": {
     "c2c": "./bin/c2c.js"
   },
+  "files": [
+    "bin/",
+    "dist/",
+    "docs/",
+    "examples/",
+    "skill/",
+    "README.md",
+    "README.ja.md",
+    "README.zh-CN.md",
+    "SECURITY.md",
+    "scripts/validate-skill.mjs",
+    "LICENSE"
+  ],
   "engines": {
     "node": ">=20"
   },
@@ -15,21 +36,22 @@
     "dev": "tsx src/cli/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "validate:skill": "node scripts/validate-skill.mjs"
   },
-  "packageManager": "pnpm@11.24.0",
+  "packageManager": "pnpm@10.34.5",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "latest",
-    "commander": "^14.0.0",
-    "express": "^5.1.0",
-    "ignore": "^7.0.5",
-    "zod": "^3.25.0"
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "commander": "14.0.3",
+    "express": "5.2.1",
+    "ignore": "7.0.6",
+    "zod": "3.25.76"
   },
   "devDependencies": {
-    "@types/express": "^5.0.3",
-    "@types/node": "^22.15.0",
-    "tsx": "^4.20.0",
-    "typescript": "^5.9.0",
-    "vitest": "^3.2.0"
+    "@types/express": "5.0.6",
+    "@types/node": "22.20.1",
+    "tsx": "4.23.12",
+    "typescript": "5.9.3",
+    "vitest": "3.2.7"
   }
 }

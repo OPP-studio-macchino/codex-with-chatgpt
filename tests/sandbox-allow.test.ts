@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   ensureSandboxAllowlist,
+  inspectSandboxAllowlist,
   isStateDirAllowlisted,
   pathsEquivalent,
   toTomlPath,
@@ -50,6 +51,43 @@ describe("sandbox allowlist", () => {
     expect(next).toContain('trust_level = "trusted"');
     expect(next).toContain("[sandbox_workspace_write]");
     expect(next).toContain('writable_roots = ["/Users/ada/Library/Application Support/codex-with-chatgpt"]');
+  });
+
+  it("inspects without creating or changing the config file", () => {
+    const dir = makeTmpDir("sandbox-inspect");
+    const stateDir = path.join(dir, "state");
+    const configPath = path.join(dir, "missing", "config.toml");
+    const result = inspectSandboxAllowlist({ configPath, stateDir });
+    expect(result.configExists).toBe(false);
+    expect(result.alreadyAllowed).toBe(false);
+    expect(fs.existsSync(configPath)).toBe(false);
+    cleanup(dir);
+  });
+
+  it("creates an owner-only recovery backup before changing an existing config", () => {
+    const dir = makeTmpDir("sandbox-backup");
+    const stateDir = path.join(dir, "state");
+    const configPath = path.join(dir, "config.toml");
+    const original = 'model = "gpt-5.6-luna"\n';
+    fs.writeFileSync(configPath, original);
+    const result = ensureSandboxAllowlist({ configPath, stateDir });
+    expect(result.backupPath).toBe(`${configPath}.c2c-backup`);
+    expect(fs.readFileSync(result.backupPath!, "utf8")).toBe(original);
+    if (process.platform !== "win32") expect(fs.statSync(result.backupPath!).mode & 0o077).toBe(0);
+    cleanup(dir);
+  });
+
+  it("refuses to replace a symlinked global config", () => {
+    const dir = makeTmpDir("sandbox-symlink");
+    const target = path.join(dir, "target.toml");
+    const configPath = path.join(dir, "config.toml");
+    fs.writeFileSync(target, 'model = "gpt-5.6-luna"\n');
+    fs.symlinkSync(target, configPath);
+    expect(() => ensureSandboxAllowlist({ configPath, stateDir: path.join(dir, "state") })).toThrow(
+      /symlinked/
+    );
+    expect(fs.readFileSync(target, "utf8")).toBe('model = "gpt-5.6-luna"\n');
+    cleanup(dir);
   });
 
   it("inserts writable_roots into an existing empty table", () => {

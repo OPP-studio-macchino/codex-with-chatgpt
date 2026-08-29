@@ -107,6 +107,22 @@ describe("discovery metadata", () => {
     expect(body.grant_types_supported).toEqual(["authorization_code", "refresh_token"]);
     expect(body.registration_endpoint).toContain("/oauth/register");
   });
+
+  it("does not trust the inbound Host header when constructing metadata", async () => {
+    const response = await fetch(`${base}/.well-known/oauth-authorization-server`, {
+      headers: { Host: "attacker.example" },
+    });
+    const body = (await response.json()) as { issuer: string };
+    expect(body.issuer).toBe(base);
+    expect(body.issuer).not.toContain("attacker.example");
+  });
+
+  it("sets no-store, anti-sniffing, and framing protections", async () => {
+    const response = await fetch(`${base}/.well-known/oauth-authorization-server`);
+    expect(response.headers.get("cache-control")).toContain("no-store");
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(response.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+  });
 });
 
 describe("authorization + token flow", () => {
@@ -184,6 +200,28 @@ describe("authorization + token flow", () => {
     expect(response.headers.get("location")).toContain("error=invalid_request");
   });
 
+  it("rejects repeated or non-string OAuth parameters", async () => {
+    const clientId = await registerClient();
+    const { challenge } = pkceVerifierAndChallenge();
+    const authorizeUrl = new URL(`${base}/oauth/authorize`);
+    authorizeUrl.searchParams.set("client_id", clientId);
+    authorizeUrl.searchParams.set("redirect_uri", REDIRECT_URI);
+    authorizeUrl.searchParams.set("response_type", "code");
+    authorizeUrl.searchParams.set("code_challenge", challenge);
+    authorizeUrl.searchParams.set("code_challenge_method", "S256");
+    authorizeUrl.searchParams.append("state", "one");
+    authorizeUrl.searchParams.append("state", "two");
+    expect((await fetch(authorizeUrl, { redirect: "manual" })).status).toBe(400);
+
+    const tokenResponse = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ grant_type: ["refresh_token"], client_id: clientId }),
+    });
+    expect(tokenResponse.status).toBe(400);
+    expect(((await tokenResponse.json()) as { error: string }).error).toBe("invalid_request");
+  });
+
   it("rejects registration with non-https redirect uris", async () => {
     const response = await fetch(`${base}/oauth/register`, {
       method: "POST",
@@ -191,6 +229,87 @@ describe("authorization + token flow", () => {
       body: JSON.stringify({ redirect_uris: ["http://evil.example.com/cb"] }),
     });
     expect(response.status).toBe(400);
+  });
+
+  it("rejects redirect URIs with credentials, fragments, or duplicates", async () => {
+    for (const redirectUris of [
+      ["https://user:password@example.com/callback"],
+      ["https://example.com/callback#fragment"],
+      ["https://example.com/callback", "https://example.com/callback"],
+    ]) {
+      const response = await fetch(`${base}/oauth/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ redirect_uris: redirectUris }),
+      });
+      expect(response.status).toBe(400);
+    }
+  });
+
+  it("rejects unknown scopes and a mismatched resource", async () => {
+    const clientId = await registerClient();
+    const { challenge } = pkceVerifierAndChallenge();
+    const makeUrl = (scope: string, resource?: string): URL => {
+      const url = new URL(`${base}/oauth/authorize`);
+      url.searchParams.set("client_id", clientId);
+      url.searchParams.set("redirect_uri", REDIRECT_URI);
+      url.searchParams.set("response_type", "code");
+      url.searchParams.set("code_challenge", challenge);
+      url.searchParams.set("code_challenge_method", "S256");
+      url.searchParams.set("scope", scope);
+      if (resource) url.searchParams.set("resource", resource);
+      return url;
+    };
+
+    const unknown = await fetch(makeUrl("workspace.read admin.write"), { redirect: "manual" });
+    expect(unknown.status).toBe(302);
+    expect(unknown.headers.get("location")).toContain("error=invalid_scope");
+
+    const wrongResource = await fetch(makeUrl("workspace.read", "https://attacker.example/mcp"), {
+      redirect: "manual",
+    });
+    expect(wrongResource.status).toBe(302);
+    expect(wrongResource.headers.get("location")).toContain("error=invalid_target");
+  });
+
+  it("escapes untrusted client and workspace labels on the pairing page", async () => {
+    const response = await fetch(`${base}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ client_name: '<script>alert("x")</script>', redirect_uris: [REDIRECT_URI] }),
+    });
+    expect(response.status).toBe(201);
+    const { client_id: clientId } = (await response.json()) as { client_id: string };
+    const { challenge } = pkceVerifierAndChallenge();
+    const url = new URL(`${base}/oauth/authorize`);
+    url.searchParams.set("client_id", clientId);
+    url.searchParams.set("redirect_uri", REDIRECT_URI);
+    url.searchParams.set("response_type", "code");
+    url.searchParams.set("code_challenge", challenge);
+    url.searchParams.set("code_challenge_method", "S256");
+    const page = await (await fetch(url)).text();
+    expect(page).not.toContain('<script>alert("x")</script>');
+    expect(page).toContain("&lt;script&gt;");
+    expect(page).toContain("OAuth callback");
+  });
+
+  it("requires redirect_uri again at the token endpoint", async () => {
+    const clientId = await registerClient();
+    const { verifier, challenge } = pkceVerifierAndChallenge();
+    const pairing = bridge.pairing.create();
+    const { code } = await authorizeWithPairing(clientId, challenge, pairing.code);
+    const response = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: code!,
+        code_verifier: verifier,
+        client_id: clientId,
+      }),
+    });
+    expect(response.status).toBe(400);
+    expect(((await response.json()) as { error: string }).error).toBe("invalid_grant");
   });
 });
 
@@ -210,6 +329,12 @@ describe("token enforcement on /mcp", () => {
     const response = await mcpCall();
     expect(response.status).toBe(401);
     expect(response.headers.get("www-authenticate")).toContain("resource_metadata");
+  });
+
+  it("allows only POST on the MCP endpoint", async () => {
+    const response = await fetch(`${base}/mcp`, { method: "GET" });
+    expect(response.status).toBe(405);
+    expect(response.headers.get("allow")).toBeNull();
   });
 
   it("401 with an invalid token", async () => {

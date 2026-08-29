@@ -9,35 +9,35 @@ importers:
   .:
     dependencies:
       '@modelcontextprotocol/sdk':
-        specifier: latest
+        specifier: 1.30.0
         version: 1.30.0(zod@3.25.76)
       commander:
-        specifier: ^14.0.0
+        specifier: 14.0.3
         version: 14.0.3
       express:
-        specifier: ^5.1.0
+        specifier: 5.2.1
         version: 5.2.1
       ignore:
-        specifier: ^7.0.5
+        specifier: 7.0.6
         version: 7.0.6
       zod:
-        specifier: ^3.25.0
+        specifier: 3.25.76
         version: 3.25.76
     devDependencies:
       '@types/express':
-        specifier: ^5.0.3
+        specifier: 5.0.6
         version: 5.0.6
       '@types/node':
-        specifier: ^22.15.0
+        specifier: 22.20.1
         version: 22.20.1
       tsx:
-        specifier: ^4.20.0
+        specifier: 4.23.12
         version: 4.23.12
       typescript:
-        specifier: ^5.9.0
+        specifier: 5.9.3
         version: 5.9.3
       vitest:
-        specifier: ^3.2.0
+        specifier: 3.2.7
         version: 3.2.7(@types/node@22.20.1)(tsx@4.23.12)
 
 packages:

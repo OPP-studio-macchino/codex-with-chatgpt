@@ -1,18 +1,35 @@
 import { Command } from "commander";
 import fs from "node:fs";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { startBridge } from "../bridge/server.js";
-import { findLiveBridge, probeBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
+import { findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
 import { adminFetch, ensureBridge, stopBridge } from "../process/daemon.js";
 import { Workspace } from "../workspace/manager.js";
 import { AuthStore } from "../auth/store.js";
 import { appendExecutionRecord } from "../execution/records.js";
 import { detectTunnelBinaries } from "../tunnel/detect.js";
-import { Logger } from "../logger/index.js";
-import { getStateDir } from "../config/paths.js";
-import { ensureSandboxAllowlist, getCodexConfigPath, isStateDirAllowlisted } from "../config/sandbox-allow.js";
+import { Logger, redact } from "../logger/index.js";
+import { getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
+import {
+  normalizeChatGptSessionUrl,
+  readSavedSession,
+  sanitizeSessionLabel,
+  sessionFile,
+  type SavedSession,
+} from "../config/session.js";
+import { assertTransportCompatible, selectedTransport } from "../config/transport.js";
+import { runGit as runWorkspaceGit } from "../workspace/git.js";
+import {
+  hasValidTrustedTunnelToken,
+  TRUSTED_TUNNEL_HEADER,
+  removeTrustedTunnelToken,
+  trustedTunnelTokenFile,
+} from "../auth/trusted-tunnel.js";
+import {
+  ensureSandboxAllowlist,
+  inspectSandboxAllowlist,
+} from "../config/sandbox-allow.js";
 import {
   CHATGPT_CREATE_CONNECTOR_URL,
   CHATGPT_DEVELOPER_MODE_URL,
@@ -65,7 +82,14 @@ function persistWorkspaceEndpoint(opts: {
 }
 
 function trySandboxAllow():
-  | { ok: true; added: boolean; alreadyAllowed: boolean; stateDir: string; configPath: string }
+  | {
+      ok: true;
+      added: boolean;
+      alreadyAllowed: boolean;
+      stateDir: string;
+      configPath: string;
+      backupPath?: string;
+    }
   | { ok: false; added: false; alreadyAllowed: false; error: string } {
   try {
     const result = ensureSandboxAllowlist();
@@ -86,6 +110,11 @@ interface PairingResponse {
   expiresAt: number;
 }
 
+interface RevokeResponse {
+  revoked: number;
+  trustedTunnelRevoked: boolean;
+}
+
 interface AdminInfo {
   workspaceId: string;
   workspaceName: string;
@@ -95,18 +124,32 @@ interface AdminInfo {
   tunnel: { running: boolean; url: string | null; provider: string };
   tokenCount: number;
   pairingActive: boolean;
+  trustedTunnelAuth: boolean;
+  trustedTunnelTokenPresent: boolean;
   pid: number;
   startedAt: string;
 }
 
 async function ensureBridgeAndTunnel(
   workspaceRoot: string,
-  opts: { tunnel: boolean }
-): Promise<{ runtime: RuntimeState; info: AdminInfo; mcpUrl: string | null }> {
-  const { runtime } = await ensureBridge(workspaceRoot);
+  opts: { cloudflareQuickTunnel: boolean; externalBaseUrl?: string; openaiSecureTunnel: boolean }
+): Promise<{
+  runtime: RuntimeState;
+  info: AdminInfo;
+  mcpUrl: string | null;
+  localMcpUrl: string;
+  trustedTunnelTokenFile: string | null;
+}> {
+  const requestedTransport = selectedTransport(opts);
+  const { runtime } = await ensureBridge(workspaceRoot, {
+    externalBaseUrl: opts.externalBaseUrl,
+    trustedTunnelAuth: opts.openaiSecureTunnel,
+  });
   let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
+  assertTransportCompatible(info, requestedTransport);
+  const localMcpUrl = `http://127.0.0.1:${runtime.port}/mcp`;
   let mcpUrl: string | null = info.publicUrl ? `${info.publicUrl}/mcp` : null;
-  if (opts.tunnel && !info.publicUrl) {
+  if (opts.cloudflareQuickTunnel && !info.publicUrl) {
     const binaries = detectTunnelBinaries();
     if (!binaries.cloudflared) {
       throw new Error(
@@ -118,7 +161,13 @@ async function ensureBridgeAndTunnel(
     info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
     mcpUrl = `${result.url}/mcp`;
   }
-  return { runtime, info, mcpUrl };
+  return {
+    runtime,
+    info,
+    mcpUrl,
+    localMcpUrl,
+    trustedTunnelTokenFile: opts.openaiSecureTunnel ? trustedTunnelTokenFile(info.workspaceId) : null,
+  };
 }
 
 program
@@ -134,11 +183,22 @@ program
   .description("Run the bridge in the foreground (internal)")
   .requiredOption("--workspace <path>")
   .option("--port <port>", "preferred port")
-  .action(async (opts: { workspace: string; port?: string }) => {
-    const logger = new Logger({ name: "bridge", console: true });
+  .option("--external-base-url <url>", "managed tunnel HTTPS origin")
+  .option("--trusted-tunnel-token-file <path>", "owner-only tunnel token file")
+  .action(async (opts: {
+    workspace: string;
+    port?: string;
+    externalBaseUrl?: string;
+    trustedTunnelTokenFile?: string;
+  }) => {
+    const workspaceRoot = resolveWorkspace(opts.workspace);
+    const workspace = new Workspace(workspaceRoot);
+    const logger = new Logger({ name: `bridge-${workspace.id}`, console: process.env.C2C_DAEMON !== "1" });
     const bridge = await startBridge({
-      workspaceRoot: resolveWorkspace(opts.workspace),
+      workspaceRoot,
       port: opts.port ? parseInt(opts.port, 10) : undefined,
+      externalBaseUrl: opts.externalBaseUrl,
+      trustedTunnelTokenFile: opts.trustedTunnelTokenFile,
       logger,
     });
     const shutdown = (): void => {
@@ -155,12 +215,21 @@ program
   .command("start")
   .description("Start (or reuse) the bridge for this workspace")
   .option("-w, --workspace <path>", "workspace root (defaults to current directory)")
-  .option("--tunnel", "also establish the secure public connection", false)
+  .option("--cloudflare-quick-tunnel", "explicitly expose through a temporary public Cloudflare URL", false)
+  .option("--openai-secure-tunnel", "prepare local authentication for OpenAI Secure MCP Tunnel", false)
+  .option("--external-base-url <url>", "HTTPS origin provided by a managed tunnel")
   .option("--json", "machine-readable output", false)
-  .action(async (opts: { workspace?: string; tunnel: boolean; json: boolean }) => {
+  .action(async (opts: {
+    workspace?: string;
+    cloudflareQuickTunnel: boolean;
+    openaiSecureTunnel: boolean;
+    externalBaseUrl?: string;
+    json: boolean;
+  }) => {
     const root = resolveWorkspace(opts.workspace);
     try {
-      const { runtime, info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
+      const { runtime, info, mcpUrl, localMcpUrl, trustedTunnelTokenFile: tokenFile } =
+        await ensureBridgeAndTunnel(root, opts);
       const connectorName = mcpUrl
         ? persistWorkspaceEndpoint({
             workspaceId: info.workspaceId,
@@ -171,12 +240,25 @@ program
           })
         : readLastEndpoint(info.workspaceId)?.connectorName;
       if (opts.json) {
-        say(JSON.stringify({ ok: true, port: runtime.port, workspaceId: info.workspaceId, mcpUrl, connectorName }));
+        say(
+          JSON.stringify({
+            ok: true,
+            port: runtime.port,
+            workspaceId: info.workspaceId,
+            transport: selectedTransport(opts),
+            mcpUrl,
+            localMcpUrl,
+            connectorName,
+            trustedTunnelHeader: tokenFile ? TRUSTED_TUNNEL_HEADER : null,
+            trustedTunnelTokenFile: tokenFile,
+          })
+        );
         return;
       }
       check(`当前项目已识别（${info.workspaceName}）`);
       check("Workspace Bridge 已启动");
-      if (mcpUrl) check("安全连接已建立");
+      if (mcpUrl) check("リモート接続先を設定しました");
+      if (tokenFile) check("OpenAI Secure MCP Tunnel 用のローカル認証を準備しました");
     } catch (error) {
       handleCliError(error, opts.json);
     }
@@ -186,11 +268,19 @@ program
 
 program
   .command("setup")
-  .description("First-time setup: bridge + secure connection + pairing code")
+  .description("Prepare a local bridge; every remote transport is explicit")
   .option("-w, --workspace <path>")
-  .option("--no-tunnel", "local-only setup (development)")
+  .option("--cloudflare-quick-tunnel", "explicitly expose through a temporary public Cloudflare URL", false)
+  .option("--openai-secure-tunnel", "prepare local authentication for OpenAI Secure MCP Tunnel", false)
+  .option("--external-base-url <url>", "HTTPS origin provided by a managed tunnel")
   .option("--json", "machine-readable output", false)
-  .action(async (opts: { workspace?: string; tunnel: boolean; json: boolean }) => {
+  .action(async (opts: {
+    workspace?: string;
+    cloudflareQuickTunnel: boolean;
+    openaiSecureTunnel: boolean;
+    externalBaseUrl?: string;
+    json: boolean;
+  }) => {
     const root = resolveWorkspace(opts.workspace);
     try {
       if (!opts.json) {
@@ -199,8 +289,8 @@ program
         say("正在连接 ChatGPT…");
         say("");
       }
-      const sandbox = trySandboxAllow();
-      const { runtime, info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
+      const { runtime, info, mcpUrl, localMcpUrl, trustedTunnelTokenFile: tokenFile } =
+        await ensureBridgeAndTunnel(root, opts);
       const connectorName = mcpUrl
         ? persistWorkspaceEndpoint({
             workspaceId: info.workspaceId,
@@ -215,7 +305,9 @@ program
             previousName: readLastEndpoint(info.workspaceId)?.connectorName,
             hadEndpointBefore: Boolean(readLastEndpoint(info.workspaceId)),
           });
-      const pairingResult = await adminFetch<PairingResponse>(runtime, "POST", "/admin/pairing");
+      const pairingResult = mcpUrl && !opts.openaiSecureTunnel
+        ? await adminFetch<PairingResponse>(runtime, "POST", "/admin/pairing")
+        : null;
       if (opts.json) {
         say(
           JSON.stringify({
@@ -223,24 +315,40 @@ program
             workspaceId: info.workspaceId,
             workspaceName: info.workspaceName,
             connectorName,
-            mcpUrl: mcpUrl ?? `http://127.0.0.1:${runtime.port}/mcp`,
-            local: mcpUrl === null,
-            pairingCode: pairingResult.code,
-            pairingExpiresAt: pairingResult.expiresAt,
-            sandbox,
+            mcpUrl,
+            localMcpUrl,
+            local: mcpUrl === null && !opts.openaiSecureTunnel,
+            transport: selectedTransport(opts),
+            pairingCode: pairingResult?.code ?? null,
+            pairingExpiresAt: pairingResult?.expiresAt ?? null,
+            trustedTunnelHeader: tokenFile ? TRUSTED_TUNNEL_HEADER : null,
+            trustedTunnelTokenFile: tokenFile,
+            sandboxModified: false,
           })
         );
         return;
       }
       check(`当前项目已识别（${info.workspaceName}）`);
       check("Workspace Bridge 已启动");
-      if (mcpUrl) check("安全连接已建立");
+      if (mcpUrl) check("リモート接続先を設定しました");
+      if (tokenFile) check("OpenAI Secure MCP Tunnel 用のローカル認証を準備しました");
       say("");
-      say(`连接地址：${mcpUrl ?? `http://127.0.0.1:${runtime.port}/mcp`}`);
-      say(`配对码：${pairingResult.code}（${Math.round((pairingResult.expiresAt - Date.now()) / 60000)} 分钟内有效）`);
+      say(`ローカル MCP：${localMcpUrl}`);
+      if (mcpUrl) say(`公開 MCP：${mcpUrl}`);
+      if (pairingResult) {
+        say(`配对码：${pairingResult.code}（${Math.round((pairingResult.expiresAt - Date.now()) / 60000)} 分钟内有效）`);
+      }
+      if (tokenFile) {
+        say(`トンネル固定ヘッダー：${TRUSTED_TUNNEL_HEADER}（値は ${tokenFile} を file: 参照）`);
+      }
       say("");
-      say("下一步：在 ChatGPT 的连接器设置中添加以上地址（OAuth），并在授权页输入配对码。");
-      say("如果你在使用 Codex Skill，这一步会自动完成。");
+      say(
+        tokenFile
+          ? "次に、公式 tunnel-client をこのローカル MCP と固定ヘッダーへ設定し、ChatGPT では Tunnel 接続を選択します。"
+          : mcpUrl
+            ? "下一步：在 ChatGPT 的连接器设置中添加以上地址（OAuth），并在授权页输入配对码。"
+            : "ローカル限定で準備しました。ChatGPT 接続は未作成です。リモート接続には方式の明示選択が必要です。"
+      );
     } catch (error) {
       handleCliError(error, opts.json);
     }
@@ -262,15 +370,26 @@ program
   .command("restart")
   .description("Restart the bridge for this workspace")
   .option("-w, --workspace <path>")
-  .option("--tunnel", "re-establish the secure public connection", false)
-  .action(async (opts: { workspace?: string; tunnel: boolean }) => {
+  .option("--cloudflare-quick-tunnel", "explicitly expose through a temporary public Cloudflare URL", false)
+  .option("--openai-secure-tunnel", "prepare local authentication for OpenAI Secure MCP Tunnel", false)
+  .option("--external-base-url <url>", "HTTPS origin provided by a managed tunnel")
+  .action(async (opts: {
+    workspace?: string;
+    cloudflareQuickTunnel: boolean;
+    openaiSecureTunnel: boolean;
+    externalBaseUrl?: string;
+  }) => {
     const root = resolveWorkspace(opts.workspace);
+    // Validate mutually exclusive transport intent before stopping a healthy
+    // process. A malformed restart request must be non-destructive.
+    selectedTransport(opts);
     await stopBridge(root);
     await new Promise((resolve) => setTimeout(resolve, 500));
     try {
-      const { info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
+      const { info, mcpUrl, trustedTunnelTokenFile: tokenFile } = await ensureBridgeAndTunnel(root, opts);
       check(`Bridge 已重启（${info.workspaceName}）`);
-      if (mcpUrl) check(`安全连接已建立`);
+      if (mcpUrl) check("明示的に選択した外部 HTTPS 接続を設定しました");
+      if (tokenFile) check("OpenAI Secure MCP Tunnel 用のローカル認証を準備しました");
     } catch (error) {
       handleCliError(error, false);
     }
@@ -301,18 +420,30 @@ program
     say("");
     check(`Workspace：${info.workspaceName}`);
     check(`Bridge：运行中（端口 ${info.port}）`);
-    if (info.tunnel.running && info.tunnel.url) check(`安全连接：${info.tunnel.url}/mcp`);
-    else say("· 安全连接：未启用（本地模式）");
-    say(`· 已授权连接：${info.tokenCount > 0 ? "是" : "否"}`);
+    if (info.tunnel.running && info.tunnel.url) {
+      check(`Cloudflare Quick Tunnel（公開）：${info.tunnel.url}/mcp`);
+    } else if (info.publicUrl) {
+      check(`管理対象の外部 HTTPS 接続：${info.publicUrl}/mcp`);
+    } else if (info.trustedTunnelAuth) {
+      if (info.trustedTunnelTokenPresent) {
+        check("OpenAI Secure MCP Tunnel：ローカル固定ヘッダー認証を準備済み");
+        say("· tunnel-client / ChatGPT 側の到達性はこのコマンドでは未検証");
+      } else {
+        cross("OpenAI Secure MCP Tunnel：ローカル資格情報は失効済みまたは欠落");
+      }
+    } else {
+      say("· リモート接続：未設定（ローカルのみ）");
+    }
+    say(`· OAuth 令牌：${info.tokenCount > 0 ? "已授权" : "无"}`);
   });
 
 // ---------------------------------------------------------------- doctor
 
 program
   .command("doctor")
-  .description("Diagnose and auto-repair the connection")
+  .description("Diagnose the connection; local bridge repair is opt-in")
   .option("-w, --workspace <path>")
-  .option("--no-fix", "diagnose only, do not repair")
+  .option("--fix", "start a missing local bridge; never opens a public tunnel", false)
   .option("--json", "machine-readable output", false)
   .action(async (opts: { workspace?: string; fix: boolean; json: boolean }) => {
     const root = resolveWorkspace(opts.workspace);
@@ -323,24 +454,15 @@ program
     const nodeMajor = parseInt(process.versions.node.split(".")[0], 10);
     report.node = { ok: nodeMajor >= 20, detail: `v${process.versions.node}` };
 
-    // Codex sandbox writable_roots (so later chats do not need elevation)
-    if (opts.fix) {
-      const sandbox = trySandboxAllow();
-      if (sandbox.ok) {
-        report.sandbox = { ok: true, detail: sandbox.alreadyAllowed ? "已在白名单" : "已写入白名单" };
-        if (sandbox.added) results.push("已将本地设置目录加入 Codex 沙箱白名单");
-      } else {
-        report.sandbox = { ok: false, detail: sandbox.error };
-      }
-    } else {
-      try {
-        const configPath = getCodexConfigPath();
-        const allowed =
-          fs.existsSync(configPath) && isStateDirAllowlisted(fs.readFileSync(configPath, "utf8"), getStateDir());
-        report.sandbox = allowed ? { ok: true, detail: "已在白名单" } : { ok: false, detail: "未在白名单" };
-      } catch (error) {
-        report.sandbox = { ok: false, detail: (error as Error).message };
-      }
+    // Diagnostic only. Global Codex configuration is changed exclusively by
+    // the explicit `sandbox-allow` command.
+    try {
+      const inspection = inspectSandboxAllowlist();
+      report.sandbox = inspection.alreadyAllowed
+        ? { ok: true, detail: "已在白名单" }
+        : { ok: false, detail: "未在白名单" };
+    } catch (error) {
+      report.sandbox = { ok: false, detail: (error as Error).message };
     }
 
     // Workspace
@@ -383,9 +505,8 @@ program
       }
     }
 
-    // Tunnel + remote reachability. If this workspace once had a public URL,
-    // a full quit reclaims it — restore a tunnel and tell the Skill to update
-    // the existing ChatGPT connector (never treat that as "local mode").
+    // Tunnel + remote reachability. Doctor never opens or restores public
+    // exposure; that requires an explicit start/restart transport option.
     const lastEndpoint = workspace ? readLastEndpoint(workspace.id) : null;
     const connectorName = workspace
       ? connectorNameFor({
@@ -424,9 +545,9 @@ program
     };
 
     if (runtime) {
-      let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
+      const info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
       const expectedPublic = Boolean(lastEndpoint?.publicUrl);
-      let currentUrl = info.publicUrl ?? info.tunnel.url;
+      const currentUrl = info.publicUrl ?? info.tunnel.url;
       let healthy = false;
       if (currentUrl) {
         try {
@@ -437,30 +558,11 @@ program
         }
       }
 
-      if ((!currentUrl || !healthy) && opts.fix && (expectedPublic || info.tunnel.running)) {
-        try {
-          const binaries = detectTunnelBinaries();
-          if (!binaries.cloudflared) {
-            report.tunnel = { ok: false, detail: "NEED_CLOUDFLARED" };
-          } else {
-            const started = await adminFetch<TunnelStartResponse>(runtime, "POST", "/admin/tunnel/start", 90_000);
-            if (started.url) {
-              currentUrl = started.url;
-              healthy = true;
-              info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
-              results.push("已重新建立安全连接（地址已更换）");
-            }
-          }
-        } catch (error) {
-          report.tunnel = { ok: false, detail: (error as Error).message };
-        }
-      }
-
       if (currentUrl && healthy) {
-        report.tunnel = { ok: true, detail: currentUrl };
+        report.transport = { ok: true, detail: `外部 HTTPS 到達確認済み: ${currentUrl}` };
         const nextMcp = mcpUrlFromPublic(currentUrl);
         const action = connectorAction(lastEndpoint?.mcpUrl, nextMcp);
-        const boundName = nextMcp
+        const boundName = nextMcp && opts.fix
           ? persistWorkspaceEndpoint({
               workspaceId: info.workspaceId,
               workspaceName: info.workspaceName,
@@ -480,18 +582,8 @@ program
           mcpUrl: nextMcp,
           previousMcpUrl: lastEndpoint?.mcpUrl ?? null,
         };
-        if (action === "update") {
-          try {
-            const pairing = await adminFetch<PairingResponse>(runtime, "POST", "/admin/pairing");
-            chatgptRepair.pairingCode = pairing.code;
-            chatgptRepair.pairingExpiresAt = pairing.expiresAt;
-            results.push(`已生成新的配对码，需要更新「${boundName}」`);
-          } catch (error) {
-            report.oauth = { ok: false, detail: (error as Error).message };
-          }
-        }
       } else if (expectedPublic) {
-        report.tunnel = report.tunnel ?? { ok: false, detail: "安全连接未恢复" };
+        report.transport = report.transport ?? { ok: false, detail: "以前の公開 HTTPS 接続は現在到達不能" };
         chatgptRepair = {
           ...chatgptRepair,
           needed: true,
@@ -501,13 +593,21 @@ program
           userMessage: reclaimUserMessage(connectorName),
           mcpUrl: null,
         };
+      } else if (info.trustedTunnelAuth) {
+        const tokenPresent = info.trustedTunnelTokenPresent;
+        report.transport = tokenPresent
+          ? {
+              ok: false,
+              detail: "ローカル認証は準備済み。tunnel-client / ChatGPT E2E は UNVERIFIED",
+            }
+          : { ok: false, detail: "OpenAI Secure MCP Tunnel の固定ヘッダートークンが見つからない" };
       } else if (!currentUrl) {
-        report.tunnel = { ok: true, detail: "未启用（本地模式）" };
+        report.transport = { ok: true, detail: "リモート接続なし（ローカルのみ）" };
       } else {
-        report.tunnel = { ok: false, detail: "公网地址无法访问" };
+        report.transport = { ok: false, detail: "外部 HTTPS アドレスへ到達不能" };
       }
     } else if (lastEndpoint?.publicUrl) {
-      report.tunnel = { ok: false, detail: "安全连接未运行" };
+      report.transport = { ok: false, detail: "以前の公開 HTTPS 接続は停止中" };
       chatgptRepair = {
         ...chatgptRepair,
         needed: true,
@@ -519,7 +619,9 @@ program
     }
 
     if (opts.json) {
-      say(JSON.stringify({ report, repairs: results, chatgptRepair }));
+      const ok = Object.values(report).every((item) => item.ok) && !chatgptRepair.needed;
+      say(JSON.stringify({ ok, report, repairs: results, chatgptRepair }));
+      if (!ok) process.exitCode = 1;
       return;
     }
     say(`${PRODUCT_NAME} Doctor`);
@@ -531,7 +633,7 @@ program
       bridge: "Bridge",
       mcp: "MCP",
       oauth: "OAuth",
-      tunnel: "Tunnel",
+      transport: "Remote transport",
     };
     let allOk = true;
     for (const [key, value] of Object.entries(report)) {
@@ -550,7 +652,13 @@ program
       if (chatgptRepair.pairingCode) say(`配对码：${chatgptRepair.pairingCode}`);
       say("");
     }
-    say(allOk && !chatgptRepair.needed ? "Everything looks good." : chatgptRepair.needed ? "本地已就绪，还需要在 ChatGPT 更新现有连接。" : "仍有问题未解决，可尝试 `c2c restart --tunnel`。");
+    say(
+      allOk && !chatgptRepair.needed
+        ? "Everything looks good."
+        : chatgptRepair.needed
+          ? "本地状态已确认。重新公開する場合は接続方式を明示して再起動してください。"
+          : "仍有问题未解决。`c2c doctor --fix` 仅修复本地 Bridge。"
+    );
     if (!allOk) process.exitCode = 1;
   });
 
@@ -564,6 +672,10 @@ program
   .action(async (opts: { workspace?: string; json: boolean }) => {
     try {
       const { runtime } = await ensureBridge(resolveWorkspace(opts.workspace));
+      const info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
+      if (info.trustedTunnelAuth) {
+        throw new Error("OpenAI Secure MCP Tunnel mode uses the fixed tunnel header, not OAuth pairing.");
+      }
       const pairing = await adminFetch<PairingResponse>(runtime, "POST", "/admin/pairing");
       if (opts.json) say(JSON.stringify({ ok: true, pairingCode: pairing.code, expiresAt: pairing.expiresAt }));
       else {
@@ -584,10 +696,14 @@ program
     const workspace = new Workspace(root);
     const runtime = await findLiveBridge(workspace.id);
     if (runtime) {
-      await adminFetch(runtime, "POST", "/admin/revoke-all");
+      await adminFetch<RevokeResponse>(runtime, "POST", "/admin/revoke-all");
     } else {
       // bridge not running: revoke directly in the persisted store
       new AuthStore(workspace.id).revokeAll();
+      removeTrustedTunnelToken(workspace.id);
+    }
+    if (new AuthStore(workspace.id).tokenCount() !== 0 || hasValidTrustedTunnelToken(workspace.id)) {
+      throw new Error("Access revocation could not be verified; inspect the local state directory before reconnecting.");
     }
     check("已断开 ChatGPT 对当前项目的访问（所有令牌已吊销）");
   });
@@ -602,16 +718,34 @@ program
   .option("--verbose", "include debug detail", false)
   .action((opts: { workspace?: string; lines: string; verbose: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    const logDir = path.join(getStateDir(), "logs");
     const candidates = [
-      path.join(getStateDir(), "logs", "bridge.log"),
-      path.join(getStateDir(), "logs", `bridge-${workspace.id}.out.log`),
+      path.join(logDir, `bridge-${workspace.id}.log`),
+      path.join(logDir, `bridge-${workspace.id}.out.log`),
     ];
+    const requestedLines = Number.parseInt(opts.lines, 10);
+    const lineLimit = Number.isInteger(requestedLines) ? Math.min(1000, Math.max(1, requestedLines)) : 50;
     let shown = false;
     for (const file of candidates) {
       if (!fs.existsSync(file)) continue;
-      const lines = fs.readFileSync(file, "utf8").trim().split("\n");
+      const lstat = fs.lstatSync(file);
+      if (!lstat.isFile() || lstat.isSymbolicLink()) continue;
+      const canonical = fs.realpathSync.native(file);
+      const canonicalLogDir = fs.realpathSync.native(logDir);
+      if (!canonical.startsWith(canonicalLogDir + path.sep)) continue;
+      const stat = fs.statSync(canonical);
+      const maxBytes = 2 * 1024 * 1024;
+      const start = Math.max(0, stat.size - maxBytes);
+      const fd = fs.openSync(canonical, "r");
+      const buffer = Buffer.alloc(stat.size - start);
+      try {
+        fs.readSync(fd, buffer, 0, buffer.length, start);
+      } finally {
+        fs.closeSync(fd);
+      }
+      const lines = redact(buffer.toString("utf8")).trim().split("\n");
       const filtered = opts.verbose ? lines : lines.filter((line) => !line.includes(" DEBUG "));
-      say(filtered.slice(-parseInt(opts.lines, 10)).join("\n"));
+      say(filtered.slice(-lineLimit).join("\n"));
       shown = true;
     }
     if (!shown) say("暂无日志。");
@@ -638,9 +772,24 @@ program
 
 program
   .command("sandbox-allow")
-  .description("Add the local settings directory to the Codex sandbox allowlist")
+  .description("Inspect or explicitly add the local state directory to the Codex sandbox allowlist")
+  .option("--check", "inspect only; do not modify Codex configuration", false)
   .option("--json", "machine-readable output", false)
-  .action((opts: { json: boolean }) => {
+  .action((opts: { check: boolean; json: boolean }) => {
+    if (opts.check) {
+      try {
+        const inspection = inspectSandboxAllowlist();
+        if (opts.json) say(JSON.stringify({ ok: true, checkOnly: true, added: false, ...inspection }));
+        else {
+          say(`Codex config：${inspection.configPath}`);
+          say(`C2C state：${inspection.stateDir}`);
+          say(`Allowlisted：${inspection.alreadyAllowed ? "yes" : "no"}`);
+        }
+      } catch (error) {
+        handleCliError(error, opts.json);
+      }
+      return;
+    }
     const result = trySandboxAllow();
     if (opts.json) {
       say(JSON.stringify(result));
@@ -661,29 +810,69 @@ program
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
 function runGit(args: string[]): { ok: boolean; stdout: string } {
-  const result = spawnSync("git", args, {
-    cwd: repoRoot,
-    encoding: "utf8",
-    timeout: 8000,
-    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
-  });
-  return { ok: result.status === 0, stdout: (result.stdout ?? "").trim() };
+  const result = runWorkspaceGit(repoRoot, args);
+  return { ok: result.ok, stdout: result.stdout.trim() };
+}
+
+function parseGitHubRepository(remote: string): { owner: string; repo: string } | null {
+  let owner: string;
+  let repo: string;
+  if (remote.startsWith("git@github.com:")) {
+    const parts = remote.slice("git@github.com:".length).split("/");
+    if (parts.length !== 2) return null;
+    [owner, repo] = parts;
+  } else {
+    let url: URL;
+    try {
+      url = new URL(remote);
+    } catch {
+      return null;
+    }
+    if (
+      url.protocol !== "https:" ||
+      url.hostname !== "github.com" ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash
+    ) {
+      return null;
+    }
+    const parts = url.pathname.replace(/^\/+|\/+$/g, "").split("/");
+    if (parts.length !== 2) return null;
+    [owner, repo] = parts;
+  }
+  repo = repo.replace(/\.git$/, "");
+  if (
+    owner === "." ||
+    owner === ".." ||
+    repo === "." ||
+    repo === ".." ||
+    !/^[A-Za-z0-9_.-]{1,100}$/.test(owner) ||
+    !/^[A-Za-z0-9_.-]{1,100}$/.test(repo)
+  ) {
+    return null;
+  }
+  return { owner, repo };
 }
 
 program
   .command("update-check")
-  .description("Check GitHub for a newer version (real check at most once per local day)")
+  .description("Explicitly check the configured Git remote for a newer commit; never installs it")
   .option("--force", "check even if already checked today", false)
   .option("--json", "machine-readable output", false)
-  .action((opts: { force: boolean; json: boolean }) => {
+  .action(async (opts: { force: boolean; json: boolean }) => {
     const file = path.join(getStateDir(), "update-check.json");
     const today = new Date().toLocaleDateString("en-CA"); // YYYY-MM-DD in local tz
-    let last: { date?: string; updateAvailable?: boolean } = {};
-    try {
-      last = JSON.parse(fs.readFileSync(file, "utf8")) as typeof last;
-    } catch {
-      /* first run */
-    }
+    const rawLast = readJsonIfExists<Record<string, unknown>>(file, 64 * 1024);
+    const last: { date?: string; updateAvailable?: boolean } = {
+      date:
+        typeof rawLast?.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(rawLast.date)
+          ? rawLast.date
+          : undefined,
+      updateAvailable:
+        typeof rawLast?.updateAvailable === "boolean" ? rawLast.updateAvailable : undefined,
+    };
 
     const emit = (data: {
       checked: boolean;
@@ -703,36 +892,43 @@ program
     }
 
     const local = runGit(["rev-parse", "HEAD"]);
-    const remote = runGit(["ls-remote", "origin", "HEAD"]);
-    if (!local.ok || !remote.ok || !remote.stdout) {
+    const origin = runGit(["remote", "get-url", "origin"]);
+    const repository = origin.ok ? parseGitHubRepository(origin.stdout) : null;
+    if (!local.ok || !repository) {
       // Offline or not a git checkout: skip quietly and retry tomorrow-ish (do not
       // record the date so a transient failure does not suppress the daily check).
-      emit({ checked: false, updateAvailable: false, note: "无法检查更新（离线或非 git 安装），已跳过。" });
+      emit({ checked: false, updateAvailable: false, note: "无法安全检查更新（仅支持 GitHub HTTPS/SSH 来源），已跳过。" });
       return;
     }
-    const remoteCommit = remote.stdout.split(/\s/)[0];
+    let remoteCommit: string;
+    try {
+      const response = await fetch(
+        `https://api.github.com/repos/${repository.owner}/${repository.repo}/commits/HEAD`,
+        {
+          headers: {
+            Accept: "application/vnd.github+json",
+            "User-Agent": "codex-with-chatgpt-update-check",
+            "X-GitHub-Api-Version": "2022-11-28",
+          },
+          signal: AbortSignal.timeout(8000),
+        }
+      );
+      if (!response.ok) throw new Error(`GitHub returned ${response.status}`);
+      const body = (await response.json()) as { sha?: unknown };
+      if (typeof body.sha !== "string" || !/^[a-f0-9]{40}$/.test(body.sha)) {
+        throw new Error("GitHub returned an invalid commit id");
+      }
+      remoteCommit = body.sha;
+    } catch {
+      emit({ checked: false, updateAvailable: false, note: "无法连接 GitHub 检查更新，已跳过。" });
+      return;
+    }
     const updateAvailable = remoteCommit !== local.stdout;
-    fs.mkdirSync(getStateDir(), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify({ date: today, updateAvailable, remoteCommit }), { mode: 0o600 });
+    writeSecureJson(file, { date: today, updateAvailable, remoteCommit });
     emit({ checked: true, updateAvailable, localCommit: local.stdout, remoteCommit });
   });
 
 // ---------------------------------------------------------------- session (ChatGPT conversation memory)
-
-interface SavedSession {
-  url: string;
-  title?: string;
-  taskId?: string;
-  iteration?: number;
-  lastState?: string;
-  savedAt: string;
-}
-
-function sessionFile(workspaceId: string): string {
-  const dir = path.join(getStateDir(), "sessions");
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  return path.join(dir, `${workspaceId}.json`);
-}
 
 const session = program
   .command("session")
@@ -746,7 +942,7 @@ session
   .action((opts: { workspace?: string; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const file = sessionFile(workspace.id);
-    const saved = fs.existsSync(file) ? (JSON.parse(fs.readFileSync(file, "utf8")) as SavedSession) : null;
+    const saved = readSavedSession(file);
     if (opts.json) say(JSON.stringify({ ok: true, session: saved }));
     else if (!saved) say("尚未记录 ChatGPT 会话。");
     else {
@@ -768,16 +964,22 @@ session
   .action((opts: { workspace?: string; url: string; title?: string; task?: string; iteration?: string; state?: string }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
     const file = sessionFile(workspace.id);
-    const previous = fs.existsSync(file) ? (JSON.parse(fs.readFileSync(file, "utf8")) as SavedSession) : null;
+    const previous = readSavedSession(file);
+    const iteration = opts.iteration ? Number.parseInt(opts.iteration, 10) : previous?.iteration;
+    if (iteration !== undefined && (!Number.isInteger(iteration) || iteration < 0 || iteration > 10_000)) {
+      throw new Error("Invalid session iteration.");
+    }
+    if (opts.task && !/^[A-Za-z0-9_.:-]{1,128}$/.test(opts.task)) throw new Error("Invalid session task id.");
+    if (opts.state && !/^[A-Z_]{2,32}$/.test(opts.state)) throw new Error("Invalid session state.");
     const saved: SavedSession = {
-      url: opts.url,
-      title: opts.title ?? previous?.title,
+      url: normalizeChatGptSessionUrl(opts.url),
+      title: sanitizeSessionLabel(opts.title) ?? previous?.title,
       taskId: opts.task ?? previous?.taskId,
-      iteration: opts.iteration ? parseInt(opts.iteration, 10) : previous?.iteration,
+      iteration,
       lastState: opts.state ?? previous?.lastState,
       savedAt: new Date().toISOString(),
     };
-    fs.writeFileSync(file, JSON.stringify(saved, null, 2), { mode: 0o600 });
+    writeSecureJson(file, saved);
     check("已记录 ChatGPT 会话，后续任务将复用");
   });
 
@@ -815,12 +1017,15 @@ program
       const changed = /^\d+$/.test(opts.changedFiles)
         ? parseInt(opts.changedFiles, 10)
         : opts.changedFiles.split(",").map((file) => file.trim()).filter(Boolean);
+      if (!["ok", "failed", "blocked"].includes(opts.exitStatus)) {
+        throw new Error("Invalid exit status; expected ok, failed, or blocked.");
+      }
       appendExecutionRecord(workspace.id, {
         taskId: opts.task,
         iteration: parseInt(opts.iteration, 10),
         changedFiles: changed,
         tests: opts.tests ?? null,
-        exitStatus: opts.exitStatus,
+        exitStatus: opts.exitStatus as "ok" | "failed" | "blocked",
         timestamp: new Date().toISOString(),
         notes: opts.notes,
       });
@@ -829,13 +1034,13 @@ program
   );
 
 function handleCliError(error: unknown, json: boolean): void {
-  const message = error instanceof Error ? error.message : String(error);
+  const message = redact(error instanceof Error ? error.message : String(error));
   if (json) {
     say(JSON.stringify({ ok: false, error: message }));
   } else if (message.startsWith("NEED_CLOUDFLARED")) {
     say("需要你完成一步：");
     say("");
-    say("尚未安装安全连接组件 cloudflared。");
+    say("Cloudflare Quick Tunnel を明示的に選択しましたが、cloudflared が未導入です。");
     say("macOS 用户可运行：brew install cloudflared");
     say("完成后再试一次即可。");
   } else {
@@ -845,6 +1050,6 @@ function handleCliError(error: unknown, json: boolean): void {
 }
 
 program.parseAsync(process.argv).catch((error: Error) => {
-  cross(error.message);
+  cross(redact(error.message));
   process.exit(1);
 });

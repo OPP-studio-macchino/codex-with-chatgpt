@@ -1,10 +1,17 @@
 import express, { type Request, type Response, type NextFunction } from "express";
 import type { Server } from "node:http";
 import { randomBytes } from "node:crypto";
+import path from "node:path";
 import { Workspace } from "../workspace/manager.js";
 import { AuthStore } from "../auth/store.js";
+import { safeEqual } from "../auth/store.js";
 import { createOAuthRouter } from "../auth/oauth.js";
 import { bearerAuth } from "../auth/middleware.js";
+import {
+  hasValidTrustedTunnelToken,
+  removeTrustedTunnelToken,
+  trustedTunnelTokenFile,
+} from "../auth/trusted-tunnel.js";
 import { PairingManager } from "../pairing/manager.js";
 import { createMcpServer } from "../mcp/server.js";
 import { createMcpHttpHandler } from "../mcp/http.js";
@@ -12,6 +19,7 @@ import { CloudflaredQuickTunnel } from "../tunnel/cloudflared.js";
 import type { TunnelProvider } from "../tunnel/provider.js";
 import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
+import { normalizeExternalBaseUrl } from "../config/transport.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 import { writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
 
@@ -26,6 +34,10 @@ export interface BridgeOptions {
   authStoreFile?: string;
   pairingTtlMs?: number;
   accessTokenTtlMs?: number;
+  /** Stable externally visible HTTPS base URL for a managed tunnel. */
+  externalBaseUrl?: string;
+  /** Owner-only token file used by OpenAI Secure MCP Tunnel static headers. */
+  trustedTunnelTokenFile?: string;
 }
 
 export interface Bridge {
@@ -77,24 +89,42 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const pairing = new PairingManager(workspace.id, { ttlMs: opts.pairingTtlMs });
   const tunnel = opts.tunnelProvider ?? new CloudflaredQuickTunnel(logger);
   const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
+  if (
+    opts.trustedTunnelTokenFile &&
+    path.resolve(opts.trustedTunnelTokenFile) !== path.resolve(trustedTunnelTokenFile(workspace.id))
+  ) {
+    throw new Error("Trusted tunnel token file must use the per-workspace state location.");
+  }
 
   let publicBaseUrl: string | null = null;
+  const managedExternalUrl = Boolean(opts.externalBaseUrl);
+  if (opts.externalBaseUrl) {
+    publicBaseUrl = normalizeExternalBaseUrl(opts.externalBaseUrl);
+  }
 
   const app = express();
-  app.set("trust proxy", true);
+  app.set("trust proxy", false);
+  app.set("query parser", "simple");
   app.disable("x-powered-by");
+  app.use((_req, res, next) => {
+    res.set({
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+      "Referrer-Policy": "no-referrer",
+    });
+    next();
+  });
 
-  const getBaseUrl = (req: Request): string => {
-    if (publicBaseUrl) return publicBaseUrl;
-    const proto = req.protocol;
-    const hostHeader = req.get("host") ?? `${host}:${port}`;
-    return `${proto}://${hostHeader}`;
+  const getBaseUrl = (_req: Request): string => {
+    const activePublicUrl = managedExternalUrl ? publicBaseUrl : tunnel.getPublicUrl();
+    if (activePublicUrl) return activePublicUrl;
+    return `http://${host}:${port}`;
   };
 
   // ---- Health (public but minimal) ---------------------------------------
 
   app.get("/health", (_req, res) => {
-    res.json({ service: SERVICE_NAME, version: VERSION, workspaceId: workspace.id, status: "ok" });
+    res.json({ service: SERVICE_NAME, status: "ok" });
   });
 
   // ---- OAuth + discovery ---------------------------------------------------
@@ -112,14 +142,41 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   // ---- MCP endpoint (bearer-protected) --------------------------------------
 
   const mcpHandler = createMcpHttpHandler(() => createMcpServer({ workspace, logger }), logger);
-  app.all(
+  let activeMcpRequests = 0;
+  const admitMcpRequest = (_req: Request, res: Response, next: NextFunction): void => {
+    if (activeMcpRequests >= 8) {
+      res.status(429).json({ error: "too_many_requests" });
+      return;
+    }
+    activeMcpRequests++;
+    let released = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      activeMcpRequests--;
+    };
+    res.once("finish", release);
+    res.once("close", release);
+    next();
+  };
+  app.post(
     "/mcp",
-    express.json({ limit: "8mb" }),
-    bearerAuth({ store: authStore, workspaceId: workspace.id, getBaseUrl, logger }),
+    bearerAuth({
+      store: authStore,
+      workspaceId: workspace.id,
+      getBaseUrl,
+      logger,
+      trustedTunnelTokenFile: opts.trustedTunnelTokenFile,
+    }),
+    admitMcpRequest,
+    express.json({ limit: "1mb", strict: true }),
     (req: Request, res: Response) => {
       void mcpHandler(req, res);
     }
   );
+  app.all("/mcp", (_req, res) => {
+    res.status(405).json({ error: "method_not_allowed" });
+  });
 
   // ---- Admin API (loopback + admin token only; used by the CLI/Skill) --------
 
@@ -130,7 +187,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     const viaProxy = Boolean(req.headers["cf-connecting-ip"] || req.headers["x-forwarded-for"]);
     const header = req.headers.authorization ?? "";
     const token = header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : "";
-    if (!isLoopback || viaProxy || token !== adminToken) {
+    if (!isLoopback || viaProxy || !safeEqual(token, adminToken)) {
       res.status(404).end(); // do not advertise the admin surface
       return;
     }
@@ -151,16 +208,26 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       workspaceName: workspace.name,
       workspaceRoot: workspace.root,
       port,
-      publicUrl: publicBaseUrl,
+      publicUrl: managedExternalUrl ? publicBaseUrl : tunnel.getPublicUrl(),
       tunnel: tunnel.status(),
       tokenCount: authStore.tokenCount(),
       pairingActive: pairing.hasActiveSession(),
+      trustedTunnelAuth: Boolean(opts.trustedTunnelTokenFile),
+      trustedTunnelTokenPresent:
+        Boolean(opts.trustedTunnelTokenFile) && hasValidTrustedTunnelToken(workspace.id),
       pid: process.pid,
       startedAt,
     });
   });
 
   app.post("/admin/tunnel/start", adminGuard, (_req, res) => {
+    if (managedExternalUrl || opts.trustedTunnelTokenFile) {
+      res.status(409).json({
+        error: "different_transport_configured",
+        message: "A different remote transport is configured; restart explicitly to change transports.",
+      });
+      return;
+    }
     tunnel
       .start(port)
       .then((url) => {
@@ -175,6 +242,13 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   });
 
   app.post("/admin/tunnel/stop", adminGuard, (_req, res) => {
+    if (managedExternalUrl || opts.trustedTunnelTokenFile) {
+      res.status(409).json({
+        error: "different_transport_configured",
+        message: "This process is not using Cloudflare Quick Tunnel; restart explicitly to change transports.",
+      });
+      return;
+    }
     void tunnel.stop().then(() => {
       publicBaseUrl = null;
       persistRuntime();
@@ -185,8 +259,9 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   app.post("/admin/revoke-all", adminGuard, (_req, res) => {
     const count = authStore.revokeAll();
     pairing.invalidateAll();
+    const trustedTunnelRevoked = removeTrustedTunnelToken(workspace.id);
     logger.info(`Revoked all tokens (${count})`);
-    res.json({ revoked: count });
+    res.json({ revoked: count, trustedTunnelRevoked });
   });
 
   app.post("/admin/shutdown", adminGuard, (_req, res) => {
@@ -197,6 +272,11 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   });
 
   const { server, port } = await listen(app, host, opts.port ?? DEFAULT_PORT);
+  server.requestTimeout = 30_000;
+  server.headersTimeout = 10_000;
+  server.keepAliveTimeout = 5_000;
+  server.maxHeadersCount = 100;
+  server.maxRequestsPerSocket = 100;
   const startedAt = new Date().toISOString();
   logger.info(`Bridge listening on ${host}:${port} for workspace ${workspace.name} (${workspace.id})`);
 
@@ -210,7 +290,8 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       pid: process.pid,
       port,
       adminToken,
-      publicUrl: publicBaseUrl,
+      publicUrl: managedExternalUrl ? publicBaseUrl : tunnel.getPublicUrl(),
+      trustedTunnelAuth: Boolean(opts.trustedTunnelTokenFile),
       startedAt,
     };
     writeRuntimeState(state);
@@ -227,6 +308,10 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     logger.info("Bridge stopped");
   };
 
+  app.use((_error: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    if (!res.headersSent) res.status(400).json({ error: "invalid_request" });
+  });
+
   return {
     workspace,
     port,
@@ -235,7 +320,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     authStore,
     pairing,
     tunnel,
-    getPublicBaseUrl: () => publicBaseUrl,
+    getPublicBaseUrl: () => (managedExternalUrl ? publicBaseUrl : tunnel.getPublicUrl()),
     localBaseUrl: () => `http://${host}:${port}`,
     close: shutdown,
   };

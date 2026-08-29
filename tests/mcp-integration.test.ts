@@ -24,8 +24,21 @@ beforeAll(async () => {
   isolateStateDir();
   root = makeTmpDir("mcp-ws");
   makeGitRepo(root);
-  write(root, "package.json", JSON.stringify({ name: "demo", scripts: { test: "vitest run" }, dependencies: { react: "^19.0.0" } }));
+  write(
+    root,
+    "package.json",
+    JSON.stringify({
+      name: "demo",
+      scripts: { test: "vitest run", deploy: "API_KEY=must-not-leave deploy" },
+      dependencies: { react: "^19.0.0" },
+    })
+  );
   write(root, ".env", "API_KEY=supersecret\n");
+  write(
+    root,
+    "src/accidental.ts",
+    'export const api_key = "sk-proj-abcdefghijklmnopqrstuvwxyz1234567890";\n'
+  );
   // an uncommitted change so git_diff has content
   write(root, "src/index.ts", "export const answer = 43; // changed\n");
 
@@ -76,12 +89,20 @@ describe("MCP tools over Streamable HTTP", () => {
 
   it("workspace_info returns identity and project detection", async () => {
     const result = await client.callTool({ name: "workspace_info", arguments: {} });
-    const info = jsonOf<{ workspaceId: string; projectType: string; frameworks: string[]; git: { isRepo: boolean; branch: string } }>(result);
+    const info = jsonOf<{
+      workspaceId: string;
+      projectType: string;
+      frameworks: string[];
+      scriptNames: string[];
+      git: { isRepo: boolean; branch: string };
+    }>(result);
     expect(info.workspaceId).toBe(bridge.workspace.id);
     expect(info.projectType).toBe("node");
     expect(info.frameworks).toContain("React");
     expect(info.git.isRepo).toBe(true);
     expect(info.git.branch).toBe("main");
+    expect(info.scriptNames).toContain("deploy");
+    expect(textOf(result)).not.toContain("must-not-leave");
   });
 
   it("read_file returns hello.txt", async () => {
@@ -95,6 +116,16 @@ describe("MCP tools over Streamable HTTP", () => {
     expect(result.isError).toBe(true);
     expect(textOf(result)).toContain("ACCESS_DENIED_SENSITIVE_FILE");
     expect(textOf(result)).not.toContain("supersecret");
+  });
+
+  it("read_file denies Git metadata and redacts credentials in readable source", async () => {
+    const denied = await client.callTool({ name: "read_file", arguments: { path: ".git/config" } });
+    expect(denied.isError).toBe(true);
+    expect(textOf(denied)).toContain("ACCESS_DENIED_SENSITIVE_FILE");
+
+    const readable = await client.callTool({ name: "read_file", arguments: { path: "src/accidental.ts" } });
+    expect(textOf(readable)).not.toContain("sk-proj-");
+    expect(textOf(readable)).toContain("[REDACTED");
   });
 
   it("read_file denies paths outside the workspace", async () => {

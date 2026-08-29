@@ -1,11 +1,46 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import readline from "node:readline";
+import path from "node:path";
 import type { Logger } from "../logger/index.js";
 import { nullLogger } from "../logger/index.js";
+import { ensureDir, getStateDir } from "../config/paths.js";
 import { findBinary } from "./detect.js";
 import type { TunnelDoctorReport, TunnelProvider, TunnelStatus } from "./provider.js";
+import { redactSensitiveText } from "../security/redaction.js";
 
 const QUICK_TUNNEL_URL_RE = /https:\/\/[a-z0-9][a-z0-9-]*\.trycloudflare\.com/i;
+
+function quickTunnelEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  const allowed = [
+    "PATH",
+    "Path",
+    "SystemRoot",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "LC_ALL",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+  ];
+  for (const key of allowed) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  const isolatedHome = ensureDir(path.join(getStateDir(), "cloudflared-home"));
+  env.HOME = isolatedHome;
+  env.USERPROFILE = isolatedHome;
+  return env;
+}
 
 /** Extract a Quick Tunnel public URL from a cloudflared log line. */
 export function parseQuickTunnelUrl(line: string): string | null {
@@ -15,14 +50,15 @@ export function parseQuickTunnelUrl(line: string): string | null {
 
 /**
  * Cloudflare Quick Tunnel provider.
- * Quick Tunnels need no account/login; the URL changes on every start,
- * which the bridge and the Skill handle by reconfiguring automatically.
+ * Quick Tunnels need no account/login and the URL changes on every start.
+ * Re-publication and connector changes remain explicit operator actions.
  */
 export class CloudflaredQuickTunnel implements TunnelProvider {
   readonly name = "cloudflare-quick";
   private child: ChildProcess | null = null;
   private url: string | null = null;
   private lastError: string | null = null;
+  private starting: Promise<string> | null = null;
 
   constructor(
     private readonly logger: Logger = nullLogger,
@@ -30,22 +66,23 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
   ) {}
 
   private binary(): string | null {
-    return this.binaryOverride ?? findBinary("cloudflared");
+    return this.binaryOverride ?? findBinary("cloudflared", { includePath: false });
   }
 
   async start(localPort: number): Promise<string> {
     if (this.child && this.url) return this.url;
+    if (this.starting) return this.starting;
     const bin = this.binary();
     if (!bin) {
       throw new Error(
         "cloudflared is not installed. Install it (e.g. `brew install cloudflared`) and retry."
       );
     }
-    return new Promise<string>((resolve, reject) => {
+    const attempt = new Promise<string>((resolve, reject) => {
       const child = spawn(
         bin,
         ["tunnel", "--url", `http://127.0.0.1:${localPort}`, "--no-autoupdate"],
-        { stdio: ["ignore", "pipe", "pipe"] }
+        { stdio: ["ignore", "pipe", "pipe"], env: quickTunnelEnv() }
       );
       this.child = child;
       this.url = null;
@@ -70,8 +107,8 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
             resolve(url);
           }
           if (/error/i.test(line)) {
-            this.lastError = line.slice(0, 400);
-            this.logger.debug(`cloudflared: ${line.slice(0, 400)}`);
+            this.lastError = redactSensitiveText(line.slice(0, 400)).text;
+            this.logger.debug(`cloudflared: ${this.lastError}`);
           }
         });
       };
@@ -94,6 +131,12 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
         }
       });
     });
+    this.starting = attempt;
+    try {
+      return await attempt;
+    } finally {
+      this.starting = null;
+    }
   }
 
   async stop(): Promise<void> {
@@ -101,6 +144,7 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
       this.child.kill("SIGTERM");
       this.child = null;
     }
+    this.starting = null;
     this.url = null;
   }
 

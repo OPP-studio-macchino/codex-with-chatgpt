@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { getStateDir } from "./paths.js";
+import { getStateDir, writeSecureText } from "./paths.js";
 
 const TABLE = "sandbox_workspace_write";
 const KEY = "writable_roots";
@@ -11,6 +11,14 @@ export interface SandboxAllowResult {
   alreadyAllowed: boolean;
   stateDir: string;
   configPath: string;
+  backupPath?: string;
+}
+
+export interface SandboxAllowInspection {
+  stateDir: string;
+  configPath: string;
+  configExists: boolean;
+  alreadyAllowed: boolean;
 }
 
 export function getCodexHome(): string {
@@ -47,6 +55,32 @@ export function isStateDirAllowlisted(content: string, stateDir: string): boolea
   return listWritableRoots(content).some((root) => pathsEquivalent(root, stateDir));
 }
 
+function readConfigForEdit(configPath: string): string {
+  if (!fs.existsSync(configPath)) return "";
+  const stat = fs.lstatSync(configPath);
+  if (stat.isSymbolicLink()) throw new Error("Refusing to edit a symlinked Codex config file.");
+  if (!stat.isFile() || stat.size > 2 * 1024 * 1024) {
+    throw new Error("Codex config must be a regular file no larger than 2 MiB.");
+  }
+  return fs.readFileSync(configPath, "utf8");
+}
+
+export function inspectSandboxAllowlist(opts?: {
+  configPath?: string;
+  stateDir?: string;
+}): SandboxAllowInspection {
+  const stateDir = path.resolve(opts?.stateDir ?? getStateDir());
+  const configPath = opts?.configPath ?? getCodexConfigPath();
+  const configExists = fs.existsSync(configPath);
+  const previous = readConfigForEdit(configPath);
+  return {
+    stateDir,
+    configPath,
+    configExists,
+    alreadyAllowed: isStateDirAllowlisted(previous, stateDir),
+  };
+}
+
 /**
  * Idempotently add the C2C state directory to Codex's sandbox writable_roots.
  * Works on macOS, Windows, and Linux. Never rewrites unrelated config.
@@ -60,19 +94,19 @@ export function ensureSandboxAllowlist(opts?: {
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   fs.mkdirSync(path.dirname(configPath), { recursive: true, mode: 0o700 });
 
-  const previous = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf8") : "";
+  const previous = readConfigForEdit(configPath);
   if (isStateDirAllowlisted(previous, stateDir)) {
     return { added: false, alreadyAllowed: true, stateDir, configPath };
   }
 
   const next = upsertWritableRoot(previous, stateDir);
-  fs.writeFileSync(configPath, next, { encoding: "utf8", mode: 0o600 });
-  try {
-    fs.chmodSync(configPath, 0o600);
-  } catch {
-    // Windows / filesystems without chmod semantics
+  let backupPath: string | undefined;
+  if (previous) {
+    backupPath = `${configPath}.c2c-backup`;
+    writeSecureText(backupPath, previous);
   }
-  return { added: true, alreadyAllowed: false, stateDir, configPath };
+  writeSecureText(configPath, next);
+  return { added: true, alreadyAllowed: false, stateDir, configPath, backupPath };
 }
 
 export function upsertWritableRoot(content: string, stateDir: string): string {
