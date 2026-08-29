@@ -48,7 +48,7 @@ provider payload was used during validation.
 | Mutable state files could follow symlinks and machine-readable diagnostics could exit successfully with failed checks | Confused-deputy writes and false automation signals | Regular-file/no-follow checks for credentials, logs, and execution records; strict state parsing; failed JSON doctor checks now return nonzero |
 | Local setup generated an OAuth pairing code despite having no ChatGPT-reachable route | Misleading readiness signal and unnecessary authorization state | Local-only and official-tunnel setup return `mcpUrl: null`, an explicit `localMcpUrl`, and no OAuth pairing code |
 | Skill directed automatic installs, config mutation, stash/pull, hidden browser behavior, and self-update | Supply-chain, user-work, and consent risk | Skill rewritten around separate approvals, visible actions, exact scope, manual review, and no automatic update |
-| Dependencies used ranges and no CI security gate existed | Unreviewed dependency drift | Exact versions, lockfile and disabled-lifecycle-script policy, reproducible CI, build/test/typecheck/audit gates, and Dependabot configuration |
+| Dependencies used ranges and no CI security gate existed | Unreviewed dependency drift | Exact versions, lockfile policy, dependency scripts denied except pinned `esbuild@0.28.2`, reproducible CI, build/test/typecheck/audit gates, and Dependabot configuration |
 
 ## Verification strategy
 

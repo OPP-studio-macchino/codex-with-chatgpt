@@ -39,7 +39,7 @@
     "typecheck": "tsc --noEmit",
     "validate:skill": "node scripts/validate-skill.mjs"
   },
-  "packageManager": "pnpm@11.24.0",
+  "packageManager": "pnpm@10.34.5",
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
     "commander": "14.0.3",

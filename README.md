@@ -92,9 +92,10 @@ corepack pnpm build
 node bin/c2c.js --help
 ```
 
-The committed project policy disables dependency lifecycle scripts and uses the
-lockfile. Review any future request to override that policy. The project does
-not silently install system packages or update itself.
+The committed project policy blocks dependency lifecycle scripts by default and
+allows only the exact `esbuild@0.28.2` build required by the pinned test/build
+toolchain. Review any future allowlist change. The project does not silently
+install system packages or update itself.
 
 In the examples below, replace `c2c` with `node /path/to/bin/c2c.js` unless you
 have deliberately linked the command onto `PATH`.
