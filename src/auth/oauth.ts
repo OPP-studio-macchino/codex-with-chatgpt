@@ -1,6 +1,14 @@
 import { Router, type Request, type Response, urlencoded, json } from "express";
 import { randomBytes } from "node:crypto";
-import { AuthStore, SUPPORTED_SCOPES, base64UrlSha256, filterScopes, safeEqual } from "./store.js";
+import {
+  AuthStore,
+  SUPPORTED_SCOPES,
+  base64UrlSha256,
+  filterScopes,
+  invalidScopes,
+  isAllowedOAuthRedirectUri,
+  safeEqual,
+} from "./store.js";
 import { PairingManager } from "../pairing/manager.js";
 import type { Logger } from "../logger/index.js";
 import { PRODUCT_NAME } from "../version.js";
@@ -24,18 +32,36 @@ interface PendingAuthRequest {
   expiresAt: number;
 }
 
-function isAllowedRedirectUri(uri: string): boolean {
-  let parsed: URL;
-  try {
-    parsed = new URL(uri);
-  } catch {
-    return false;
+const MAX_PENDING_AUTH_REQUESTS = 64;
+
+function scalarStringFields(
+  value: unknown,
+  keys: readonly string[]
+): Record<string, string | undefined> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const result: Record<string, string | undefined> = {};
+  for (const key of keys) {
+    const field = record[key];
+    if (field !== undefined && typeof field !== "string") return null;
+    result[key] = field as string | undefined;
   }
-  if (parsed.protocol === "https:") return true;
-  if (parsed.protocol === "http:" && (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1")) {
-    return true;
-  }
-  return false;
+  return result;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, "")
+    .replace(/[&<>"']/g, (char) => {
+    const entities: Record<string, string> = {
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;",
+    };
+      return entities[char];
+    });
 }
 
 function authorizationServerMetadata(base: string): Record<string, unknown> {
@@ -67,6 +93,8 @@ function protectedResourceMetadata(base: string): Record<string, unknown> {
 function pairingPage(opts: {
   requestId: string;
   workspaceName: string;
+  clientName: string;
+  redirectUri: string;
   scopes: string[];
   error?: string;
 }): string {
@@ -78,10 +106,10 @@ function pairingPage(opts: {
     offline_access: "Stay connected between sessions",
   };
   const scopeList = opts.scopes
-    .map((scope) => `<li>${scopeLabels[scope] ?? scope}</li>`)
+    .map((scope) => `<li>${escapeHtml(scopeLabels[scope] ?? scope)}</li>`)
     .join("");
   const errorHtml = opts.error
-    ? `<p class="error" role="alert">${opts.error}</p>`
+    ? `<p class="error" role="alert">${escapeHtml(opts.error)}</p>`
     : "";
   return `<!doctype html>
 <html lang="en">
@@ -115,7 +143,9 @@ function pairingPage(opts: {
 <body>
 <div class="card">
   <h1>${PRODUCT_NAME}</h1>
-  <p class="sub">ChatGPT is requesting access to workspace <strong>${opts.workspaceName}</strong> (read-only):</p>
+  <p class="sub"><strong>${escapeHtml(opts.clientName)}</strong> is requesting read-only access to
+    workspace <strong>${escapeHtml(opts.workspaceName)}</strong>.</p>
+  <p class="sub">OAuth callback: <strong>${escapeHtml(opts.redirectUri)}</strong></p>
   <ul>${scopeList}</ul>
   <form method="POST" action="authorize">
     <input type="hidden" name="request_id" value="${opts.requestId}">
@@ -133,6 +163,19 @@ function pairingPage(opts: {
 export function createOAuthRouter(deps: OAuthDeps): Router {
   const router = Router();
   const pendingRequests = new Map<string, PendingAuthRequest>();
+  const registrationHits = new Map<string, { count: number; resetAt: number }>();
+
+  router.use((_req, res, next) => {
+    res.set({
+      "Cache-Control": "no-store",
+      Pragma: "no-cache",
+      "X-Content-Type-Options": "nosniff",
+      "Referrer-Policy": "no-referrer",
+      "Content-Security-Policy":
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+    });
+    next();
+  });
 
   const prunePending = (): void => {
     const now = Date.now();
@@ -157,12 +200,31 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
 
   // ---- Dynamic Client Registration (RFC 7591) ------------------------------
 
-  router.post("/oauth/register", json(), (req, res) => {
+  router.post("/oauth/register", json({ limit: "16kb", strict: true }), (req, res) => {
+    const now = Date.now();
+    if (registrationHits.size > 1024) {
+      for (const [address, entry] of registrationHits) {
+        if (now > entry.resetAt) registrationHits.delete(address);
+      }
+    }
+    const key = req.socket.remoteAddress ?? "unknown";
+    const hit = registrationHits.get(key);
+    if (!hit || now > hit.resetAt) {
+      registrationHits.set(key, { count: 1, resetAt: now + 60_000 });
+    } else {
+      hit.count++;
+      if (hit.count > 20) {
+        res.status(429).json({ error: "rate_limited" });
+        return;
+      }
+    }
     const body = req.body as { client_name?: string; redirect_uris?: unknown };
     const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris : [];
     if (
       redirectUris.length === 0 ||
-      !redirectUris.every((uri) => typeof uri === "string" && isAllowedRedirectUri(uri))
+      redirectUris.length > 10 ||
+      new Set(redirectUris).size !== redirectUris.length ||
+      !redirectUris.every((uri) => typeof uri === "string" && isAllowedOAuthRedirectUri(uri))
     ) {
       res.status(400).json({
         error: "invalid_redirect_uri",
@@ -170,10 +232,23 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
       });
       return;
     }
-    const client = deps.store.registerClient({
-      clientName: typeof body.client_name === "string" ? body.client_name.slice(0, 200) : undefined,
-      redirectUris: redirectUris as string[],
-    });
+    let client;
+    try {
+      client = deps.store.registerClient({
+        clientName: typeof body.client_name === "string" ? body.client_name.slice(0, 200) : undefined,
+        redirectUris: redirectUris as string[],
+      });
+    } catch (error) {
+      if ((error as Error).message === "CLIENT_REGISTRATION_LIMIT") {
+        res.status(429).json({ error: "registration_limit_reached" });
+        return;
+      }
+      if ((error as Error).message === "INVALID_REDIRECT_URIS") {
+        res.status(400).json({ error: "invalid_redirect_uri" });
+        return;
+      }
+      throw error;
+    }
     deps.logger.info(`Registered OAuth client ${client.clientId} (${client.clientName ?? "unnamed"})`);
     res.status(201).json({
       client_id: client.clientId,
@@ -189,7 +264,20 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
 
   router.get("/oauth/authorize", (req, res) => {
     prunePending();
-    const query = req.query as Record<string, string | undefined>;
+    const query = scalarStringFields(req.query, [
+      "client_id",
+      "redirect_uri",
+      "response_type",
+      "code_challenge",
+      "code_challenge_method",
+      "scope",
+      "state",
+      "resource",
+    ]);
+    if (!query) {
+      res.status(400).send("OAuth parameters must each have one string value.");
+      return;
+    }
     const client = query.client_id ? deps.store.getClient(query.client_id) : undefined;
     if (!client) {
       res.status(400).send("Unknown client. Please reconnect from ChatGPT.");
@@ -211,11 +299,36 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
       fail("unsupported_response_type", "Only response_type=code is supported");
       return;
     }
-    if (!query.code_challenge || query.code_challenge_method !== "S256") {
+    if (
+      !query.code_challenge ||
+      !/^[A-Za-z0-9_-]{43,128}$/.test(query.code_challenge) ||
+      query.code_challenge_method !== "S256"
+    ) {
       fail("invalid_request", "PKCE with S256 is required");
       return;
     }
+    if ((query.state?.length ?? 0) > 1024 || (query.resource?.length ?? 0) > 2048) {
+      fail("invalid_request", "Authorization request parameter is too long");
+      return;
+    }
+    const invalid = invalidScopes(query.scope);
+    if (invalid.length > 0) {
+      fail("invalid_scope", "One or more requested scopes are not supported");
+      return;
+    }
     const scopes = filterScopes(query.scope);
+    const expectedResource = `${deps.getBaseUrl(req)}/mcp`;
+    if (query.resource && query.resource.replace(/\/+$/, "") !== expectedResource.replace(/\/+$/, "")) {
+      fail("invalid_target", "The requested resource does not match this workspace bridge");
+      return;
+    }
+    const pendingForClient = [...pendingRequests.values()].filter(
+      (pending) => pending.clientId === client.clientId
+    ).length;
+    if (pendingRequests.size >= MAX_PENDING_AUTH_REQUESTS || pendingForClient >= 4) {
+      fail("temporarily_unavailable", "Too many pending authorization requests");
+      return;
+    }
     const request: PendingAuthRequest = {
       id: randomBytes(16).toString("hex"),
       clientId: client.clientId,
@@ -230,12 +343,27 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
     res
       .status(200)
       .type("html")
-      .send(pairingPage({ requestId: request.id, workspaceName: deps.workspaceName, scopes }));
+      .send(
+        pairingPage({
+          requestId: request.id,
+          workspaceName: deps.workspaceName,
+          clientName: client.clientName ?? "Unnamed OAuth client",
+          redirectUri,
+          scopes,
+        })
+      );
   });
 
-  router.post("/oauth/authorize", urlencoded({ extended: false }), (req, res) => {
+  router.post(
+    "/oauth/authorize",
+    urlencoded({ extended: false, limit: "16kb", parameterLimit: 20 }),
+    (req, res) => {
     prunePending();
-    const body = req.body as { request_id?: string; pairing_code?: string };
+    const body = scalarStringFields(req.body, ["request_id", "pairing_code"]);
+    if (!body) {
+      res.status(400).send("Invalid authorization form.");
+      return;
+    }
     const request = body.request_id ? pendingRequests.get(body.request_id) : undefined;
     if (!request) {
       res.status(400).send("This authorization request has expired. Please reconnect from ChatGPT.");
@@ -258,6 +386,8 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
           pairingPage({
             requestId: request.id,
             workspaceName: deps.workspaceName,
+            clientName: deps.store.getClient(request.clientId)?.clientName ?? "Unnamed OAuth client",
+            redirectUri: request.redirectUri,
             scopes: request.scopes,
             error: messages[verdict.reason] ?? "Verification failed.",
           })
@@ -265,6 +395,7 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
       return;
     }
     pendingRequests.delete(request.id);
+    deps.store.markClientAuthorized(request.clientId);
     const code = deps.store.createAuthorizationCode({
       clientId: request.clientId,
       redirectUri: request.redirectUri,
@@ -278,12 +409,28 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
     url.searchParams.set("code", code);
     if (request.state) url.searchParams.set("state", request.state);
     res.redirect(url.toString());
-  });
+    }
+  );
 
   // ---- Token endpoint --------------------------------------------------------
 
-  router.post("/oauth/token", urlencoded({ extended: false }), json(), (req, res) => {
-    const body = req.body as Record<string, string | undefined>;
+  router.post(
+    "/oauth/token",
+    urlencoded({ extended: false, limit: "16kb", parameterLimit: 20 }),
+    json({ limit: "16kb", strict: true }),
+    (req, res) => {
+    const body = scalarStringFields(req.body, [
+      "grant_type",
+      "code",
+      "code_verifier",
+      "client_id",
+      "redirect_uri",
+      "refresh_token",
+    ]);
+    if (!body) {
+      res.status(400).json({ error: "invalid_request" });
+      return;
+    }
     const grantType = body.grant_type;
 
     if (grantType === "authorization_code") {
@@ -297,7 +444,7 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
         res.status(400).json({ error: "invalid_grant" });
         return;
       }
-      if (redirectUri && redirectUri !== record.redirectUri) {
+      if (!redirectUri || redirectUri !== record.redirectUri) {
         res.status(400).json({ error: "invalid_grant", error_description: "redirect_uri mismatch" });
         return;
       }
@@ -340,15 +487,24 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
     }
 
     res.status(400).json({ error: "unsupported_grant_type" });
-  });
+    }
+  );
 
   // ---- Revocation (RFC 7009) ---------------------------------------------------
 
-  router.post("/oauth/revoke", urlencoded({ extended: false }), (req, res) => {
-    const body = req.body as { token?: string };
+  router.post(
+    "/oauth/revoke",
+    urlencoded({ extended: false, limit: "16kb", parameterLimit: 10 }),
+    (req, res) => {
+    const body = scalarStringFields(req.body, ["token"]);
+    if (!body) {
+      res.status(400).json({ error: "invalid_request" });
+      return;
+    }
     if (body.token) deps.store.revokeToken(body.token);
     res.status(200).json({});
-  });
+    }
+  );
 
   return router;
 }

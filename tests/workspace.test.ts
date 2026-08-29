@@ -2,13 +2,15 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import { Workspace, WorkspaceError } from "../src/workspace/manager.js";
-import { makeTmpDir, cleanup, write } from "./helpers.js";
+import { makeTmpDir, cleanup, write, isolateStateDir } from "./helpers.js";
 
 let root: string;
 let outside: string;
 let ws: Workspace;
+let stateDir: string;
 
 beforeAll(() => {
+  stateDir = isolateStateDir();
   root = makeTmpDir("ws");
   outside = makeTmpDir("outside");
   write(root, "hello.txt", "hello world\n");
@@ -19,6 +21,9 @@ beforeAll(() => {
   write(root, "certs/server.pem", "PRIVATE KEY\n");
   write(root, "keys/id_rsa", "PRIVATE KEY\n");
   write(root, "nested/.ssh/config", "Host *\n");
+  write(root, ".git/config", "[core]\n\trepositoryformatversion = 0\n");
+  write(root, "artifacts/session.har", "synthetic browser capture\n");
+  write(root, "data/users.sqlite", "synthetic database\n");
   write(outside, "secret.txt", "outside data\n");
   write(root, ".c2cignore", "private-notes/\n");
   write(root, "private-notes/todo.md", "secret notes\n");
@@ -118,6 +123,17 @@ describe("sensitive files", () => {
     expectDenied("private-notes/todo.md");
   });
 
+  it("denies repository metadata and the ignore policy itself", () => {
+    expectDenied(".git");
+    expectDenied(".git/config");
+    expectDenied(".c2cignore");
+  });
+
+  it("denies browser captures and local databases", () => {
+    expectDenied("artifacts/session.har");
+    expectDenied("data/users.sqlite");
+  });
+
   it("hides sensitive files from directory listing", async () => {
     const listing = await ws.listDirectory(".", { limit: 500, depth: 2 });
     const paths = listing.entries.map((entry) => entry.path);
@@ -154,13 +170,32 @@ describe("read_file pagination", () => {
   it("reports FILE_NOT_FOUND for missing files", async () => {
     await expect(ws.readFile("nope.txt")).rejects.toMatchObject({ code: "FILE_NOT_FOUND" });
   });
+
+  it("rejects source files larger than 5 MiB", async () => {
+    fs.writeFileSync(path.join(root, "too-large.txt"), Buffer.alloc(5 * 1024 * 1024 + 1, 0x61));
+    await expect(ws.readFile("too-large.txt")).rejects.toMatchObject({ code: "FILE_TOO_LARGE" });
+  });
+
+  it("rejects a single line that exceeds the bounded response", async () => {
+    write(root, "minified.js", "a".repeat(300 * 1024));
+    await expect(ws.readFile("minified.js")).rejects.toMatchObject({ code: "FILE_TOO_LARGE" });
+  });
+
+  it("redacts credential-shaped values in otherwise readable files", async () => {
+    const token = "sk-proj-abcdefghijklmnopqrstuvwxyz1234567890";
+    write(root, "accidental-secret.ts", `export const api_key = "${token}";\n`);
+    const result = await ws.readFile("accidental-secret.ts");
+    expect(result.content).not.toContain(token);
+    expect(result.content).toContain("[REDACTED");
+    expect(result.redactionCount).toBeGreaterThan(0);
+  });
 });
 
 describe("workspace identity", () => {
   it("has a stable id and name", () => {
     const again = new Workspace(root);
     expect(again.id).toBe(ws.id);
-    expect(ws.id).toMatch(/^[a-f0-9]{12}$/);
+    expect(ws.id).toMatch(/^[a-f0-9]{24}$/);
     expect(ws.name).toBe(path.basename(root));
   });
 
@@ -171,5 +206,56 @@ describe("workspace identity", () => {
     expect(namedWs.name).toBe("Remi");
     expect(namedWs.projectConfig.maxIterations).toBe(12);
     cleanup(named);
+  });
+
+  it("rejects a state directory located inside the connected workspace", () => {
+    process.env.C2C_STATE_DIR = path.join(root, "local-state");
+    try {
+      expect(() => new Workspace(root)).toThrow(/state directory must be outside/i);
+    } finally {
+      process.env.C2C_STATE_DIR = stateDir;
+    }
+  });
+
+  it("fails closed when .c2cignore cannot be read", () => {
+    const unreadable = makeTmpDir("bad-ignore");
+    fs.mkdirSync(path.join(unreadable, ".c2cignore"));
+    expect(() => new Workspace(unreadable)).toThrow(/Cannot enforce \.c2cignore/);
+    cleanup(unreadable);
+  });
+
+  it("fails closed when .c2cignore is a symlink", () => {
+    const linked = makeTmpDir("linked-ignore");
+    const policy = makeTmpDir("outside-policy");
+    write(policy, "ignore", "private/\n");
+    fs.symlinkSync(path.join(policy, "ignore"), path.join(linked, ".c2cignore"));
+    expect(() => new Workspace(linked)).toThrow(/Cannot enforce \.c2cignore/);
+    cleanup(linked);
+    cleanup(policy);
+  });
+
+  it("does not inspect a symlinked project manifest", () => {
+    const linked = makeTmpDir("linked-project");
+    const outsideManifest = makeTmpDir("outside-manifest");
+    write(outsideManifest, "package.json", JSON.stringify({ scripts: { "secret-token": "echo no" } }));
+    fs.symlinkSync(path.join(outsideManifest, "package.json"), path.join(linked, "package.json"));
+    const linkedWs = new Workspace(linked);
+    expect(linkedWs.detectProject()).toMatchObject({ projectType: "unknown", scriptNames: [] });
+    cleanup(linked);
+    cleanup(outsideManifest);
+  });
+
+  it("sanitizes and bounds untrusted project config", () => {
+    const configured = makeTmpDir("configured");
+    write(
+      configured,
+      ".c2c.json",
+      JSON.stringify({ name: "Safe\u202eName\u0000", maxIterations: 1_000_000 })
+    );
+    const configuredWs = new Workspace(configured);
+    expect(configuredWs.name).not.toContain("\u0000");
+    expect(configuredWs.name).not.toContain("\u202e");
+    expect(configuredWs.projectConfig.maxIterations).toBeUndefined();
+    cleanup(configured);
   });
 });

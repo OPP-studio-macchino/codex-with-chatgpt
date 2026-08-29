@@ -2,12 +2,14 @@ import type { NextFunction, Request, Response } from "express";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import type { AuthStore } from "./store.js";
 import type { Logger } from "../logger/index.js";
+import { TRUSTED_TUNNEL_HEADER, verifyTrustedTunnelToken } from "./trusted-tunnel.js";
 
 export interface BearerAuthDeps {
   store: AuthStore;
   workspaceId: string;
   getBaseUrl: (req: Request) => string;
   logger: Logger;
+  trustedTunnelTokenFile?: string;
 }
 
 /**
@@ -17,6 +19,20 @@ export interface BearerAuthDeps {
  */
 export function bearerAuth(deps: BearerAuthDeps) {
   return (req: Request, res: Response, next: NextFunction): void => {
+    const trustedTunnelToken = req.get(TRUSTED_TUNNEL_HEADER) ?? "";
+    if (
+      deps.trustedTunnelTokenFile &&
+      verifyTrustedTunnelToken(deps.trustedTunnelTokenFile, trustedTunnelToken)
+    ) {
+      const authInfo: AuthInfo = {
+        token: "trusted-tunnel",
+        clientId: "openai-secure-tunnel",
+        scopes: ["workspace.read", "workspace.search", "git.read", "execution.read"],
+      };
+      (req as Request & { auth?: AuthInfo }).auth = authInfo;
+      next();
+      return;
+    }
     const challenge = (error: string, description: string): string =>
       `Bearer realm="c2c", error="${error}", error_description="${description}", ` +
       `resource_metadata="${deps.getBaseUrl(req)}/.well-known/oauth-protected-resource/mcp"`;

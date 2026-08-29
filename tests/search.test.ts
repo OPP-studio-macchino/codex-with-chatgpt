@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
+import fs from "node:fs";
 import { Workspace } from "../src/workspace/manager.js";
 import { searchWorkspace, resetRipgrepCache, findRipgrep } from "../src/workspace/search.js";
 import { makeTmpDir, cleanup, write } from "./helpers.js";
@@ -12,6 +13,13 @@ beforeAll(() => {
   write(root, "src/deep/nested.ts", "// needle-alpha appears here too\n");
   write(root, "README.md", "This project contains needle-alpha documentation.\n");
   write(root, ".env", "NEEDLE-ALPHA=secret\n");
+  write(root, ".c2cignore", "private/\n");
+  write(root, "private/notes.txt", "needle-alpha must remain private\n");
+  write(
+    root,
+    "src/accidental.ts",
+    'export const api_key = "sk-proj-abcdefghijklmnopqrstuvwxyz1234567890"; // redact-me\n'
+  );
   write(root, "node_modules/pkg/index.js", "needle-alpha in dependencies\n");
   for (let i = 0; i < 30; i++) {
     write(root, `many/file-${i}.txt`, "needle-beta\nneedle-beta\n");
@@ -25,6 +33,7 @@ afterAll(() => {
 
 afterEach(() => {
   delete process.env.C2C_DISABLE_RG;
+  delete process.env.C2C_RG_PATH;
   resetRipgrepCache();
 });
 
@@ -56,6 +65,16 @@ describe.each(engines())("search engine: %s", (engine) => {
     const paths = result.matches.map((match) => match.path);
     expect(paths.some((p) => p.includes(".env"))).toBe(false);
     expect(paths.some((p) => p.includes("node_modules"))).toBe(false);
+    expect(paths.some((p) => p.includes("private/"))).toBe(false);
+  });
+
+  it("redacts credential-shaped values in matching lines", async () => {
+    configure();
+    const result = await searchWorkspace(ws, { query: "redact-me" });
+    expect(result.matches).toHaveLength(1);
+    expect(result.matches[0].text).not.toContain("sk-proj-");
+    expect(result.matches[0].text).toContain("[REDACTED");
+    expect(result.redactionCount).toBeGreaterThan(0);
   });
 
   it("respects the limit", async () => {
@@ -79,5 +98,23 @@ describe.each(engines())("search engine: %s", (engine) => {
     const paths = result.matches.map((match) => match.path);
     expect(paths).toContain("src/auth.ts");
     expect(paths).not.toContain("README.md");
+  });
+});
+
+describe("regex fallback safety", () => {
+  it("ignores a workspace-provided ripgrep override", () => {
+    const candidate = write(root, "rg-fixture", "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(candidate, 0o700);
+    process.env.C2C_RG_PATH = candidate;
+    resetRipgrepCache();
+    expect(findRipgrep()).not.toBe(fs.realpathSync.native(candidate));
+  });
+
+  it("fails closed when ripgrep is unavailable", async () => {
+    process.env.C2C_DISABLE_RG = "1";
+    resetRipgrepCache();
+    await expect(searchWorkspace(ws, { query: "(a+)+$", regex: true })).rejects.toMatchObject({
+      code: "UNSUPPORTED_REGEX",
+    });
   });
 });

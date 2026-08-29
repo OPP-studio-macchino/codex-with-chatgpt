@@ -1,22 +1,25 @@
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir, getStateDir } from "../config/paths.js";
+import { redactSensitiveText } from "../security/redaction.js";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 const LEVELS: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
+const MAX_LOG_BYTES = 5 * 1024 * 1024;
+const MAX_LOG_FIELD_CHARS = 8000;
 
 /**
  * Secret redaction. Logs must never contain tokens, pairing codes or credentials.
  */
 const REDACT_PATTERNS: RegExp[] = [
-  /c2c_(?:at|rt|ac|admin)_[A-Za-z0-9_-]+/g,
+  /c2c_(?:at|rt|ac|admin|tunnel)_[A-Za-z0-9_-]+/g,
   /(authorization"?\s*[:=]\s*"?bearer\s+)[^\s"']+/gi,
   /((?:access_token|refresh_token|client_secret|code_verifier|code|token)"?\s*[:=]\s*"?)[A-Za-z0-9._~+/-]{16,}/gi,
   /\b[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}\b/g, // pairing-code shaped strings
 ];
 
 export function redact(input: string): string {
-  let out = input;
+  let out = redactSensitiveText(input).text;
   for (const pattern of REDACT_PATTERNS) {
     out = out.replace(pattern, (_m, g1) => (typeof g1 === "string" ? `${g1}[REDACTED]` : "[REDACTED]"));
   }
@@ -50,10 +53,15 @@ export class Logger {
 
   private write(level: LogLevel, msg: string, extra?: unknown): void {
     if (LEVELS[level] < this.level) return;
-    const parts = [new Date().toISOString(), level.toUpperCase().padEnd(5), `[${this.name}]`, redact(msg)];
+    const parts = [
+      new Date().toISOString(),
+      level.toUpperCase().padEnd(5),
+      `[${this.name}]`,
+      redact(msg).slice(0, MAX_LOG_FIELD_CHARS),
+    ];
     if (extra !== undefined) {
       try {
-        parts.push(redact(JSON.stringify(extra)));
+        parts.push(redact(JSON.stringify(extra)).slice(0, MAX_LOG_FIELD_CHARS));
       } catch {
         parts.push("[unserializable]");
       }
@@ -61,7 +69,26 @@ export class Logger {
     const line = parts.join(" ") + "\n";
     if (this.file) {
       try {
-        fs.appendFileSync(this.file, line, { mode: 0o600 });
+        const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+        const fd = fs.openSync(
+          this.file,
+          fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | noFollow,
+          0o600
+        );
+        try {
+          if (fs.fstatSync(fd).size > MAX_LOG_BYTES) {
+            fs.ftruncateSync(fd, 0);
+            fs.writeSync(fd, `${new Date().toISOString()} WARN  [${this.name}] log rotated locally\n`);
+          }
+          fs.writeSync(fd, line);
+          try {
+            fs.fchmodSync(fd, 0o600);
+          } catch {
+            // Filesystems without POSIX permissions are handled by their host ACLs.
+          }
+        } finally {
+          fs.closeSync(fd);
+        }
       } catch {
         // logging must never crash the bridge
       }

@@ -1,9 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHmac } from "node:crypto";
 import readline from "node:readline";
 import { IgnoreRules } from "./ignore.js";
-import { readJsonIfExists } from "../config/paths.js";
+import { getStateDir, getWorkspaceIdentityKey, readJsonIfExists } from "../config/paths.js";
+import { redactSensitiveText } from "../security/redaction.js";
 
 export type WorkspaceErrorCode =
   | "INVALID_PATH"
@@ -13,7 +14,9 @@ export type WorkspaceErrorCode =
   | "NOT_A_FILE"
   | "NOT_A_DIRECTORY"
   | "BINARY_FILE"
-  | "FILE_TOO_LARGE";
+  | "FILE_TOO_LARGE"
+  | "UNSAFE_STATE_DIRECTORY"
+  | "UNSUPPORTED_REGEX";
 
 export class WorkspaceError extends Error {
   constructor(
@@ -38,6 +41,7 @@ export interface ReadFileResult {
   remainingLines: number;
   nextStartLine: number | null;
   content: string;
+  redactionCount: number;
 }
 
 export interface DirEntry {
@@ -63,6 +67,29 @@ export interface ProjectConfig {
 const DEFAULT_MAX_LINES = 400;
 const HARD_MAX_LINES = 2000;
 const DEFAULT_MAX_BYTES = 256 * 1024;
+const HARD_MAX_SOURCE_BYTES = 5 * 1024 * 1024;
+
+function loadProjectConfig(root: string): ProjectConfig {
+  const raw = readJsonIfExists<Record<string, unknown>>(path.join(root, ".c2c.json"), 64 * 1024);
+  if (!raw) return {};
+  const config: ProjectConfig = {};
+  if (typeof raw.name === "string") {
+    const name = raw.name
+      .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (name) config.name = name.slice(0, 100);
+  }
+  if (
+    typeof raw.maxIterations === "number" &&
+    Number.isInteger(raw.maxIterations) &&
+    raw.maxIterations >= 1 &&
+    raw.maxIterations <= 100
+  ) {
+    config.maxIterations = raw.maxIterations;
+  }
+  return config;
+}
 
 export class Workspace {
   readonly root: string;
@@ -83,9 +110,19 @@ export class Workspace {
       throw new WorkspaceError("NOT_A_DIRECTORY", `Workspace root is not a directory: ${rootInput}`);
     }
     this.root = real;
-    this.id = createHash("sha256").update(normCase(real)).digest("hex").slice(0, 12);
+    const stateDir = this.canonicalize(path.resolve(getStateDir()));
+    if (this.contains(stateDir)) {
+      throw new WorkspaceError(
+        "UNSAFE_STATE_DIRECTORY",
+        "C2C state directory must be outside the connected workspace."
+      );
+    }
+    this.id = createHmac("sha256", getWorkspaceIdentityKey())
+      .update(normCase(real))
+      .digest("hex")
+      .slice(0, 24);
     this.ignoreRules = new IgnoreRules(real);
-    this.projectConfig = readJsonIfExists<ProjectConfig>(path.join(real, ".c2c.json")) ?? {};
+    this.projectConfig = loadProjectConfig(real);
     this.name = this.projectConfig.name ?? path.basename(real);
   }
 
@@ -180,6 +217,12 @@ export class Workspace {
     if (!stat.isFile()) {
       throw new WorkspaceError("NOT_A_FILE", `Not a regular file: ${rel}`);
     }
+    if (stat.size > HARD_MAX_SOURCE_BYTES) {
+      throw new WorkspaceError(
+        "FILE_TOO_LARGE",
+        `File exceeds the ${HARD_MAX_SOURCE_BYTES}-byte source limit: ${rel}`
+      );
+    }
     if (await this.isBinary(abs)) {
       throw new WorkspaceError("BINARY_FILE", `Binary file (${stat.size} bytes): ${rel}. Content is not returned.`);
     }
@@ -202,8 +245,15 @@ export class Workspace {
     for await (const line of rl) {
       totalLines++;
       if (totalLines >= startLine && totalLines <= endLimit && !byteTruncated) {
-        const cost = Buffer.byteLength(line, "utf8") + 1;
-        if (collectedBytes + cost > maxBytes && lines.length > 0) {
+        const cost = Buffer.byteLength(line, "utf8") + (lines.length > 0 ? 1 : 0);
+        if (collectedBytes + cost > maxBytes) {
+          if (lines.length === 0) {
+            stream.destroy();
+            throw new WorkspaceError(
+              "FILE_TOO_LARGE",
+              `Line ${totalLines} exceeds the ${maxBytes}-byte response limit: ${rel}`
+            );
+          }
           byteTruncated = true;
         } else {
           lines.push(line);
@@ -215,6 +265,7 @@ export class Workspace {
     rl.close();
 
     const remaining = Math.max(0, totalLines - actualEnd);
+    const redacted = redactSensitiveText(lines.join("\n"));
     return {
       path: rel,
       sizeBytes: stat.size,
@@ -224,7 +275,8 @@ export class Workspace {
       truncated: remaining > 0,
       remainingLines: remaining,
       nextStartLine: remaining > 0 ? actualEnd + 1 : null,
-      content: lines.join("\n"),
+      content: redacted.text,
+      redactionCount: redacted.redactionCount,
     };
   }
 
@@ -244,7 +296,7 @@ export class Workspace {
     }
     const depth = Math.min(4, Math.max(1, Math.floor(opts.depth ?? 1)));
     const limit = Math.min(1000, Math.max(1, Math.floor(opts.limit ?? 200)));
-    const offset = Math.max(0, Math.floor(opts.offset ?? 0));
+    const offset = Math.min(10_000, Math.max(0, Math.floor(opts.offset ?? 0)));
 
     const all: DirEntry[] = [];
     const walk = async (dirAbs: string, dirRel: string, level: number): Promise<void> => {
@@ -274,7 +326,7 @@ export class Workspace {
           }
           all.push({ path: childRel, type: "file", sizeBytes: size });
         }
-        if (all.length >= offset + limit + 2000) return; // hard cap for huge trees
+        if (all.length >= Math.min(12_000, offset + limit + 2000)) return;
       }
     };
     await walk(abs, rel, 1);
@@ -296,14 +348,21 @@ export class Workspace {
     languages: string[];
     frameworks: string[];
     packageManager: string | null;
-    scripts: Record<string, string>;
+    scriptNames: string[];
   } {
-    const has = (f: string): boolean => fs.existsSync(path.join(this.root, f));
+    const has = (f: string): boolean => {
+      try {
+        const stat = fs.lstatSync(path.join(this.root, f));
+        return stat.isFile() && !stat.isSymbolicLink();
+      } catch {
+        return false;
+      }
+    };
     const languages = new Set<string>();
     const frameworks = new Set<string>();
     let projectType = "unknown";
     let packageManager: string | null = null;
-    let scripts: Record<string, string> = {};
+    let scriptNames: string[] = [];
 
     if (has("package.json")) {
       projectType = "node";
@@ -313,8 +372,20 @@ export class Workspace {
         dependencies?: Record<string, string>;
         devDependencies?: Record<string, string>;
       }>(path.join(this.root, "package.json"));
-      scripts = pkg?.scripts ?? {};
-      const deps = { ...(pkg?.dependencies ?? {}), ...(pkg?.devDependencies ?? {}) };
+      scriptNames = Object.keys(
+        pkg?.scripts && typeof pkg.scripts === "object" && !Array.isArray(pkg.scripts) ? pkg.scripts : {}
+      )
+        .slice(0, 200)
+        .map((name) => redactSensitiveText(name.slice(0, 200)).text)
+        .sort();
+      const dependencies =
+        pkg?.dependencies && typeof pkg.dependencies === "object" && !Array.isArray(pkg.dependencies)
+          ? pkg.dependencies
+          : {};
+      const devDependencies =
+        pkg?.devDependencies && typeof pkg.devDependencies === "object" && !Array.isArray(pkg.devDependencies)
+          ? pkg.devDependencies
+          : {};
       const known: Record<string, string> = {
         next: "Next.js",
         react: "React",
@@ -328,7 +399,7 @@ export class Workspace {
         jest: "Jest",
       };
       for (const [dep, label] of Object.entries(known)) {
-        if (deps[dep]) frameworks.add(label);
+        if (Object.hasOwn(dependencies, dep) || Object.hasOwn(devDependencies, dep)) frameworks.add(label);
       }
       if (has("pnpm-lock.yaml")) packageManager = "pnpm";
       else if (has("yarn.lock")) packageManager = "yarn";
@@ -357,7 +428,7 @@ export class Workspace {
       languages: [...languages],
       frameworks: [...frameworks],
       packageManager,
-      scripts,
+      scriptNames,
     };
   }
 }

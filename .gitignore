@@ -4,6 +4,7 @@ dist/
 .pnpm-store/
 *.log
 .DS_Store
+._*
 .env
 .env.*
 !.env.example

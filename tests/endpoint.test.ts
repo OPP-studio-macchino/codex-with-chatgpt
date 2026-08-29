@@ -1,11 +1,17 @@
 import { describe, it, expect } from "vitest";
+import fs from "node:fs";
+import path from "node:path";
 import {
   connectorAction,
   connectorNameFor,
   DEFAULT_CONNECTOR_NAME,
   mcpUrlFromPublic,
   normalizePublicUrl,
+  endpointFile,
+  readLastEndpoint,
+  writeLastEndpoint,
 } from "../src/config/endpoint.js";
+import { isolateStateDir } from "./helpers.js";
 
 describe("connectorAction", () => {
   it("creates on the first successful URL", () => {
@@ -63,5 +69,64 @@ describe("mcpUrlFromPublic", () => {
     expect(mcpUrlFromPublic("https://A.trycloudflare.com/")).toBe("https://a.trycloudflare.com/mcp");
     expect(mcpUrlFromPublic("https://a.trycloudflare.com/mcp")).toBe("https://a.trycloudflare.com/mcp");
     expect(normalizePublicUrl("https://A.trycloudflare.com/")).toBe("https://a.trycloudflare.com");
+  });
+
+  it("rejects insecure, credentialed, and ambiguous endpoint URLs", () => {
+    for (const candidate of [
+      "http://public.example.com",
+      "https://user:secret@example.com",
+      "https://example.com/path",
+      "https://example.com/?token=secret",
+      "https://example.com/#fragment",
+    ]) {
+      expect(mcpUrlFromPublic(candidate)).toBeNull();
+    }
+    expect(mcpUrlFromPublic("http://127.0.0.1:48765")).toBe("http://127.0.0.1:48765/mcp");
+  });
+});
+
+describe("persisted endpoint validation", () => {
+  const workspaceId = "0123456789abcdef01234567";
+
+  it("round-trips a validated endpoint", () => {
+    isolateStateDir();
+    writeLastEndpoint({
+      workspaceId,
+      port: 48765,
+      publicUrl: "https://mcp.example.com",
+      mcpUrl: "https://mcp.example.com/mcp",
+      connectorName: "Codex with ChatGPT · Demo",
+    });
+    expect(readLastEndpoint(workspaceId)?.mcpUrl).toBe("https://mcp.example.com/mcp");
+  });
+
+  it("rejects credentialed or cross-origin state loaded from disk", () => {
+    const state = isolateStateDir();
+    const file = endpointFile(workspaceId);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        workspaceId,
+        port: 48765,
+        publicUrl: "https://mcp.example.com",
+        mcpUrl: "https://user:secret@attacker.example/mcp",
+        savedAt: new Date().toISOString(),
+      })
+    );
+    expect(state).toBeTruthy();
+    expect(readLastEndpoint(workspaceId)).toBeNull();
+  });
+
+  it("sanitizes stored connector labels before displaying them", () => {
+    isolateStateDir();
+    writeLastEndpoint({
+      workspaceId,
+      port: 48765,
+      publicUrl: "https://mcp.example.com",
+      mcpUrl: "https://mcp.example.com/mcp",
+      connectorName: "Trusted\u202e\nConnector",
+    });
+    expect(readLastEndpoint(workspaceId)?.connectorName).toBe("Trusted Connector");
   });
 });

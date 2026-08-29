@@ -3,10 +3,43 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDir, getStateDir } from "../config/paths.js";
-import { findLiveBridge, probeBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
+import { clearRuntimeState, findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
 import { Workspace } from "../workspace/manager.js";
+import { ensureTrustedTunnelToken } from "../auth/trusted-tunnel.js";
+import { normalizeExternalBaseUrl } from "../config/transport.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+function daemonEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  const allowed = [
+    "PATH",
+    "Path",
+    "SystemRoot",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "HOME",
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "XDG_STATE_HOME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "TZ",
+    "LANG",
+    "LC_ALL",
+    "C2C_STATE_DIR",
+    "C2C_LOG_LEVEL",
+    "C2C_DISABLE_RG",
+  ];
+  for (const key of allowed) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  env.C2C_STATE_DIR = getStateDir();
+  env.C2C_DAEMON = "1";
+  return env;
+}
 
 /** Path to the CLI entry, works from dist/ and from tsx dev runs. */
 function cliEntry(): { cmd: string; args: string[] } {
@@ -29,29 +62,62 @@ export interface EnsureBridgeResult {
  * Ensure a bridge is running for the workspace. Reuses a live instance,
  * otherwise spawns a detached daemon and waits for it to become healthy.
  */
-export async function ensureBridge(workspaceRoot: string, opts: { port?: number } = {}): Promise<EnsureBridgeResult> {
+export async function ensureBridge(
+  workspaceRoot: string,
+  opts: { port?: number; externalBaseUrl?: string; trustedTunnelAuth?: boolean } = {}
+): Promise<EnsureBridgeResult> {
   const workspace = new Workspace(workspaceRoot);
   const live = await findLiveBridge(workspace.id);
-  if (live) return { runtime: live, spawned: false };
+  if (live) {
+    if (opts.externalBaseUrl) {
+      const requested = normalizeExternalBaseUrl(opts.externalBaseUrl);
+      if (live.publicUrl !== requested) {
+        throw new Error("Bridge is already running with a different external base URL; stop it first.");
+      }
+    }
+    if (
+      opts.trustedTunnelAuth !== undefined &&
+      Boolean(live.trustedTunnelAuth) !== opts.trustedTunnelAuth
+    ) {
+      throw new Error("Bridge is already running with a different authentication mode; stop it first.");
+    }
+    if (opts.trustedTunnelAuth) ensureTrustedTunnelToken(workspace.id);
+    return { runtime: live, spawned: false };
+  }
+  const trustedTunnel = opts.trustedTunnelAuth ? ensureTrustedTunnelToken(workspace.id) : null;
 
   const logDir = ensureDir(path.join(getStateDir(), "logs"));
   const logFile = path.join(logDir, `bridge-${workspace.id}.out.log`);
-  const out = fs.openSync(logFile, "a", 0o600);
+  const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+  const out = fs.openSync(
+    logFile,
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | noFollow,
+    0o600
+  );
   try {
     // Existing files may have been created with a permissive umask. Keep the
     // daemon's inherited stdout/stderr log owner-readable only.
-    fs.chmodSync(logFile, 0o600);
+    fs.fchmodSync(out, 0o600);
+    if (fs.fstatSync(out).size > 2 * 1024 * 1024) fs.ftruncateSync(out, 0);
   } catch {
     // Windows / filesystems without chmod semantics
   }
   const { cmd, args } = cliEntry();
   const child = spawn(
     cmd,
-    [...args, "serve", "--workspace", workspace.root, ...(opts.port ? ["--port", String(opts.port)] : [])],
+    [
+      ...args,
+      "serve",
+      "--workspace",
+      workspace.root,
+      ...(opts.port ? ["--port", String(opts.port)] : []),
+      ...(opts.externalBaseUrl ? ["--external-base-url", opts.externalBaseUrl] : []),
+      ...(trustedTunnel ? ["--trusted-tunnel-token-file", trustedTunnel.file] : []),
+    ],
     {
       detached: true,
       stdio: ["ignore", out, out],
-      env: { ...process.env },
+      env: daemonEnv(),
     }
   );
   child.unref();
@@ -95,21 +161,18 @@ export async function adminFetch<T = unknown>(
 
 export async function stopBridge(workspaceRoot: string): Promise<boolean> {
   const workspace = new Workspace(workspaceRoot);
-  const runtime = readRuntimeState(workspace.id);
-  if (!runtime) return false;
-  const healthy = await probeBridge(runtime.port);
-  if (healthy && healthy.workspaceId === workspace.id) {
-    try {
-      await adminFetch(runtime, "POST", "/admin/shutdown", 5000);
-      return true;
-    } catch {
-      // fall through to kill
-    }
+  const runtime = await findLiveBridge(workspace.id);
+  if (!runtime) {
+    clearRuntimeState(workspace.id);
+    return false;
   }
   try {
-    process.kill(runtime.pid, "SIGTERM");
+    await adminFetch(runtime, "POST", "/admin/shutdown", 5000);
     return true;
   } catch {
+    // Never signal a PID from a stale runtime file: it may have been reused by
+    // an unrelated process. Clearing the local record is the safe fallback.
+    clearRuntimeState(workspace.id);
     return false;
   }
 }

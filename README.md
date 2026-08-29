@@ -1,217 +1,241 @@
-# Codex with ChatGPT
+# Codex with ChatGPT — hardened fork
 
-> ChatGPT thinks. Codex works.
-> ChatGPT 负责思考，Codex 负责干活。
+A consent-driven, read-only MCP bridge that lets ChatGPT inspect a selected
+local workspace for optional planning and review while Codex remains the
+execution authority.
 
-## The problem · 解决什么问题
+This repository is a security-focused fork of
+[`XiaoDuoYa/codex-with-chatgpt`](https://github.com/XiaoDuoYa/codex-with-chatgpt),
+refactored from upstream commit `2165dea39017d29fef95b85e8054669ad68541e1`.
+It is an independent community project and is not affiliated with or endorsed
+by OpenAI or Cloudflare.
 
-**中文** — ChatGPT 付费订阅的网页版额度大量闲置，Codex 却在消耗紧张的
-API 额度做规划和 Review。本项目把"思考"交给你已付费的网页版 ChatGPT，
-Codex 只负责执行。不用 API Key、不搞逆向代理——官方网页 + 只读 MCP 桥接。
+日本語: [README.ja.md](README.ja.md) · 中文: [README.zh-CN.md](README.zh-CN.md)
 
-**EN** — ChatGPT Plus/Pro web quota sits idle while your coding agent burns
-scarce API/Codex tokens on planning and review. This project moves the
-thinking to the subscription you already pay for; Codex only executes.
-No API keys, no reverse proxy — official web UI plus a read-only MCP bridge.
+## What it does
 
-## What it is · 这是什么
+The bridge exposes eight bounded, read-only MCP tools:
 
-**中文** — 把 ChatGPT 网页版变成 Codex 编码会话的"规划与审查大脑"，执行权
-完全保留在 Codex 手里。你的仓库永远不会被上传：ChatGPT 通过一条安全的、
-OAuth 保护的**只读** MCP 连接，按需读取当前工作区里它真正需要的那几行代码。
+- workspace metadata;
+- directory listing;
+- paginated text-file reads;
+- bounded workspace search;
+- Git status and diff;
+- test and execution summaries recorded by Codex.
 
-**EN** — Use the ChatGPT web app as the planning and review brain for your
-Codex coding sessions, while Codex keeps full ownership of execution. Your
-repository is never uploaded: ChatGPT reads exactly the lines it needs through
-a secure, OAuth-protected, **read-only** MCP connection to your current
-workspace.
+It does not expose file-write, delete, shell, package-install, commit, push, or
+deployment tools. ChatGPT's suggestions remain advisory; Codex must validate
+them against the user's request, repository instructions, and actual test
+results before acting.
 
-Detailed docs below are in English · 详细中文文档见 **[README.zh-CN.md](README.zh-CN.md)**
+## The data boundary, plainly stated
 
-## One-paste install · 一段话安装
+When ChatGPT calls a tool, the selected source excerpts, search results, diffs,
+paths, and summaries are sent from the local machine to ChatGPT/OpenAI. The
+repository is not uploaded wholesale, but requested content does leave the
+machine. With the optional Cloudflare fallback, Cloudflare is also in the
+transport path.
 
-**中文** — 不懂 git、Node、终端？完全不需要懂。把下面这段话原样复制给你的
-编码 Agent（Codex），然后去倒杯咖啡：
+The bridge blocks common credential paths, applies `.c2cignore`, bounds output,
+and redacts many credential-shaped values. Those controls reduce risk; they
+cannot prove that arbitrary personal data, proprietary material, or every
+possible secret format will be removed. Review the workspace and
+`.c2cignore` before connecting it.
 
-```text
-请帮我完整安装并配置 Codex with ChatGPT，全程自动，我是不懂技术的小白，
-所有事情你自己做：
+## Hardening in this fork
 
-1. 环境自检：需要 git 和 Node.js ≥ 20，缺什么就自动安装
-  （macOS 用 Homebrew，Windows 用 winget），同时安装 cloudflared。
-2. 下载：把 https://github.com/XiaoDuoYa/codex-with-chatgpt 克隆到
-   ~/codex-with-chatgpt（已存在就 git pull 更新）。
-3. 构建：在该目录里执行 corepack pnpm install 和 corepack pnpm build。
-4. 安装 Skill：把仓库里的 skill/SKILL.md 复制到
-   ~/.codex/skills/codex-with-chatgpt/SKILL.md，并把文件中
-   "The codex-with-chatgpt checkout lives at:" 那一行的路径改成实际克隆路径。
-5. 首次配置：按 SKILL.md 里的 first-time setup 流程执行
-  （运行 c2c setup，用内置浏览器打开 ChatGPT 配置连接器并输入配对码）。
-   全程只用内置浏览器，禁止打开任何第三方浏览器。
-6. 只有遇到需要我登录（ChatGPT / Cloudflare）、验证码或两步验证时才叫我，
-   而且一次只告诉我一个动作。
-7. 完成后给我看 ✓ 清单，并确认文件读取测试通过。我不懂 MCP、OAuth、
-   Tunnel、端口这些词，不要向我解释；出了问题先自己修。
-```
+- Local-only operation is the default; every remote transport is explicit.
+- OpenAI Secure MCP Tunnel support keeps the MCP listener on loopback and uses
+  a per-workspace, owner-only fixed-header token.
+- Cloudflare Quick Tunnel is an explicit fallback, never an automatic setup.
+- OAuth redirect validation, PKCE, request/body limits, rate limits, bounded
+  registrations, security headers, and immediate revocation are enforced.
+- Canonical realpath containment blocks `..`, absolute-path, and symlink escape.
+- Sensitive paths are filtered from reads, listings, search, Git status, and
+  Git diff; outbound text also passes through credential redaction.
+- Git inspection ignores global/system config and disables hooks, external diff
+  programs, text conversion, pagers, optional locks, and parent-repository bleed.
+- Runtime/state files use private directories and owner-only atomic writes where
+  the platform supports POSIX permissions.
+- Health responses disclose only service and status. Admin routes require both
+  loopback origin and a private admin token.
+- `doctor` does not create public exposure. `update-check` never installs an
+  update. Global Codex config changes require the separate `sandbox-allow`
+  command.
+- Dependencies are exact-version pinned and CI checks types, tests, build, and
+  production dependency audit.
 
+See [Security Model](docs/security.md) and [Hardening Notes](docs/hardening.md)
+for limitations and residual risks.
 
-**EN** — Don't know git, Node, or terminals? You don't need to. Copy the
-paragraph below, paste it to your coding agent (Codex), and go grab a coffee:
+## Requirements
 
-```text
-Please install and configure "Codex with ChatGPT" for me, fully automatically.
-I am a non-technical user — do everything yourself:
+- Node.js 20 or newer
+- Git
+- pnpm via Corepack
+- For OpenAI Secure MCP Tunnel: an official `tunnel-client` binary, a
+  `tunnel_id`, a runtime API key, and the required Platform/ChatGPT permissions
+- For the fallback only: `cloudflared`
 
-1. Check the environment: git and Node.js >= 20 must be available. Install
-   anything missing yourself (macOS: Homebrew, Windows: winget). Also install
-   cloudflared.
-2. Download: clone https://github.com/XiaoDuoYa/codex-with-chatgpt into
-   ~/codex-with-chatgpt (if it already exists, git pull to update).
-3. Build: inside that folder run `corepack pnpm install` then `corepack pnpm build`.
-4. Install the Skill: copy skill/SKILL.md to
-   ~/.codex/skills/codex-with-chatgpt/SKILL.md, and update the line
-   "The codex-with-chatgpt checkout lives at:" to the actual clone path.
-5. First-time setup: follow the SKILL.md "first-time setup" workflow
-   (run c2c setup, configure the ChatGPT connector in the BUILT-IN browser,
-   enter the pairing code). Never open a third-party browser.
-6. Only interrupt me for logins (ChatGPT / Cloudflare), CAPTCHAs or 2FA —
-   and give me exactly ONE action at a time.
-7. When done, show me the ✓ checklist and confirm the file-read test passed.
-   I don't know what MCP, OAuth, tunnels or ports are. Don't explain them.
-   If anything breaks, fix it yourself first.
-```
+Do not paste runtime API keys, OAuth tokens, cookies, or generated tunnel-token
+contents into chat, shell history, issue reports, or config files.
 
+## Install from this fork
 
-**Updates · 更新** — The Skill checks GitHub once a day and updates itself when a
-new version is released; no action needed. You can also say "更新 Codex with ChatGPT"
-anytime. / Skill 每天自动检查一次 GitHub，有新版本会自动更新，无需任何操作；
-也可以随时对 Codex 说"更新 Codex with ChatGPT"。
-
----
-
-*The sections below are in English. 以下详细内容为英文，中文完整版见
-[README.zh-CN.md](README.zh-CN.md)。*
-
-## Install → Setup → Use (manual)
-
-1. Install the Codex Skill: copy `skill/` to `~/.codex/skills/codex-with-chatgpt/`.
-2. Tell Codex: **"Set up Codex with ChatGPT."** (中文: "使用 Codex with ChatGPT 完成首次配置。")
-3. Use Codex normally: **"Use Codex with ChatGPT to implement XXX."**
-
-That's the whole manual. You don't need to know what MCP, OAuth, tunnels,
-ports or localhost are — Codex configures everything automatically and you
-just see:
-
-```
-Codex with ChatGPT
-
-✓ Project detected
-✓ Workspace Bridge started
-✓ Secure connection established
-✓ ChatGPT connected
-✓ File read test passed
-
-Ready.
-```
-
-The only step that may need you: logging into ChatGPT (and nothing else).
-
-## How it works
-
-```
-             ┌───────────────────────────┐
-             │       ChatGPT Web         │
-             │  Reason / Plan / Review   │
-             └──────────┬──────────▲─────┘
-                        │          │
-               MCP      │          │ Computer Use
-            Data Plane  │          │ Control Plane (<1 KB messages)
-                        ▼          │
-             ┌─────────────────────┐
-             │      C2C Bridge     │   loopback-only HTTP server
-             │  read-only MCP      │   OAuth 2.1 + one-time pairing code
-             │  OAuth + Pairing    │   Cloudflare Quick Tunnel
-             │  Tunnel Manager     │
-             └──────────┬──────────┘
-                        │  read-only
-                        ▼
-             ┌─────────────────────┐          ┌─────────────────────┐
-             │   Local Workspace   │◀─────────│    Codex Harness    │
-             └─────────────────────┘ edit/git │ shell / tests / fix │
-                                              └─────────────────────┘
-```
-
-- **Control plane (Computer Use)**: Codex and ChatGPT exchange tiny structured
-  `[C2C]` state messages — `INIT → PLAN → EXECUTED → REVIEW → DONE`. No diffs,
-  no logs, no file bodies are ever pasted.
-- **Data plane (MCP)**: ChatGPT pulls what it needs itself through 8 read-only
-  tools: `workspace_info`, `list_directory`, `read_file`, `search_workspace`,
-  `git_status`, `git_diff`, `test_status`, `execution_summary`.
-- **Independent review**: after Codex executes, ChatGPT inspects the actual
-  git diff and test records through MCP — it never trusts "all tests passed"
-  claims blindly.
-
-## Security model (short version)
-
-- **Read-only by construction**: write/delete/shell/commit tools simply do not
-  exist on the server. No prompt injection can enable them.
-- **One workspace = one boundary**: every token is bound to a single workspace;
-  path containment uses canonical realpaths (symlink/`../`/absolute-path escapes
-  are all blocked and tested).
-- **Sensitive files never leave**: `.env*`, keys, SSH, credentials are denied by
-  default (`.env.example` allowed); `.c2cignore` adds your own rules.
-- **Knowing the URL grants nothing**: the public MCP endpoint requires OAuth 2.1
-  (PKCE S256, dynamic client registration, rotating refresh tokens). Without a
-  token: 401. Wrong workspace: 403.
-- **The model never sees long-lived credentials**: the only secret that ever
-  touches a browser is a one-time pairing code (5-minute TTL, 5 attempts,
-  rate-limited, destroyed on use).
-
-Full threat model: [docs/security.md](docs/security.md)
-
-## For developers
+Review the repository and lockfile first, then:
 
 ```bash
-pnpm install
-pnpm build          # -> dist/, exposes the `c2c` bin
-pnpm test           # vitest: 76 tests (path security, OAuth, pairing, MCP e2e)
-
-c2c setup           # bridge + tunnel + pairing code, all in one
-c2c sandbox-allow   # whitelist the settings dir in Codex (macOS + Windows)
-c2c status / doctor / pair / unpair / logs / stop
+git clone https://github.com/OPP-studio-macchino/codex-with-chatgpt.git
+cd codex-with-chatgpt
+corepack pnpm install --frozen-lockfile
+corepack pnpm build
+node bin/c2c.js --help
 ```
 
-Requirements: Node.js >= 20, git. `cloudflared` for the public connection
-(auto-detected; the Skill installs it for you).
+The committed project policy disables dependency lifecycle scripts and uses the
+lockfile. Review any future request to override that policy. The project does
+not silently install system packages or update itself.
 
-Docs: [architecture](docs/architecture.md) · [protocol](docs/protocol.md) ·
-[security](docs/security.md) · [troubleshooting](docs/troubleshooting.md)
+In the examples below, replace `c2c` with `node /path/to/bin/c2c.js` unless you
+have deliberately linked the command onto `PATH`.
 
-## Project layout
+## Connection modes
 
-```
-src/
-  bridge/     loopback HTTP server, port recovery, admin API
-  mcp/        8 read-only tools, stateless Streamable HTTP
-  auth/       OAuth 2.1 (PKCE, DCR, refresh rotation, revocation)
-  pairing/    one-time pairing codes (CSPRNG, TTL, rate limits)
-  workspace/  path containment, sensitive-file policy, search, git
-  tunnel/     TunnelProvider abstraction + Cloudflare Quick Tunnel
-  execution/  execution records for the review loop
-  process/    daemon lifecycle
-  cli/        the c2c CLI
-skill/        the Codex Skill (the real UX layer)
-tests/        unit + integration tests
-docs/         architecture / protocol / security / troubleshooting
+### 1. Local-only (default)
+
+```bash
+c2c setup -w /absolute/path/to/workspace --json
 ```
 
-## Status & disclaimer
+This starts a loopback bridge and creates no remote transport. It is suitable
+for local validation or a separately managed connection. A healthy local
+bridge does not prove that ChatGPT can reach it.
 
-V1. Verified end-to-end: bridge, OAuth + pairing, public tunnel, ChatGPT
-connector setup, zero-touch first-run experience.
+### 2. OpenAI Secure MCP Tunnel (preferred remote mode)
 
-**Unofficial community project. Not affiliated with or endorsed by OpenAI.**
+OpenAI documents this as an outbound-only connection that lets supported
+products reach a private MCP server without a public inbound listener. Tunnel
+permissions and ChatGPT developer-mode access are separate.
 
-## License
+First prepare per-workspace local authentication:
 
-[MIT](LICENSE)
+```bash
+c2c setup -w /absolute/path/to/workspace --openai-secure-tunnel --json
+```
+
+The JSON response returns `localMcpUrl`, `trustedTunnelHeader`, and
+`trustedTunnelTokenFile`; it never returns the token value. Pass the token to
+the official client by file reference for both MCP and discovery requests:
+
+```bash
+tunnel-client run \
+  --control-plane.tunnel-id='<approved tunnel_id>' \
+  --control-plane.api-key=file:/absolute/protected/path/to/openai-tunnel-runtime-api-key \
+  --mcp.server-url='<localMcpUrl>' \
+  --mcp.extra-headers '<trustedTunnelHeader>: file:<trustedTunnelTokenFile>' \
+  --mcp.discovery-extra-headers '<trustedTunnelHeader>: file:<trustedTunnelTokenFile>'
+```
+
+Create that API-key file outside the workspace with owner-only permissions, or
+use your organization's secret injection method. In ChatGPT, create a developer-mode app,
+choose **Tunnel**, and select only the intended tunnel. Verify the local bridge,
+`tunnel-client` readiness, and an actual ChatGPT `workspace_info` call as three
+separate checks.
+
+The implementation and local authentication path are tested, but this fork's
+official-tunnel live end-to-end path is currently **UNVERIFIED** because it
+requires account-specific tunnel credentials and permissions.
+
+### 3. Cloudflare Quick Tunnel (explicit fallback)
+
+```bash
+c2c setup -w /absolute/path/to/workspace --cloudflare-quick-tunnel --json
+```
+
+This creates a temporary public HTTPS URL through Cloudflare. The MCP endpoint
+still requires OAuth, PKCE, and a one-time pairing code, but the public route
+adds attack surface and Cloudflare handles the transport. Use it only after
+accepting that boundary. The command does not install `cloudflared` for you.
+
+### 4. Managed HTTPS origin
+
+```bash
+c2c setup -w /absolute/path/to/workspace \
+  --external-base-url https://your-reviewed-origin.example --json
+```
+
+The caller owns the proxy/tunnel configuration, authentication assumptions,
+DNS, TLS, logging, and operational security. C2C validates the declared origin
+but does not establish or audit that external path.
+
+## Privacy controls
+
+Create `.c2cignore` in the connected workspace using gitignore syntax:
+
+```gitignore
+internal-notes/
+customer-data/
+fixtures/private-*
+```
+
+`.c2cignore` itself is never returned through MCP. Built-in exclusions cover
+common environment files, private keys, cloud credentials, token stores,
+browser cookies, Terraform state, and related material. Add project-specific
+PII and proprietary paths yourself.
+
+## Useful commands
+
+```bash
+c2c status -w <workspace> --json
+c2c doctor -w <workspace> --json
+c2c doctor -w <workspace> --fix --json  # starts only a missing local bridge
+c2c logs -w <workspace> -n 100
+c2c pair -w <workspace>                 # OAuth/Cloudflare mode only
+c2c unpair -w <workspace>               # revoke local OAuth + tunnel header
+c2c stop -w <workspace>
+c2c update-check --json                 # advisory; never installs
+```
+
+`c2c sandbox-allow --check --json` reports the target paths without mutation.
+`c2c sandbox-allow --json` changes the user's global Codex config and creates a
+private recovery backup when a config already exists. Run the modifying form
+only with informed approval.
+
+## Development
+
+```bash
+corepack pnpm install --frozen-lockfile
+corepack pnpm typecheck
+corepack pnpm test
+corepack pnpm build
+corepack pnpm audit --prod
+```
+
+Project layout:
+
+```text
+src/auth/       OAuth, fixed-header tunnel auth, token storage
+src/bridge/     loopback server, public/admin boundaries, runtime state
+src/mcp/        eight bounded read-only MCP tools
+src/workspace/  containment, ignore policy, search, safe Git inspection
+src/security/   outbound credential-shaped value redaction
+src/process/    authenticated daemon discovery and shutdown
+src/tunnel/     explicit Cloudflare Quick Tunnel fallback
+src/cli/        consent-oriented CLI surfaces
+skill/          reviewable Codex Skill instructions
+tests/          unit and integration coverage
+```
+
+## Security reports
+
+Please follow [SECURITY.md](SECURITY.md). Do not include live credentials,
+private source, personal data, or raw production evidence in a report.
+
+## Status and disclaimer
+
+This fork is hardened and tested, not formally verified. It has not received an
+independent third-party security audit. “Read-only” limits available MCP tools;
+it does not make source disclosure risk zero and does not neutralize every
+prompt-injection or supply-chain risk.
+
+License: [MIT](LICENSE).
