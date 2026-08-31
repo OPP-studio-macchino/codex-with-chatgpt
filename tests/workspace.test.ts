@@ -1,6 +1,7 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { Workspace, WorkspaceError } from "../src/workspace/manager.js";
 import { makeTmpDir, cleanup, write, isolateStateDir } from "./helpers.js";
 
@@ -36,6 +37,10 @@ beforeAll(() => {
 afterAll(() => {
   cleanup(root);
   cleanup(outside);
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
 });
 
 describe("path containment", () => {
@@ -188,6 +193,97 @@ describe("read_file pagination", () => {
     expect(result.content).not.toContain(token);
     expect(result.content).toContain("[REDACTED");
     expect(result.redactionCount).toBeGreaterThan(0);
+  });
+
+  it("uses one verified descriptor for binary inspection and content", async () => {
+    const open = vi.spyOn(fs.promises, "open");
+    const result = await ws.readFile("hello.txt");
+    expect(result.content).toContain("hello world");
+    expect(open).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a leaf swapped to an outside symlink before open", async () => {
+    const local = makeTmpDir("leaf-swap");
+    const external = makeTmpDir("leaf-swap-outside");
+    const target = write(local, "target.txt", "safe local content\n");
+    const externalFile = write(external, "secret.txt", "outside-leaf-secret\n");
+    const localWs = new Workspace(local);
+    const originalOpen = fs.promises.open.bind(fs.promises);
+    vi.spyOn(fs.promises, "open").mockImplementationOnce(async (file, flags, mode) => {
+      fs.renameSync(target, `${target}.safe`);
+      fs.symlinkSync(externalFile, target);
+      return originalOpen(file, flags, mode);
+    });
+
+    await expect(localWs.readFile("target.txt")).rejects.toMatchObject({
+      code: "UNSAFE_PATH_MUTATION",
+    });
+    cleanup(local);
+    cleanup(external);
+  });
+
+  it("rejects a parent directory swapped to an outside symlink before open", async () => {
+    const local = makeTmpDir("parent-swap");
+    const external = makeTmpDir("parent-swap-outside");
+    const parent = path.join(local, "nested");
+    write(local, "nested/target.txt", "safe local content\n");
+    write(external, "target.txt", "outside-parent-secret\n");
+    const localWs = new Workspace(local);
+    const originalOpen = fs.promises.open.bind(fs.promises);
+    vi.spyOn(fs.promises, "open").mockImplementationOnce(async (file, flags, mode) => {
+      fs.renameSync(parent, `${parent}.safe`);
+      fs.symlinkSync(external, parent, "dir");
+      return originalOpen(file, flags, mode);
+    });
+
+    await expect(localWs.readFile("nested/target.txt")).rejects.toMatchObject({
+      code: "UNSAFE_PATH_MUTATION",
+    });
+    cleanup(local);
+    cleanup(external);
+  });
+
+  it.skipIf(process.platform === "win32")("rejects a regular file swapped to a FIFO", async () => {
+    const local = makeTmpDir("fifo-swap");
+    const target = write(local, "target.txt", "safe local content\n");
+    const localWs = new Workspace(local);
+    const originalOpen = fs.promises.open.bind(fs.promises);
+    vi.spyOn(fs.promises, "open").mockImplementationOnce(async (file, flags, mode) => {
+      fs.unlinkSync(target);
+      const result = spawnSync("mkfifo", [target]);
+      if (result.status !== 0) throw new Error("mkfifo fixture failed");
+      return originalOpen(file, flags, mode);
+    });
+
+    await expect(localWs.readFile("target.txt")).rejects.toMatchObject({ code: "NOT_A_FILE" });
+    cleanup(local);
+  });
+});
+
+describe("mutable directory traversal", () => {
+  it("discards list results when a directory is swapped outside", async () => {
+    const local = makeTmpDir("list-dir-swap");
+    const external = makeTmpDir("list-dir-swap-outside");
+    const target = path.join(local, "nested");
+    write(local, "nested/local.txt", "safe\n");
+    write(external, "outside-name.txt", "outside-list-secret\n");
+    const localWs = new Workspace(local);
+    const originalOpenDir = fs.promises.opendir.bind(fs.promises);
+    let swapped = false;
+    vi.spyOn(fs.promises, "opendir").mockImplementation(async (dirPath, options) => {
+      if (!swapped && path.resolve(String(dirPath)) === target) {
+        swapped = true;
+        fs.renameSync(target, `${target}.safe`);
+        fs.symlinkSync(external, target, "dir");
+      }
+      return originalOpenDir(dirPath, options);
+    });
+
+    const listing = await localWs.listDirectory(".", { depth: 2, limit: 100 });
+    expect(JSON.stringify(listing)).not.toContain("outside-name.txt");
+    expect(JSON.stringify(listing)).not.toContain("outside-list-secret");
+    cleanup(local);
+    cleanup(external);
   });
 });
 

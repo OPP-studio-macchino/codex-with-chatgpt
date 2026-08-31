@@ -115,8 +115,17 @@ by the local account. C2C fails closed when it cannot enforce that file.
 
 ## Search regex is unsupported
 
-Regex mode requires ripgrep. Literal search has a bounded Node.js fallback.
-Install ripgrep only with approval, or repeat the request as a literal search.
+Workspace search intentionally supports literal mode only. A ripgrep subprocess
+would reopen mutable paths outside the descriptor-bound reader, so regex mode
+fails closed even when ripgrep is installed. Repeat the request as a literal
+search or run a separately reviewed local search outside C2C.
+
+## A read or listing returns `UNSAFE_PATH_MUTATION`
+
+The target path changed while C2C was opening or traversing it. C2C rejects the
+operation instead of following the new target. Stop concurrent generators or
+renames and retry. Do not suppress this check; strong guarantees on hostile
+shared or network filesystems are outside the supported boundary.
 
 ## Git status/diff differs from an interactive shell
 
@@ -124,6 +133,15 @@ C2C deliberately ignores global/system Git config and disables hooks, external
 diff drivers, textconv, renames, pagers, and parent-repository discovery. The
 result is a hardened inspection view, not necessarily byte-for-byte identical
 to the user's customized interactive Git output.
+
+## Git diff returns `UNSAFE_GIT_CONFIGURATION`
+
+C2C refuses Git inspection when repository or worktree configuration contains
+executable filters, config includes, partial-clone promises, credential helpers,
+protocol overrides, or SSH commands. These settings can start local processes or
+network access from an otherwise read-oriented Git operation. Use a separately
+reviewed full clone without those repository-local settings; do not delete or
+rewrite an existing repository's configuration merely to bypass this check.
 
 ## Codex cannot write C2C state
 

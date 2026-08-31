@@ -13,6 +13,10 @@ export interface RedactionResult {
   redactionCount: number;
 }
 
+export interface RedactedTruncatedResult extends RedactionResult {
+  truncated: boolean;
+}
+
 type Rule = {
   pattern: RegExp;
   replacement: string;
@@ -70,12 +74,12 @@ const RULES: Rule[] = [
   },
   {
     pattern:
-      /(["']?(?:AWS_SECRET_ACCESS_KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY|GOOGLE_API_KEY|GITHUB_TOKEN|GITLAB_TOKEN|NPM_TOKEN|STRIPE_SECRET_KEY|DATABASE_URL)["']?\s*[:=]\s*["'])([^"'\r\n]{4,})(["'])/gi,
+      /(["'`]?(?:AWS_SECRET_ACCESS_KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY|GOOGLE_API_KEY|GITHUB_TOKEN|GITLAB_TOKEN|NPM_TOKEN|STRIPE_SECRET_KEY|DATABASE_URL)["'`]?\s*[:=]\s*["'`])([^"'`\r\n]{4,})(["'`])/gi,
     replacement: "$1[REDACTED]$3",
   },
   {
     pattern:
-      /(["']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|passwd|private[_-]?key|cookie)["']?\s*[:=]\s*["'])([^"'\r\n]{4,})(["'])/gi,
+      /(["'`]?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|passwd|private[_-]?key|cookie)["'`]?\s*[:=]\s*["'`])([^"'`\r\n]{4,})(["'`])/gi,
     replacement: "$1[REDACTED]$3",
   },
   {
@@ -94,6 +98,18 @@ const RULES: Rule[] = [
   },
 ];
 
+const MAX_REDACTION_INPUT_BYTES = 4 * 1024 * 1024;
+const TRUNCATION_MARKER = " [TRUNCATED]";
+
+function utf8Prefix(input: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  const bytes = Buffer.from(input, "utf8");
+  if (bytes.length <= maxBytes) return input;
+  let end = maxBytes;
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--;
+  return bytes.subarray(0, end).toString("utf8");
+}
+
 export function redactSensitiveText(input: string): RedactionResult {
   let text = input;
   let redactionCount = 0;
@@ -106,4 +122,36 @@ export function redactSensitiveText(input: string): RedactionResult {
     });
   }
   return { text, redactionCount };
+}
+
+/**
+ * Redact a complete bounded logical unit before truncating it. This preserves
+ * closing delimiters needed by credential rules and never splits UTF-8 output.
+ * Oversized raw input fails closed instead of exposing a prefix that could end
+ * inside a credential value.
+ */
+export function redactAndTruncate(
+  input: string,
+  maxBytes: number,
+  opts: { trimEnd?: boolean } = {}
+): RedactedTruncatedResult {
+  const limit = Math.max(Buffer.byteLength(TRUNCATION_MARKER, "utf8"), Math.floor(maxBytes));
+  const logicalUnit = opts.trimEnd === false ? input : input.trimEnd();
+  if (Buffer.byteLength(logicalUnit, "utf8") > MAX_REDACTION_INPUT_BYTES) {
+    return {
+      text: `[REDACTED OVERSIZED TEXT]${TRUNCATION_MARKER}`,
+      redactionCount: 1,
+      truncated: true,
+    };
+  }
+  const redacted = redactSensitiveText(logicalUnit);
+  if (Buffer.byteLength(redacted.text, "utf8") <= limit) {
+    return { ...redacted, truncated: false };
+  }
+  const markerBytes = Buffer.byteLength(TRUNCATION_MARKER, "utf8");
+  return {
+    text: `${utf8Prefix(redacted.text, limit - markerBytes)}${TRUNCATION_MARKER}`,
+    redactionCount: redacted.redactionCount,
+    truncated: true,
+  };
 }

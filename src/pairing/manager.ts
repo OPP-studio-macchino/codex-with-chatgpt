@@ -10,7 +10,6 @@ export interface PairingSession {
   workspaceId: string;
   createdAt: number;
   expiresAt: number;
-  attemptsLeft: number;
   used: boolean;
 }
 
@@ -66,7 +65,8 @@ export interface PairingManagerOptions {
 
 export class PairingManager {
   private sessions = new Map<string, PairingSession>();
-  private ipHits = new Map<string, { count: number; resetAt: number }>();
+  private bindingAttempts = new Map<string, { attemptsLeft: number; expiresAt: number }>();
+  private rateHits = new Map<string, { count: number; resetAt: number }>();
   private readonly ttlMs: number;
   private readonly maxAttempts: number;
   private readonly ipRateLimit: number;
@@ -85,6 +85,8 @@ export class PairingManager {
   /** Create a new pairing session. Invalidates previous sessions (one active at a time). */
   create(): { sessionId: string; code: string; expiresAt: number } {
     this.sessions.clear();
+    this.bindingAttempts.clear();
+    this.rateHits.clear();
     const raw = generateCode();
     const session: PairingSession = {
       id: randomBytes(16).toString("hex"),
@@ -92,27 +94,29 @@ export class PairingManager {
       workspaceId: this.workspaceId,
       createdAt: Date.now(),
       expiresAt: Date.now() + this.ttlMs,
-      attemptsLeft: this.maxAttempts,
       used: false,
     };
     this.sessions.set(session.id, session);
     return { sessionId: session.id, code: formatPairingCode(raw), expiresAt: session.expiresAt };
   }
 
-  private checkIpRate(ip: string | undefined): boolean {
-    if (!ip) return true;
+  private checkRate(bindingId: string, ip: string | undefined): boolean {
     const now = Date.now();
-    const entry = this.ipHits.get(ip);
+    const key = `${bindingId}\0${ip ?? "unknown"}`;
+    const entry = this.rateHits.get(key);
     if (!entry || now > entry.resetAt) {
-      this.ipHits.set(ip, { count: 1, resetAt: now + this.ipRateWindowMs });
+      this.rateHits.set(key, { count: 1, resetAt: now + this.ipRateWindowMs });
       return true;
     }
     entry.count++;
     return entry.count <= this.ipRateLimit;
   }
 
-  verify(codeInput: string, ip?: string): PairingVerifyResult {
-    if (!this.checkIpRate(ip)) {
+  verify(codeInput: string, bindingId: string, ip?: string): PairingVerifyResult {
+    if (!/^[A-Za-z0-9_-]{8,128}$/.test(bindingId)) {
+      return { ok: false, reason: "no_active_session" };
+    }
+    if (!this.checkRate(bindingId, ip)) {
       return { ok: false, reason: "rate_limited" };
     }
     const normalized = normalizePairingCode(codeInput);
@@ -127,8 +131,12 @@ export class PairingManager {
         this.sessions.delete(session.id);
         return { ok: false, reason: "expired" };
       }
-      if (session.attemptsLeft <= 0) {
-        this.sessions.delete(session.id);
+      const attemptKey = `${session.id}:${bindingId}`;
+      const attempts = this.bindingAttempts.get(attemptKey) ?? {
+        attemptsLeft: this.maxAttempts,
+        expiresAt: session.expiresAt,
+      };
+      if (attempts.attemptsLeft <= 0) {
         return { ok: false, reason: "too_many_attempts" };
       }
       const match = timingSafeEqual(inputHash, session.codeHash);
@@ -136,14 +144,16 @@ export class PairingManager {
         // one-time use: destroy immediately
         session.used = true;
         this.sessions.delete(session.id);
+        this.bindingAttempts.clear();
+        this.rateHits.clear();
         return { ok: true, sessionId: session.id };
       }
-      session.attemptsLeft--;
-      if (session.attemptsLeft <= 0) {
-        this.sessions.delete(session.id);
+      attempts.attemptsLeft--;
+      this.bindingAttempts.set(attemptKey, attempts);
+      if (attempts.attemptsLeft <= 0) {
         return { ok: false, reason: "too_many_attempts" };
       }
-      return { ok: false, reason: "invalid", attemptsLeft: session.attemptsLeft };
+      return { ok: false, reason: "invalid", attemptsLeft: attempts.attemptsLeft };
     }
     return { ok: false, reason: "no_active_session" };
   }
@@ -158,5 +168,7 @@ export class PairingManager {
 
   invalidateAll(): void {
     this.sessions.clear();
+    this.bindingAttempts.clear();
+    this.rateHits.clear();
   }
 }

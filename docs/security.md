@@ -43,13 +43,13 @@ instructions.
 | Risk | Implemented control |
 | --- | --- |
 | `..` / absolute-path escape | Paths are resolved against the workspace and checked after canonicalization. |
-| Symlink escape | The deepest existing ancestor is realpathed before containment is checked. |
+| Symlink and path-swap escape | The deepest existing ancestor is realpathed. A regular file is then opened once with no-follow/nonblocking flags, verified by descriptor and post-open path identity, and read only through that descriptor. Directory traversal rejects pre/post identity changes. |
 | Parent Git repository bleed | Git is used only when `.git` exists at the selected workspace root. |
 | Sensitive path exposure | A non-configurable denylist and `.c2cignore` apply to reads, listings, search, status, and diff. If `.c2cignore` exists but cannot be read, workspace access fails closed. |
-| Binary or huge source reads | Binary files are rejected; individual source files and each response are bounded. |
-| Search exhaustion | Query, glob, result count, file count, file size, and runtime are bounded. Regex search requires ripgrep. |
-| Malicious Git configuration | Git runs without global/system config or optional locks; hooks, fsmonitor, pagers, external diff, and textconv are disabled. Pathspecs are literal. |
-| Secrets embedded in otherwise allowed text | Outbound content is scanned for common private-key, bearer-token, provider-key, cookie, URL-credential, and assignment patterns and matching values are replaced. |
+| Binary or huge source reads | Binary files are rejected; individual source files and each response are bounded, including growth after the initial descriptor stat. |
+| Search exhaustion and mutable subprocess paths | Query, glob, result count, file count, file size, and runtime are bounded. Search is literal-only through verified file descriptors; regex subprocess search is disabled. |
+| Malicious Git configuration | Git runs without global/system config, optional locks, or lazy object fetching; transport protocols default to denied, and hooks, fsmonitor, pagers, external diff, and textconv are disabled. Before status/diff reads index or object data, C2C lists repository config names without following includes and rejects filters, includes, partial-clone promises, protocol overrides, credential helpers, and SSH commands. Pathspecs are literal. |
+| Secrets embedded in otherwise allowed text | Complete bounded logical units are scanned for common private-key, bearer-token, provider-key, cookie, URL-credential, and assignment patterns before UTF-8-safe truncation. Matching values are replaced and oversized raw units fail closed. |
 
 The denylist and scanner are defense in depth. They cannot recognize every
 secret, arbitrary PII, customer data, proprietary algorithm, or encoded value.
@@ -85,8 +85,11 @@ is **UNVERIFIED** in this fork.
 
 Cloudflare Quick Tunnel or a caller-managed HTTPS origin uses C2C's OAuth flow:
 
+- dynamic registration and authorization require an active pairing window
+  created by the owner;
 - dynamic clients are provisional until successful pairing;
-- provisional registrations expire after five minutes and are capped;
+- provisional registrations expire after five minutes and are kept within a
+  bounded oldest-first replacement set;
 - persisted authorized clients are capped;
 - redirect URIs must be credential-free HTTPS URLs, except loopback HTTP for
   development; fragments, control characters, duplicates, and oversized lists
@@ -99,8 +102,10 @@ Cloudflare Quick Tunnel or a caller-managed HTTPS origin uses C2C's OAuth flow:
 - requested scopes are allowlisted and enforced per tool;
 - pairing pages show the requesting client, workspace, callback origin, and
   scopes, and include no-store, CSP, anti-framing, and referrer protections;
-- pairing attempts, pending authorization requests, registrations, request
-  bodies, and concurrent MCP work are bounded;
+- pairing attempts are bounded per pending authorization request, so failures
+  against one request do not consume another request's budget;
+- pending authorization requests, registrations, request bodies, and
+  concurrent MCP work are bounded;
 - `c2c unpair` revokes clients and stored token hashes.
 
 A user must still inspect the pairing page. OAuth does not make a mistakenly
@@ -180,7 +185,11 @@ diagnostic logs.
 - A prompt injection in repository content can still influence ChatGPT's plan.
 - Legitimate source content may contain unrecognized secrets or PII.
 - A same-user local attacker can bypass most local file-permission boundaries.
-- Concurrent local mutation can create time-of-check/time-of-use races.
+- Descriptor-bound reads and identity checks reduce concurrent path-swap risk,
+  but do not provide a formal `openat2`-style guarantee on hostile shared or
+  network filesystems.
+- Regex workspace search is unavailable because a path-based subprocess cannot
+  preserve the same descriptor-bound containment guarantee.
 - A compromised dependency, Node.js, Git, tunnel client, proxy, browser, or
   OpenAI/Cloudflare account is outside the bridge's protection.
 - Read-only access can still disclose valuable source and metadata.

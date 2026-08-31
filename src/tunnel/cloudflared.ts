@@ -6,7 +6,7 @@ import { nullLogger } from "../logger/index.js";
 import { ensureDir, getStateDir } from "../config/paths.js";
 import { findBinary } from "./detect.js";
 import type { TunnelDoctorReport, TunnelProvider, TunnelStatus } from "./provider.js";
-import { redactSensitiveText } from "../security/redaction.js";
+import { redactAndTruncate } from "../security/redaction.js";
 
 const QUICK_TUNNEL_URL_RE = /https:\/\/[a-z0-9][a-z0-9-]*\.trycloudflare\.com/i;
 
@@ -107,7 +107,7 @@ export class CloudflaredQuickTunnel implements TunnelProvider {
             resolve(url);
           }
           if (/error/i.test(line)) {
-            this.lastError = redactSensitiveText(line.slice(0, 400)).text;
+            this.lastError = redactAndTruncate(line, 400).text;
             this.logger.debug(`cloudflared: ${this.lastError}`);
           }
         });

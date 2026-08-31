@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { IgnoreRules } from "./ignore.js";
-import { redactSensitiveText } from "../security/redaction.js";
+import { redactAndTruncate, redactSensitiveText } from "../security/redaction.js";
 import { findBinary } from "../tunnel/detect.js";
 
 export interface GitCommandResult {
@@ -19,6 +19,21 @@ const SAFE_GIT_CONFIG = [
   "core.hooksPath=/dev/null",
   "-c",
   "diff.external=",
+  "-c",
+  "protocol.allow=never",
+];
+
+const UNSAFE_GIT_CONFIGURATION_ERROR =
+  "UNSAFE_GIT_CONFIGURATION: Git inspection is disabled for this repository.";
+
+const UNSAFE_GIT_CONFIG_KEYS = [
+  /^filter\..+\.(?:clean|process|smudge|required)$/i,
+  /^include(?:if\..+)?\.path$/i,
+  /^extensions\.partialclone$/i,
+  /^remote\..+\.(?:promisor|partialclonefilter)$/i,
+  /^protocol\..+\.allow$/i,
+  /^credential(?:\..+)?\.helper$/i,
+  /^core\.(?:askpass|sshcommand)$/i,
 ];
 
 const NULL_DEVICE = process.platform === "win32" ? "NUL" : "/dev/null";
@@ -42,6 +57,7 @@ function safeGitEnv(root: string, binary: string): NodeJS.ProcessEnv {
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_ATTR_NOSYSTEM: "1",
     GIT_CEILING_DIRECTORIES: path.dirname(root),
+    GIT_NO_LAZY_FETCH: "1",
     GIT_OPTIONAL_LOCKS: "0",
     GIT_PAGER: "cat",
     GIT_TERMINAL_PROMPT: "0",
@@ -49,12 +65,8 @@ function safeGitEnv(root: string, binary: string): NodeJS.ProcessEnv {
   };
 }
 
-/**
- * Run a read-only Git command without user/system config, hooks, pagers, or
- * optional locks. Individual diff calls also disable external diff drivers and
- * textconv because repository-controlled attributes are untrusted input.
- */
-export function runGit(root: string, args: string[]): GitCommandResult {
+/** Low-level Git spawn used only for the non-executing configuration preflight. */
+function spawnGit(root: string, args: string[]): GitCommandResult {
   const binary = gitBinary();
   if (!binary) {
     return { ok: false, stdout: "", stderr: "Trusted Git binary not found.", code: null };
@@ -158,27 +170,78 @@ function validatedGitDirectory(root: string): string | null {
   }
 }
 
-function isRepository(root: string): boolean {
+type RepositoryState = "absent" | "safe" | "unsafe_configuration";
+
+function hasUnsafeGitConfiguration(root: string): boolean {
+  // Do not follow repository-controlled include/includeIf directives while
+  // inspecting configuration. Their presence is itself unsupported. Listing
+  // names only also avoids copying command values or credentials into memory.
+  const config = spawnGit(root, [
+    "config",
+    "--no-includes",
+    "--name-only",
+    "--null",
+    "--list",
+  ]);
+  if (!config.ok) return true;
+  const keys = config.stdout.split("\0").filter(Boolean);
+  return keys.some((key) => UNSAFE_GIT_CONFIG_KEYS.some((pattern) => pattern.test(key)));
+}
+
+function repositoryState(root: string): RepositoryState {
   // Do not walk into a parent repository: the connected workspace is the
   // authorization boundary. Only validated linked-worktree control files are
   // allowed to reference metadata outside it.
-  if (!validatedGitDirectory(root)) return false;
-  const check = runGit(root, ["rev-parse", "--is-inside-work-tree", "--show-toplevel"]);
-  if (!check.ok) return false;
+  if (!validatedGitDirectory(root)) return "absent";
+
+  // This inspection runs before any Git command that may read index or object
+  // data. git-config parses names but does not invoke filters, transports,
+  // credential helpers, or SSH commands. Unsupported executable/network-capable
+  // configuration therefore fails closed before status or diff can reach it.
+  if (hasUnsafeGitConfiguration(root)) return "unsafe_configuration";
+
+  const check = spawnGit(root, ["rev-parse", "--is-inside-work-tree", "--show-toplevel"]);
+  if (!check.ok) return "absent";
   const lines = check.stdout.trim().split(/\r?\n/);
-  if (lines[0] !== "true" || !lines[1]) return false;
+  if (lines[0] !== "true" || !lines[1]) return "absent";
   try {
-    return fs.realpathSync.native(lines[1]) === fs.realpathSync.native(root);
+    return fs.realpathSync.native(lines[1]) === fs.realpathSync.native(root)
+      ? "safe"
+      : "absent";
   } catch {
-    return false;
+    return "absent";
   }
+}
+
+function isRepository(root: string): boolean {
+  return repositoryState(root) === "safe";
+}
+
+/**
+ * Run a read-only Git command only after repository configuration has passed
+ * the non-executing preflight. Global/system config, hooks, pagers, optional
+ * locks, and lazy object fetching remain disabled for the subprocess itself.
+ */
+export function runGit(root: string, args: string[]): GitCommandResult {
+  const state = repositoryState(root);
+  if (state !== "safe") {
+    return {
+      ok: false,
+      stdout: "",
+      stderr:
+        state === "unsafe_configuration"
+          ? UNSAFE_GIT_CONFIGURATION_ERROR
+          : "Validated Git repository not found.",
+      code: null,
+    };
+  }
+  return spawnGit(root, args);
 }
 
 function sanitizeGitLabel(value: string): string {
   const clean = value
-    .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, "�")
-    .slice(0, 4096);
-  return redactSensitiveText(clean).text;
+    .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, "�");
+  return redactAndTruncate(clean, 4096).text;
 }
 
 export interface GitInfo {
@@ -363,7 +426,9 @@ function emptyDiff(mode: DiffMode): GitDiffResult {
 
 export function gitDiff(root: string, opts: GitDiffOptions = {}, relPath?: string): GitDiffResult {
   const mode = opts.mode ?? "unstaged";
-  if (!isRepository(root)) return emptyDiff(mode);
+  const state = repositoryState(root);
+  if (state === "unsafe_configuration") throw new Error(UNSAFE_GIT_CONFIGURATION_ERROR);
+  if (state !== "safe") return emptyDiff(mode);
 
   const offset = Math.max(0, Math.floor(opts.offset ?? 0));
   const maxBytes = Math.min(256 * 1024, Math.max(1024, Math.floor(opts.maxBytes ?? 64 * 1024)));

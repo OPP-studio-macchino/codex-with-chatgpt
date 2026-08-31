@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir, getStateDir, writeSecureText } from "../config/paths.js";
-import { redactSensitiveText } from "../security/redaction.js";
+import { redactAndTruncate } from "../security/redaction.js";
 import { isBuiltinSensitivePath } from "../workspace/ignore.js";
 
 /**
@@ -22,9 +22,9 @@ export interface ExecutionRecord {
 function sanitizeChangedFiles(value: unknown): string[] | number {
   if (Array.isArray(value)) {
     const files = value.slice(0, 50).map((entry) => {
-      const candidate = String(entry).slice(0, 512).replace(/\\/g, "/");
+      const candidate = String(entry).replace(/\\/g, "/");
       if (isBuiltinSensitivePath(candidate)) return "[REDACTED SENSITIVE PATH]";
-      return redactSensitiveText(candidate).text;
+      return redactAndTruncate(candidate, 512).text;
     });
     if (value.length > files.length) files.push(`[TRUNCATED ${value.length - files.length} MORE PATHS]`);
     return files;
@@ -61,10 +61,10 @@ function sanitizeRecord(value: unknown): ExecutionRecord | null {
     taskId: record.taskId,
     iteration: record.iteration,
     changedFiles: sanitizeChangedFiles(record.changedFiles),
-    tests: typeof record.tests === "string" ? redactSensitiveText(record.tests.slice(0, 500)).text : null,
+    tests: typeof record.tests === "string" ? redactAndTruncate(record.tests, 500).text : null,
     exitStatus: record.exitStatus,
     timestamp: record.timestamp,
-    notes: typeof record.notes === "string" ? redactSensitiveText(record.notes.slice(0, 500)).text : undefined,
+    notes: typeof record.notes === "string" ? redactAndTruncate(record.notes, 500).text : undefined,
   };
 }
 

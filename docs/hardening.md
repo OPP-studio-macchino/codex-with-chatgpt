@@ -31,15 +31,16 @@ provider payload was used during validation.
 | Setup/doctor/Skill could automatically create or restore a public Quick Tunnel | Unannounced external exposure and third-party transport | Local-only default; explicit, mutually exclusive transport flags; doctor never opens a tunnel |
 | Documentation claimed the repository never leaves the machine | Incorrect consent boundary | README, Skill, architecture, and threat model now state that requested MCP output is processed externally |
 | No private official-tunnel authentication mode | Public ingress was the primary path | Added per-workspace fixed-header auth for OpenAI Secure MCP Tunnel, read from a `0600` file on every request |
-| Git inspection inherited user/system/repository behavior | A hostile repo configuration could invoke helpers or leak extra content | Sanitized environment/config, disabled hooks/fsmonitor/external diff/textconv/pager, literal pathspecs, root `.git` requirement, prefiltered diff paths |
-| Helper discovery trusted arbitrary `PATH` entries | A selected workspace could shadow `git`, `rg`, or `cloudflared` with executable content | Git, ripgrep, and Quick Tunnel execution now resolve canonical executables only from fixed system locations; repository-local shims are rejected |
+| Git inspection inherited user/system/repository behavior | A hostile repo configuration could invoke helpers, start a lazy-fetch transport, or leak extra content | Sanitized environment/config, disabled hooks/fsmonitor/external diff/textconv/pager/lazy fetch, default-denied transport protocols, literal pathspecs, root `.git` requirement, prefiltered diff paths, and preflight rejection of filters, includes, partial-clone promises, credential helpers, and SSH commands |
+| Helper discovery trusted arbitrary `PATH` entries | A selected workspace could shadow `git`, `rg`, or `cloudflared` with executable content | Git and Quick Tunnel execution now resolve canonical executables only from fixed system locations; repository-local shims are rejected. Ripgrep discovery is diagnostic only; workspace search no longer launches a path-based subprocess. |
 | Arbitrary `.git` files, symlinks, or object alternates could point outside the selected workspace | Git diff could read blobs from unrelated repository metadata | Reject `.git` symlinks, arbitrary control files, and alternate object stores; allow only embedded metadata or validated Git worktree back-pointers |
 | Sensitive-path protection did not consistently cover Git output | Secret filenames or contents could appear in status/diff | Unified built-in policy and `.c2cignore` across status, diff, reads, listing, and search |
-| Allowed files and summaries could contain credential values | Secret disclosure | Central outbound scanner/redactor applied to MCP content, Git output, logs, and execution records |
+| Allowed files and summaries could contain credential values, including values whose closing delimiter appeared beyond an output slice | Secret disclosure | Complete bounded logical units are centrally redacted before UTF-8-safe truncation with an explicit marker; oversized raw units fail closed |
+| File and search paths were checked separately from later stat/open/read operations | A local path swap could redirect a read after containment checks | Regular files are opened once with no-follow/nonblocking flags, verified by descriptor and post-open path identity, then read from that descriptor; directory traversal rejects pre/post identity changes; path-based regex subprocess search is disabled |
 | State directory could be placed inside the connected workspace | C2C credentials could enter its own readable boundary | Workspace creation refuses a state directory inside the workspace |
 | Workspace IDs were derived without an install secret | Local paths could be guessed/correlated | Per-install HMAC key and 24-hex workspace aliases |
 | Pairing HTML embedded untrusted names without complete escaping | Markup/script injection in the authorization page | Escaping/control-character removal plus CSP, anti-framing, referrer, no-store, and MIME headers |
-| OAuth registrations and pending authorization state were insufficiently bounded | Memory/disk exhaustion and stale clients | Provisional TTL/cap, authorized cap, pending cap, rate limits, 16 KiB bodies, strict redirect/PKCE/scope/resource validation |
+| OAuth registrations and pairing attempts shared globally destructible capacity | An unauthenticated request could consume the owner's pairing budget or provisional-client slots | Dynamic registration and authorization require an active owner pairing window; attempt budgets are authorization-request-bound; provisional clients use bounded oldest-first replacement while authorized clients retain a separate hard cap |
 | Public base URL could depend on request headers | Host/proxy-header confusion | Fixed validated base URL; Express proxy trust disabled |
 | `/mcp` parsed arbitrary bodies before authentication | Unauthenticated resource consumption | Authentication precedes strict 1 MiB parsing; method and concurrency limits added |
 | Public health included workspace-correlating metadata | Privacy leakage and weak identity assumptions | Public health now returns only service/status; bridge reuse requires authenticated admin identity and PID match |
@@ -57,10 +58,13 @@ The test suite includes targeted cases for:
 - canonical path and symlink escape;
 - state-directory isolation;
 - sensitive path and `.c2cignore` enforcement;
-- output redaction;
-- bounded reads, search, records, and schemas;
-- Git status/diff filtering and hostile external diff configuration;
-- OAuth redirect, PKCE, rate, registration, pairing, scope, and HTML handling;
+- redact-before-truncate boundaries, multibyte output, and oversized fail-closed behavior;
+- descriptor-bound reads, file/directory/FIFO swap rejection, and bounded literal search;
+- Git status/diff filtering, hostile external diff configuration, executable
+  clean/process/smudge filters, included/worktree configuration, and promisor
+  repositories with missing objects;
+- OAuth redirect, PKCE, rate, registration, request-bound pairing, provisional
+  flood fairness, scope, and HTML handling;
 - trusted-tunnel header acceptance and immediate revocation;
 - public health minimization and admin-route isolation;
 - endpoint and ChatGPT session URL validation;
@@ -92,9 +96,15 @@ run so this document does not become a stale numeric claim.
   every secret representation.
 - Prompt injection can influence advisory reasoning even though it cannot add
   MCP capabilities.
-- Same-user host compromise, dependency compromise, external tunnel/provider
-  compromise, and concurrent local file races remain outside or partly outside
-  the bridge boundary.
+- Same-user host compromise, dependency compromise, and external
+  tunnel/provider compromise remain outside the bridge boundary. The
+  descriptor-bound reader reduces path-swap exposure but is not a formal
+  `openat2`-style guarantee for hostile shared or network filesystems.
+- Regex workspace search is intentionally unavailable at this containment
+  boundary; use literal search or a separately reviewed local tool outside C2C.
+- Repositories that intentionally require filters, config includes, partial
+  clones, credential helpers, or SSH commands are unsupported by Git inspection;
+  use a reviewed full clone without those repository-local settings.
 - Managed `--external-base-url` paths are caller-owned and are not audited by
   C2C.
 

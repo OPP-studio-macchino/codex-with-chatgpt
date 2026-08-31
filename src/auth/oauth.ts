@@ -1,5 +1,5 @@
 import { Router, type Request, type Response, urlencoded, json } from "express";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   AuthStore,
   SUPPORTED_SCOPES,
@@ -180,7 +180,7 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
   const prunePending = (): void => {
     const now = Date.now();
     for (const [id, request] of pendingRequests) {
-      if (now > request.expiresAt) pendingRequests.delete(id);
+      if (now > request.expiresAt || !deps.store.getClient(request.clientId)) pendingRequests.delete(id);
     }
   };
 
@@ -201,23 +201,6 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
   // ---- Dynamic Client Registration (RFC 7591) ------------------------------
 
   router.post("/oauth/register", json({ limit: "16kb", strict: true }), (req, res) => {
-    const now = Date.now();
-    if (registrationHits.size > 1024) {
-      for (const [address, entry] of registrationHits) {
-        if (now > entry.resetAt) registrationHits.delete(address);
-      }
-    }
-    const key = req.socket.remoteAddress ?? "unknown";
-    const hit = registrationHits.get(key);
-    if (!hit || now > hit.resetAt) {
-      registrationHits.set(key, { count: 1, resetAt: now + 60_000 });
-    } else {
-      hit.count++;
-      if (hit.count > 20) {
-        res.status(429).json({ error: "rate_limited" });
-        return;
-      }
-    }
     const body = req.body as { client_name?: string; redirect_uris?: unknown };
     const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris : [];
     if (
@@ -232,10 +215,34 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
       });
       return;
     }
+    if (!deps.pairing.hasActiveSession()) {
+      res.status(403).json({ error: "pairing_required" });
+      return;
+    }
+    const now = Date.now();
+    if (registrationHits.size > 1024) {
+      for (const [fingerprint, entry] of registrationHits) {
+        if (now > entry.resetAt) registrationHits.delete(fingerprint);
+      }
+    }
+    const origins = (redirectUris as string[]).map((uri) => new URL(uri).origin).sort().join("|");
+    const key = createHash("sha256")
+      .update(`${req.socket.remoteAddress ?? "unknown"}\0${origins}`)
+      .digest("hex");
+    const hit = registrationHits.get(key);
+    if (!hit || now > hit.resetAt) {
+      registrationHits.set(key, { count: 1, resetAt: now + 60_000 });
+    } else {
+      hit.count++;
+      if (hit.count > 20) {
+        res.status(429).json({ error: "rate_limited" });
+        return;
+      }
+    }
     let client;
     try {
       client = deps.store.registerClient({
-        clientName: typeof body.client_name === "string" ? body.client_name.slice(0, 200) : undefined,
+        clientName: typeof body.client_name === "string" ? body.client_name : undefined,
         redirectUris: redirectUris as string[],
       });
     } catch (error) {
@@ -295,6 +302,10 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
       if (query.state) url.searchParams.set("state", query.state);
       res.redirect(url.toString());
     };
+    if (!deps.pairing.hasActiveSession()) {
+      fail("access_denied", "No owner-approved pairing session is active");
+      return;
+    }
     if (query.response_type !== "code") {
       fail("unsupported_response_type", "Only response_type=code is supported");
       return;
@@ -369,7 +380,7 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
       res.status(400).send("This authorization request has expired. Please reconnect from ChatGPT.");
       return;
     }
-    const verdict = deps.pairing.verify(body.pairing_code ?? "", req.ip);
+    const verdict = deps.pairing.verify(body.pairing_code ?? "", request.id, req.ip);
     if (!verdict.ok) {
       const messages: Record<string, string> = {
         invalid: `Incorrect pairing code.${verdict.attemptsLeft !== undefined ? ` ${verdict.attemptsLeft} attempts left.` : ""}`,

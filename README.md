@@ -49,12 +49,22 @@ possible secret format will be removed. Review the workspace and
   a per-workspace, owner-only fixed-header token.
 - Cloudflare Quick Tunnel is an explicit fallback, never an automatic setup.
 - OAuth redirect validation, PKCE, request/body limits, rate limits, bounded
-  registrations, security headers, and immediate revocation are enforced.
+  registrations, request-bound pairing attempts, security headers, and immediate
+  revocation are enforced. Dynamic registration requires an active owner pairing
+  window.
 - Canonical realpath containment blocks `..`, absolute-path, and symlink escape.
+  File reads stay on one verified descriptor; directory reads are rejected when
+  their path identity changes during traversal.
 - Sensitive paths are filtered from reads, listings, search, Git status, and
-  Git diff; outbound text also passes through credential redaction.
-- Git inspection ignores global/system config and disables hooks, external diff
-  programs, text conversion, pagers, optional locks, and parent-repository bleed.
+  Git diff; complete bounded logical units are credential-redacted before
+  UTF-8-safe output truncation.
+- Workspace search is literal-only and uses the verified in-process reader;
+  regex subprocess search is disabled at this containment boundary.
+- Git inspection ignores global/system config, disables hooks, external diff
+  programs, text conversion, pagers, optional locks, lazy object fetching, and
+  parent-repository bleed. Repositories with executable filters, config includes,
+  partial-clone promises, credential helpers, or SSH commands fail closed before
+  status/diff reads index or object data.
 - Runtime/state files use private directories and owner-only atomic writes where
   the platform supports POSIX permissions.
 - Health responses disclose only service and status. Admin routes require both

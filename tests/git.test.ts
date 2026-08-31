@@ -7,6 +7,25 @@ import { makeTmpDir, cleanup, write, makeGitRepo, git } from "./helpers.js";
 let repo: string;
 let plain: string;
 
+const UNSAFE_GIT_CONFIGURATION =
+  "UNSAFE_GIT_CONFIGURATION: Git inspection is disabled for this repository.";
+
+function commandQuote(value: string): string {
+  const portable = process.platform === "win32" ? value.replaceAll("\\", "/") : value;
+  return JSON.stringify(portable);
+}
+
+function markerHelper(root: string, name = "git-helper"): { command: string; marker: string } {
+  const marker = path.join(root, `${name}-executed`);
+  const helper = write(
+    root,
+    `${name}.cjs`,
+    'require("node:fs").writeFileSync(process.argv[2], "executed\\n");\nprocess.exit(1);\n'
+  );
+  const command = [process.execPath, helper, marker].map(commandQuote).join(" ");
+  return { command, marker };
+}
+
 beforeAll(() => {
   repo = makeTmpDir("git-repo");
   makeGitRepo(repo);
@@ -234,6 +253,131 @@ describe("gitDiff pagination", () => {
     expect(fs.existsSync(path.join(isolated, "driver-executed"))).toBe(false);
     cleanup(isolated);
   });
+
+  it(
+    "fails closed before repository clean/process/smudge filters can execute",
+    () => {
+      for (const driver of ["clean", "process", "smudge"] as const) {
+        const isolated = makeTmpDir(`git-${driver}-filter`);
+        makeGitRepo(isolated);
+        write(isolated, ".gitattributes", "hello.txt filter=hostile\n");
+        git(isolated, "add", ".gitattributes");
+        git(isolated, "commit", "-m", "add filter attributes");
+        const { command, marker } = markerHelper(isolated, `${driver}-helper`);
+        git(isolated, "config", `filter.hostile.${driver}`, command);
+        if (driver === "process") git(isolated, "config", "filter.hostile.required", "true");
+        write(isolated, "hello.txt", `changed for ${driver}\n`);
+
+        expect(gitStatus(isolated).isRepo).toBe(false);
+        expect(() => gitDiff(isolated, { mode: "unstaged" })).toThrow(UNSAFE_GIT_CONFIGURATION);
+        expect(fs.existsSync(marker)).toBe(false);
+        cleanup(isolated);
+      }
+    }
+  );
+
+  it(
+    "rejects included filter configuration without following the include",
+    () => {
+      const isolated = makeTmpDir("git-included-filter");
+      makeGitRepo(isolated);
+      write(isolated, ".gitattributes", "hello.txt filter=hostile\n");
+      git(isolated, "add", ".gitattributes");
+      git(isolated, "commit", "-m", "add filter attributes");
+      const { command, marker } = markerHelper(isolated, "included-helper");
+      const included = write(
+        isolated,
+        ".git/hostile-include",
+        `[filter "hostile"]\n\tclean = ${command}\n`
+      );
+      git(isolated, "config", "include.path", included);
+      write(isolated, "hello.txt", "changed with included filter\n");
+
+      expect(() => gitDiff(isolated, { mode: "unstaged" })).toThrow(UNSAFE_GIT_CONFIGURATION);
+      expect(fs.existsSync(marker)).toBe(false);
+      cleanup(isolated);
+    }
+  );
+
+  it(
+    "rejects filters selected through .git/info/attributes",
+    () => {
+      const isolated = makeTmpDir("git-info-attributes-filter");
+      makeGitRepo(isolated);
+      const { command, marker } = markerHelper(isolated, "info-attributes-helper");
+      write(isolated, ".git/info/attributes", "hello.txt filter=hostile\n");
+      git(isolated, "config", "filter.hostile.clean", command);
+      write(isolated, "hello.txt", "changed with info attributes\n");
+
+      expect(() => gitDiff(isolated, { mode: "unstaged" })).toThrow(UNSAFE_GIT_CONFIGURATION);
+      expect(fs.existsSync(marker)).toBe(false);
+      cleanup(isolated);
+    }
+  );
+
+  it(
+    "rejects filters configured in linked-worktree configuration",
+    () => {
+      const source = makeTmpDir("git-filter-worktree-source");
+      const container = makeTmpDir("git-filter-worktree-container");
+      const linked = path.join(container, "linked");
+      makeGitRepo(source);
+      write(source, ".gitattributes", "hello.txt filter=hostile\n");
+      git(source, "add", ".gitattributes");
+      git(source, "commit", "-m", "add filter attributes");
+      git(source, "config", "extensions.worktreeConfig", "true");
+      git(source, "worktree", "add", "-b", "c2c-filter-test", linked);
+      const { command, marker } = markerHelper(linked, "worktree-helper");
+      git(linked, "config", "--worktree", "filter.hostile.clean", command);
+      write(linked, "hello.txt", "changed in linked worktree\n");
+
+      expect(() => gitDiff(linked, { mode: "unstaged" })).toThrow(UNSAFE_GIT_CONFIGURATION);
+      expect(fs.existsSync(marker)).toBe(false);
+      cleanup(container);
+      cleanup(source);
+    }
+  );
+
+  it(
+    "rejects a promisor repository before a missing object can start a transport",
+    () => {
+      const isolated = makeTmpDir("git-promisor");
+      makeGitRepo(isolated);
+      const blob = git(isolated, "rev-parse", "HEAD:hello.txt").trim();
+      const object = path.join(isolated, ".git", "objects", blob.slice(0, 2), blob.slice(2));
+      fs.renameSync(object, path.join(isolated, "missing-blob-backup"));
+      const { command, marker } = markerHelper(isolated, "transport-helper");
+      git(isolated, "config", "remote.origin.url", `ext::${command}`);
+      git(isolated, "config", "remote.origin.promisor", "true");
+      git(isolated, "config", "remote.origin.partialCloneFilter", "blob:none");
+      git(isolated, "config", "extensions.partialClone", "origin");
+      git(isolated, "config", "protocol.ext.allow", "always");
+      write(isolated, "hello.txt", "changed with missing base blob\n");
+
+      expect(() => gitDiff(isolated, { mode: "unstaged" })).toThrow(UNSAFE_GIT_CONFIGURATION);
+      expect(fs.existsSync(marker)).toBe(false);
+      cleanup(isolated);
+    }
+  );
+
+  it(
+    "rejects credential and SSH helpers without exposing their configured values",
+    () => {
+      for (const key of ["credential.helper", "core.askPass", "core.sshCommand"] as const) {
+        const isolated = makeTmpDir(`git-${key.replaceAll(".", "-")}`);
+        makeGitRepo(isolated);
+        const { command, marker } = markerHelper(isolated, "network-helper");
+        git(isolated, "config", key, command);
+        write(isolated, "hello.txt", `changed with ${key}\n`);
+
+        expect(() => gitDiff(isolated, { mode: "unstaged" })).toThrow(
+          UNSAFE_GIT_CONFIGURATION
+        );
+        expect(fs.existsSync(marker)).toBe(false);
+        cleanup(isolated);
+      }
+    }
+  );
 
   it("handles non-repos gracefully", () => {
     const diff = gitDiff(plain, { mode: "unstaged" });

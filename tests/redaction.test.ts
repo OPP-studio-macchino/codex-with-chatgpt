@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
-import { redactSensitiveText } from "../src/security/redaction.js";
+import { redactAndTruncate, redactSensitiveText } from "../src/security/redaction.js";
 import { Logger, redact } from "../src/logger/index.js";
 import { cleanup, makeTmpDir } from "./helpers.js";
 
@@ -60,5 +60,38 @@ describe("outbound secret redaction", () => {
     new Logger({ file }).info("x".repeat(100_000), { detail: "y".repeat(100_000) });
     expect(fs.statSync(file).size).toBeLessThan(20_000);
     cleanup(dir);
+  });
+
+  it.each(['"', "'", "`"])(
+    "redacts a long credential before truncating when the delimiter is %s",
+    (delimiter) => {
+      const secret = "S".repeat(620);
+      const input = `const password = ${delimiter}${secret}${delimiter};\r\n`;
+      const result = redactAndTruncate(input, 500);
+      expect(result.text).not.toContain("S".repeat(32));
+      expect(result.text).toContain("[REDACTED]");
+      expect(result.redactionCount).toBe(1);
+      expect(Buffer.byteLength(result.text, "utf8")).toBeLessThanOrEqual(500);
+    }
+  );
+
+  it.each([499, 500, 501])("adds an explicit marker across the %i-byte boundary", (size) => {
+    const result = redactAndTruncate("a".repeat(size), 500);
+    expect(Buffer.byteLength(result.text, "utf8")).toBeLessThanOrEqual(500);
+    expect(result.truncated).toBe(size > 500);
+    expect(result.text.includes("[TRUNCATED]")).toBe(size > 500);
+  });
+
+  it("does not split a multi-byte character at the byte limit", () => {
+    const result = redactAndTruncate("界".repeat(200), 500);
+    expect(Buffer.byteLength(result.text, "utf8")).toBeLessThanOrEqual(500);
+    expect(result.text).not.toContain("�");
+    expect(result.text).toContain("[TRUNCATED]");
+  });
+
+  it("fails closed for an oversized logical unit", () => {
+    const result = redactAndTruncate(`password = "${"X".repeat(5 * 1024 * 1024)}"`, 500);
+    expect(result.text).toBe("[REDACTED OVERSIZED TEXT] [TRUNCATED]");
+    expect(result.redactionCount).toBe(1);
   });
 });

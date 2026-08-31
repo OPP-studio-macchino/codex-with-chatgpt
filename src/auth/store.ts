@@ -2,6 +2,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir, getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
+import { redactAndTruncate } from "../security/redaction.js";
 
 export const SUPPORTED_SCOPES = [
   "workspace.read",
@@ -90,9 +91,8 @@ function sanitizeClientName(value: string | undefined): string | undefined {
   const sanitized = value
     .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ")
     .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 200);
-  return sanitized || undefined;
+    .trim();
+  return sanitized ? redactAndTruncate(sanitized, 200).text : undefined;
 }
 
 function sha256hex(value: string): string {
@@ -207,10 +207,16 @@ export class AuthStore {
     for (const [clientId, client] of this.clients) {
       if (!client.authorizedAt && Date.parse(client.createdAt) < cutoff) this.clients.delete(clientId);
     }
-    const provisionalCount = [...this.clients.values()].filter((client) => !client.authorizedAt).length;
-    const authorizedCount = this.clients.size - provisionalCount;
-    if (provisionalCount >= MAX_PROVISIONAL_CLIENTS || authorizedCount >= MAX_REGISTERED_CLIENTS) {
+    const provisional = [...this.clients.values()]
+      .filter((client) => !client.authorizedAt)
+      .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+    const authorizedCount = this.clients.size - provisional.length;
+    if (authorizedCount >= MAX_REGISTERED_CLIENTS) {
       throw new Error("CLIENT_REGISTRATION_LIMIT");
+    }
+    while (provisional.length >= MAX_PROVISIONAL_CLIENTS) {
+      const oldest = provisional.shift();
+      if (oldest) this.clients.delete(oldest.clientId);
     }
     const client: ClientRegistration = {
       clientId: `c2c_client_${randomBytes(12).toString("base64url")}`,

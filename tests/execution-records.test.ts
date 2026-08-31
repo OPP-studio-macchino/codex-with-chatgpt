@@ -29,6 +29,22 @@ describe("execution record boundary", () => {
     expect(serialized).toContain("[REDACTED");
   });
 
+  it("redacts long credential values before bounded persistence", () => {
+    const secret = "S".repeat(620);
+    appendExecutionRecord("workspace-long-redaction", {
+      taskId: "c2c_long_redaction",
+      iteration: 1,
+      changedFiles: 0,
+      tests: `password = "${secret}"`,
+      exitStatus: "failed",
+      timestamp: new Date().toISOString(),
+      notes: `client_secret = \`${secret}\``,
+    });
+    const serialized = JSON.stringify(readExecutionRecords("workspace-long-redaction"));
+    expect(serialized).not.toContain("S".repeat(32));
+    expect(serialized).toContain("[REDACTED]");
+  });
+
   it("drops unknown legacy fields instead of returning them through MCP", () => {
     const workspaceId = "workspace-legacy";
     appendExecutionRecord(workspaceId, {

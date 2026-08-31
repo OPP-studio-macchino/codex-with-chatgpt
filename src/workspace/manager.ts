@@ -1,10 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHmac } from "node:crypto";
-import readline from "node:readline";
 import { IgnoreRules } from "./ignore.js";
 import { getStateDir, getWorkspaceIdentityKey, readJsonIfExists } from "../config/paths.js";
-import { redactSensitiveText } from "../security/redaction.js";
+import { redactAndTruncate, redactSensitiveText } from "../security/redaction.js";
 
 export type WorkspaceErrorCode =
   | "INVALID_PATH"
@@ -15,6 +14,7 @@ export type WorkspaceErrorCode =
   | "NOT_A_DIRECTORY"
   | "BINARY_FILE"
   | "FILE_TOO_LARGE"
+  | "UNSAFE_PATH_MUTATION"
   | "UNSAFE_STATE_DIRECTORY"
   | "UNSUPPORTED_REGEX";
 
@@ -59,6 +59,12 @@ export interface ListDirectoryResult {
   hasMore: boolean;
 }
 
+export interface VerifiedDirectory {
+  abs: string;
+  rel: string;
+  entries: fs.Dirent[];
+}
+
 export interface ProjectConfig {
   name?: string;
   maxIterations?: number;
@@ -78,7 +84,7 @@ function loadProjectConfig(root: string): ProjectConfig {
       .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ")
       .replace(/\s+/g, " ")
       .trim();
-    if (name) config.name = name.slice(0, 100);
+    if (name) config.name = redactAndTruncate(name, 100).text;
   }
   if (
     typeof raw.maxIterations === "number" &&
@@ -189,17 +195,143 @@ export class Workspace {
     return { abs: canonical, rel };
   }
 
-  private async isBinary(abs: string): Promise<boolean> {
-    const fd = await fs.promises.open(abs, "r");
+  private unsafeMutation(rel: string): WorkspaceError {
+    return new WorkspaceError(
+      "UNSAFE_PATH_MUTATION",
+      `UNSAFE_PATH_MUTATION: '${rel || "."}' changed while it was being accessed.`
+    );
+  }
+
+  private async openVerifiedRegularFile(
+    requested: string
+  ): Promise<{ handle: fs.promises.FileHandle; stat: fs.Stats; abs: string; rel: string }> {
+    const resolved = this.resolve(requested);
+    const flags =
+      fs.constants.O_RDONLY |
+      (fs.constants.O_NOFOLLOW ?? 0) |
+      (fs.constants.O_NONBLOCK ?? 0);
+    let handle: fs.promises.FileHandle;
     try {
-      const buf = Buffer.alloc(8192);
-      const { bytesRead } = await fd.read(buf, 0, buf.length, 0);
-      for (let i = 0; i < bytesRead; i++) {
-        if (buf[i] === 0) return true;
+      handle = await fs.promises.open(resolved.abs, flags);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ELOOP" || code === "EMLINK") throw this.unsafeMutation(resolved.rel);
+      throw new WorkspaceError("FILE_NOT_FOUND", `File not found: ${resolved.rel}`);
+    }
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile()) {
+        throw new WorkspaceError("NOT_A_FILE", `Not a regular file: ${resolved.rel}`);
       }
-      return false;
+      let canonicalAfter: string;
+      let pathStat: fs.Stats;
+      try {
+        canonicalAfter = await fs.promises.realpath(resolved.abs);
+        pathStat = await fs.promises.stat(resolved.abs);
+      } catch {
+        throw this.unsafeMutation(resolved.rel);
+      }
+      if (
+        normCase(canonicalAfter) !== normCase(resolved.abs) ||
+        !this.contains(canonicalAfter) ||
+        pathStat.dev !== stat.dev ||
+        pathStat.ino !== stat.ino
+      ) {
+        throw this.unsafeMutation(resolved.rel);
+      }
+      const actualRel = path.relative(this.root, canonicalAfter).split(path.sep).join("/");
+      if (actualRel !== resolved.rel || this.ignoreRules.isSensitive(actualRel)) {
+        throw this.unsafeMutation(resolved.rel);
+      }
+      return { handle, stat, abs: canonicalAfter, rel: actualRel };
+    } catch (error) {
+      await handle.close().catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private async isBinaryHandle(handle: fs.promises.FileHandle): Promise<boolean> {
+    const buf = Buffer.alloc(8192);
+    const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
+    for (let i = 0; i < bytesRead; i++) {
+      if (buf[i] === 0) return true;
+    }
+    return false;
+  }
+
+  private async readHandleBounded(
+    handle: fs.promises.FileHandle,
+    maxBytes: number
+  ): Promise<Buffer | null> {
+    const buffer = Buffer.alloc(maxBytes + 1);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset > maxBytes) return null;
+    return buffer.subarray(0, offset);
+  }
+
+  async readDirectoryEntries(requested: string): Promise<VerifiedDirectory> {
+    const before = this.resolve(requested);
+    let beforeStat: fs.Stats;
+    let dir: fs.Dir;
+    try {
+      beforeStat = await fs.promises.lstat(before.abs);
+      if (!beforeStat.isDirectory() || beforeStat.isSymbolicLink()) {
+        throw new WorkspaceError("NOT_A_DIRECTORY", `Not a directory: ${before.rel}`);
+      }
+      dir = await fs.promises.opendir(before.abs);
+    } catch (error) {
+      if (error instanceof WorkspaceError) throw error;
+      throw new WorkspaceError("FILE_NOT_FOUND", `Directory not found: ${before.rel || "."}`);
+    }
+    const entries: fs.Dirent[] = [];
+    try {
+      for (;;) {
+        const entry = await dir.read();
+        if (!entry) break;
+        entries.push(entry);
+      }
     } finally {
-      await fd.close();
+      await dir.close().catch(() => undefined);
+    }
+    let after: { abs: string; rel: string };
+    let afterStat: fs.Stats;
+    try {
+      after = this.resolve(requested);
+      afterStat = await fs.promises.lstat(after.abs);
+    } catch {
+      throw this.unsafeMutation(before.rel);
+    }
+    if (
+      normCase(after.abs) !== normCase(before.abs) ||
+      !afterStat.isDirectory() ||
+      afterStat.isSymbolicLink() ||
+      afterStat.dev !== beforeStat.dev ||
+      afterStat.ino !== beforeStat.ino
+    ) {
+      throw this.unsafeMutation(before.rel);
+    }
+    return { ...after, entries };
+  }
+
+  async readSearchText(requested: string, maxBytes = 2 * 1024 * 1024): Promise<string | null> {
+    let opened: Awaited<ReturnType<Workspace["openVerifiedRegularFile"]>>;
+    try {
+      opened = await this.openVerifiedRegularFile(requested);
+    } catch {
+      return null;
+    }
+    try {
+      if (opened.stat.size > maxBytes || (await this.isBinaryHandle(opened.handle))) return null;
+      const buffer = await this.readHandleBounded(opened.handle, maxBytes);
+      if (!buffer || buffer.includes(0)) return null;
+      return buffer.toString("utf8");
+    } finally {
+      await opened.handle.close().catch(() => undefined);
     }
   }
 
@@ -207,105 +339,100 @@ export class Workspace {
     requested: string,
     opts: { startLine?: number; endLine?: number; maxLines?: number; maxBytes?: number } = {}
   ): Promise<ReadFileResult> {
-    const { abs, rel } = this.resolve(requested);
-    let stat: fs.Stats;
+    const opened = await this.openVerifiedRegularFile(requested);
+    const { stat, rel } = opened;
     try {
-      stat = await fs.promises.stat(abs);
-    } catch {
-      throw new WorkspaceError("FILE_NOT_FOUND", `File not found: ${rel}`);
-    }
-    if (!stat.isFile()) {
-      throw new WorkspaceError("NOT_A_FILE", `Not a regular file: ${rel}`);
-    }
-    if (stat.size > HARD_MAX_SOURCE_BYTES) {
-      throw new WorkspaceError(
-        "FILE_TOO_LARGE",
-        `File exceeds the ${HARD_MAX_SOURCE_BYTES}-byte source limit: ${rel}`
-      );
-    }
-    if (await this.isBinary(abs)) {
-      throw new WorkspaceError("BINARY_FILE", `Binary file (${stat.size} bytes): ${rel}. Content is not returned.`);
-    }
+      if (stat.size > HARD_MAX_SOURCE_BYTES) {
+        throw new WorkspaceError(
+          "FILE_TOO_LARGE",
+          `File exceeds the ${HARD_MAX_SOURCE_BYTES}-byte source limit: ${rel}`
+        );
+      }
+      if (await this.isBinaryHandle(opened.handle)) {
+        throw new WorkspaceError("BINARY_FILE", `Binary file (${stat.size} bytes): ${rel}. Content is not returned.`);
+      }
 
-    const startLine = Math.max(1, Math.floor(opts.startLine ?? 1));
-    const maxLines = Math.min(HARD_MAX_LINES, Math.max(1, Math.floor(opts.maxLines ?? DEFAULT_MAX_LINES)));
-    const endLimit = opts.endLine
-      ? Math.min(Math.floor(opts.endLine), startLine + HARD_MAX_LINES - 1)
-      : startLine + maxLines - 1;
-    const maxBytes = Math.min(1024 * 1024, Math.max(1024, Math.floor(opts.maxBytes ?? DEFAULT_MAX_BYTES)));
+      const startLine = Math.max(1, Math.floor(opts.startLine ?? 1));
+      const maxLines = Math.min(HARD_MAX_LINES, Math.max(1, Math.floor(opts.maxLines ?? DEFAULT_MAX_LINES)));
+      const endLimit = opts.endLine
+        ? Math.min(Math.floor(opts.endLine), startLine + HARD_MAX_LINES - 1)
+        : startLine + maxLines - 1;
+      const maxBytes = Math.min(1024 * 1024, Math.max(1024, Math.floor(opts.maxBytes ?? DEFAULT_MAX_BYTES)));
 
-    const lines: string[] = [];
-    let totalLines = 0;
-    let collectedBytes = 0;
-    let byteTruncated = false;
-    let actualEnd = startLine - 1;
-
-    const stream = fs.createReadStream(abs, { encoding: "utf8" });
-    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-    for await (const line of rl) {
-      totalLines++;
-      if (totalLines >= startLine && totalLines <= endLimit && !byteTruncated) {
-        const cost = Buffer.byteLength(line, "utf8") + (lines.length > 0 ? 1 : 0);
-        if (collectedBytes + cost > maxBytes) {
-          if (lines.length === 0) {
-            stream.destroy();
-            throw new WorkspaceError(
-              "FILE_TOO_LARGE",
-              `Line ${totalLines} exceeds the ${maxBytes}-byte response limit: ${rel}`
-            );
+      const selectedLines: string[] = [];
+      let collectedBytes = 0;
+      let byteTruncated = false;
+      let actualEnd = startLine - 1;
+      const buffer = await this.readHandleBounded(opened.handle, HARD_MAX_SOURCE_BYTES);
+      if (!buffer) {
+        throw new WorkspaceError(
+          "FILE_TOO_LARGE",
+          `File exceeds the ${HARD_MAX_SOURCE_BYTES}-byte source limit: ${rel}`
+        );
+      }
+      const text = buffer.toString("utf8");
+      const lines = text === "" ? [] : text.split(/\r?\n/);
+      if (lines.length > 0 && lines.at(-1) === "") lines.pop();
+      const totalLines = lines.length;
+      for (let index = 0; index < lines.length; index++) {
+        const lineNumber = index + 1;
+        const line = lines[index];
+        if (lineNumber >= startLine && lineNumber <= endLimit && !byteTruncated) {
+          const cost = Buffer.byteLength(line, "utf8") + (selectedLines.length > 0 ? 1 : 0);
+          if (collectedBytes + cost > maxBytes) {
+            if (selectedLines.length === 0) {
+              throw new WorkspaceError(
+                "FILE_TOO_LARGE",
+                `Line ${lineNumber} exceeds the ${maxBytes}-byte response limit: ${rel}`
+              );
+            }
+            byteTruncated = true;
+          } else {
+            selectedLines.push(line);
+            collectedBytes += cost;
+            actualEnd = lineNumber;
           }
-          byteTruncated = true;
-        } else {
-          lines.push(line);
-          collectedBytes += cost;
-          actualEnd = totalLines;
         }
       }
-    }
-    rl.close();
 
-    const remaining = Math.max(0, totalLines - actualEnd);
-    const redacted = redactSensitiveText(lines.join("\n"));
-    return {
-      path: rel,
-      sizeBytes: stat.size,
-      totalLines,
-      startLine: Math.min(startLine, Math.max(totalLines, 1)),
-      endLine: actualEnd,
-      truncated: remaining > 0,
-      remainingLines: remaining,
-      nextStartLine: remaining > 0 ? actualEnd + 1 : null,
-      content: redacted.text,
-      redactionCount: redacted.redactionCount,
-    };
+      const remaining = Math.max(0, totalLines - actualEnd);
+      const redacted = redactSensitiveText(selectedLines.join("\n"));
+      return {
+        path: rel,
+        sizeBytes: stat.size,
+        totalLines,
+        startLine: Math.min(startLine, Math.max(totalLines, 1)),
+        endLine: actualEnd,
+        truncated: remaining > 0,
+        remainingLines: remaining,
+        nextStartLine: remaining > 0 ? actualEnd + 1 : null,
+        content: redacted.text,
+        redactionCount: redacted.redactionCount,
+      };
+    } finally {
+      await opened.handle.close().catch(() => undefined);
+    }
   }
 
   async listDirectory(
     requested: string,
     opts: { depth?: number; limit?: number; offset?: number } = {}
   ): Promise<ListDirectoryResult> {
-    const { abs, rel } = this.resolve(requested);
-    let stat: fs.Stats;
-    try {
-      stat = await fs.promises.stat(abs);
-    } catch {
-      throw new WorkspaceError("FILE_NOT_FOUND", `Directory not found: ${rel || "."}`);
-    }
-    if (!stat.isDirectory()) {
-      throw new WorkspaceError("NOT_A_DIRECTORY", `Not a directory: ${rel}`);
-    }
+    const initial = await this.readDirectoryEntries(requested);
+    const { abs, rel } = initial;
     const depth = Math.min(4, Math.max(1, Math.floor(opts.depth ?? 1)));
     const limit = Math.min(1000, Math.max(1, Math.floor(opts.limit ?? 200)));
     const offset = Math.min(10_000, Math.max(0, Math.floor(opts.offset ?? 0)));
 
     const all: DirEntry[] = [];
     const walk = async (dirAbs: string, dirRel: string, level: number): Promise<void> => {
-      let entries: fs.Dirent[];
+      let verified: VerifiedDirectory;
       try {
-        entries = await fs.promises.readdir(dirAbs, { withFileTypes: true });
+        verified = dirAbs === abs && dirRel === rel ? initial : await this.readDirectoryEntries(dirRel);
       } catch {
         return;
       }
+      const entries = verified.entries;
       entries.sort((a, b) => {
         const ad = a.isDirectory() ? 0 : 1;
         const bd = b.isDirectory() ? 0 : 1;
@@ -315,16 +442,25 @@ export class Workspace {
         const childRel = dirRel ? `${dirRel}/${entry.name}` : entry.name;
         if (this.ignoreRules.isHidden(childRel) || this.ignoreRules.isHidden(childRel + "/")) continue;
         if (entry.isDirectory()) {
-          all.push({ path: childRel + "/", type: "dir" });
-          if (level < depth) await walk(path.join(dirAbs, entry.name), childRel, level + 1);
-        } else if (entry.isFile()) {
-          let size: number | undefined;
           try {
-            size = (await fs.promises.stat(path.join(dirAbs, entry.name))).size;
+            const child = await this.readDirectoryEntries(childRel);
+            all.push({ path: childRel + "/", type: "dir" });
+            if (level < depth) await walk(child.abs, childRel, level + 1);
           } catch {
-            size = undefined;
+            continue;
           }
-          all.push({ path: childRel, type: "file", sizeBytes: size });
+        } else if (entry.isFile()) {
+          let opened: Awaited<ReturnType<Workspace["openVerifiedRegularFile"]>>;
+          try {
+            opened = await this.openVerifiedRegularFile(childRel);
+          } catch {
+            continue;
+          }
+          try {
+            all.push({ path: childRel, type: "file", sizeBytes: opened.stat.size });
+          } finally {
+            await opened.handle.close().catch(() => undefined);
+          }
         }
         if (all.length >= Math.min(12_000, offset + limit + 2000)) return;
       }
@@ -376,7 +512,7 @@ export class Workspace {
         pkg?.scripts && typeof pkg.scripts === "object" && !Array.isArray(pkg.scripts) ? pkg.scripts : {}
       )
         .slice(0, 200)
-        .map((name) => redactSensitiveText(name.slice(0, 200)).text)
+        .map((name) => redactAndTruncate(name, 200).text)
         .sort();
       const dependencies =
         pkg?.dependencies && typeof pkg.dependencies === "object" && !Array.isArray(pkg.dependencies)

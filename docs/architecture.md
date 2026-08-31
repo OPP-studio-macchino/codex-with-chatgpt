@@ -32,9 +32,9 @@ validates every recommendation. Repository content is untrusted in both layers.
 | `bridge/` | Express assembly, loopback-only listener, bounded request handling, minimal public health, protected admin routes, runtime state |
 | `mcp/` | Stateless Streamable HTTP handling and eight read-only tools with per-tool scopes |
 | `auth/` | OAuth/PKCE flow for external HTTPS mode, hashed token store, and fixed-header auth for OpenAI Secure MCP Tunnel |
-| `pairing/` | One-time code generation, TTL, attempt limits, and request-rate limits |
-| `workspace/` | Canonical containment, deny policy, `.c2cignore`, bounded reads/listing/search, hardened Git inspection |
-| `security/` | Outbound credential-shaped value detection and masking |
+| `pairing/` | One-time code generation, TTL, authorization-request-bound attempt limits, and request-rate limits |
+| `workspace/` | Canonical containment, descriptor-bound file reads, verified directory traversal, deny policy, `.c2cignore`, bounded literal search, hardened Git inspection |
+| `security/` | Outbound credential-shaped value detection, masking-before-truncation, and UTF-8-safe bounds |
 | `execution/` | Bounded, sanitized JSONL summaries explicitly recorded by Codex |
 | `process/` | Daemon spawn/reuse, authenticated identity checks and shutdown |
 | `tunnel/` | Explicit Cloudflare Quick Tunnel fallback only |
@@ -65,8 +65,8 @@ local requests to fail even if tunnel-client is still running.
 1. An explicitly selected Cloudflare Quick Tunnel or caller-managed proxy
    forwards HTTPS to the loopback bridge.
 2. An unauthenticated `/mcp` call receives 401 plus protected-resource metadata.
-3. The client discovers C2C's authorization endpoints and dynamically registers
-   bounded redirect URIs.
+3. During an owner-created pairing window, the client discovers C2C's
+   authorization endpoints and dynamically registers bounded redirect URIs.
 4. Authorization requires PKCE S256 and a one-time pairing code on a page that
    identifies workspace, client, callback origin, and requested scopes.
 5. A one-time authorization code is exchanged for an access token and optional
@@ -94,13 +94,13 @@ canonical workspace containment
 built-in sensitive denylist + .c2cignore
         |
         v
-bounded filesystem, search, Git, or execution-record operation
+descriptor-bound filesystem, literal search, Git, or execution-record operation
         |
         v
-credential-shaped value redaction
+complete-unit credential-shaped value redaction
         |
         v
-bounded JSON MCP response
+UTF-8-safe bounded JSON MCP response
 ```
 
 The redaction stage is not a data-classification system. Project owners must
@@ -110,9 +110,13 @@ exclude their own PII and proprietary paths.
 
 Git commands run only when `.git` exists at the selected root. C2C removes
 environment overrides, ignores global/system Git config, disables fsmonitor,
-hooks, external diff and textconv, uses literal pathspecs, and prevents optional
-locks and terminal prompts. Diff paths are enumerated and filtered before their
-content is requested.
+hooks, external diff, textconv, and lazy object fetching, uses literal
+pathspecs, defaults transport protocols to denied, and prevents optional locks
+and terminal prompts. Before status/diff
+reads index or object data, a name-only config preflight that does not follow
+includes rejects executable filters, includes, partial-clone promises,
+protocol overrides, credential helpers, and SSH commands. Diff paths are then
+enumerated and filtered before their content is requested.
 
 ## Process and state lifecycle
 

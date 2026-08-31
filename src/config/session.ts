@@ -1,6 +1,6 @@
 import path from "node:path";
 import { ensureDir, getStateDir, readJsonIfExists } from "./paths.js";
-import { redactSensitiveText } from "../security/redaction.js";
+import { redactAndTruncate } from "../security/redaction.js";
 
 export interface SavedSession {
   url: string;
@@ -41,10 +41,9 @@ export function sanitizeSessionLabel(value: unknown): string | undefined {
   const clean = value
     .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ")
     .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 200);
+    .trim();
   if (!clean) return undefined;
-  return redactSensitiveText(clean).text;
+  return redactAndTruncate(clean, 200).text;
 }
 
 export function readSavedSession(file: string): SavedSession | null {
