@@ -61,6 +61,7 @@ const PROVISIONAL_CLIENT_TTL_MS = 5 * 60 * 1000;
 const MAX_PROVISIONAL_CLIENTS = 8;
 const MAX_REGISTERED_CLIENTS = 32;
 const MAX_PERSISTED_TOKENS = 256;
+const MAX_AUTHORIZATION_CODES = 64;
 
 export function isAllowedOAuthRedirectUri(uri: string): boolean {
   let parsed: URL;
@@ -119,6 +120,7 @@ export class AuthStore {
   private clients = new Map<string, ClientRegistration>();
   private tokens = new Map<string, TokenRecord>();
   private authCodes = new Map<string, AuthorizationCodeRecord>();
+  private provisionalWindowId: string | null = null;
   private readonly file: string;
 
   constructor(
@@ -191,7 +193,30 @@ export class AuthStore {
     writeSecureJson(this.file, state);
   }
 
+  private pruneEphemeral(now = Date.now()): void {
+    const cutoff = now - PROVISIONAL_CLIENT_TTL_MS;
+    for (const [clientId, client] of this.clients) {
+      if (!client.authorizedAt && Date.parse(client.createdAt) < cutoff) this.clients.delete(clientId);
+    }
+    for (const [code, record] of this.authCodes) {
+      if (record.expiresAt <= now) this.authCodes.delete(code);
+    }
+  }
+
   // ---- Dynamic Client Registration -------------------------------------
+
+  /**
+   * Provisional registrations belong to one short owner-created pairing
+   * window. Starting a new window discards only unapproved candidates from
+   * the old window; authorized clients are never affected.
+   */
+  beginPairingWindow(windowId: string): void {
+    if (this.provisionalWindowId === windowId) return;
+    this.provisionalWindowId = windowId;
+    for (const [clientId, client] of this.clients) {
+      if (!client.authorizedAt) this.clients.delete(clientId);
+    }
+  }
 
   registerClient(input: { clientName?: string; redirectUris: string[] }): ClientRegistration {
     if (
@@ -203,10 +228,7 @@ export class AuthStore {
     ) {
       throw new Error("INVALID_REDIRECT_URIS");
     }
-    const cutoff = Date.now() - PROVISIONAL_CLIENT_TTL_MS;
-    for (const [clientId, client] of this.clients) {
-      if (!client.authorizedAt && Date.parse(client.createdAt) < cutoff) this.clients.delete(clientId);
-    }
+    this.pruneEphemeral();
     const provisional = [...this.clients.values()]
       .filter((client) => !client.authorizedAt)
       .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
@@ -214,10 +236,11 @@ export class AuthStore {
     if (authorizedCount >= MAX_REGISTERED_CLIENTS) {
       throw new Error("CLIENT_REGISTRATION_LIMIT");
     }
-    while (provisional.length >= MAX_PROVISIONAL_CLIENTS) {
-      const oldest = provisional.shift();
-      if (oldest) this.clients.delete(oldest.clientId);
-    }
+    // Never evict an existing provisional registration. This preserves an
+    // owner flow that registered before a flood; excess untrusted clients are
+    // rejected and the owner can regenerate the short pairing window if the
+    // cap was already full.
+    if (provisional.length >= MAX_PROVISIONAL_CLIENTS) throw new Error("PROVISIONAL_CLIENT_LIMIT");
     const client: ClientRegistration = {
       clientId: `c2c_client_${randomBytes(12).toString("base64url")}`,
       clientName: sanitizeClientName(input.clientName),
@@ -229,10 +252,12 @@ export class AuthStore {
   }
 
   getClient(clientId: string): ClientRegistration | undefined {
+    this.pruneEphemeral();
     return this.clients.get(clientId);
   }
 
   markClientAuthorized(clientId: string): void {
+    this.pruneEphemeral();
     const client = this.clients.get(clientId);
     if (!client) return;
     client.authorizedAt = new Date().toISOString();
@@ -240,6 +265,11 @@ export class AuthStore {
   }
 
   // ---- Authorization codes ----------------------------------------------
+
+  canIssueAuthorizationCode(): boolean {
+    this.pruneEphemeral();
+    return this.authCodes.size < MAX_AUTHORIZATION_CODES;
+  }
 
   createAuthorizationCode(input: {
     clientId: string;
@@ -249,6 +279,8 @@ export class AuthStore {
     pairingSessionId: string;
     resource?: string;
   }): string {
+    this.pruneEphemeral();
+    if (this.authCodes.size >= MAX_AUTHORIZATION_CODES) throw new Error("AUTHORIZATION_CODE_LIMIT");
     const code = newToken("c2c_ac");
     this.authCodes.set(code, {
       code,
@@ -382,6 +414,7 @@ export class AuthStore {
     this.clients.clear();
     this.tokens.clear();
     this.authCodes.clear();
+    this.provisionalWindowId = null;
     this.save();
     return count;
   }

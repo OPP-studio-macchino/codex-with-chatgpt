@@ -195,6 +195,32 @@ describe("read_file pagination", () => {
     expect(result.redactionCount).toBeGreaterThan(0);
   });
 
+  it("redacts multiline private keys across pagination boundaries", async () => {
+    const lines = Array.from({ length: 560 }, (_, index) => `safe line ${index + 1}`);
+    lines[389] = "-----BEGIN PRIVATE KEY-----";
+    for (let index = 390; index < 520; index++) lines[index] = `private-key-body-${index}`;
+    lines[520] = "-----END PRIVATE KEY-----";
+    write(root, "paginated-key.txt", `${lines.join("\n")}\n`);
+
+    const first = await ws.readFile("paginated-key.txt");
+    const middle = await ws.readFile("paginated-key.txt", { startLine: 450, endLine: 455 });
+    const ending = await ws.readFile("paginated-key.txt", { startLine: 518, endLine: 523 });
+    for (const page of [first, middle, ending]) {
+      expect(page.content).not.toContain("private-key-body-");
+      expect(page.redactionCount).toBeGreaterThan(0);
+    }
+    expect(ending.content).toContain("safe line 522");
+  });
+
+  it("streams a dense newline file without materializing every line", async () => {
+    const dense = "x\n".repeat(500_000);
+    write(root, "dense-lines.txt", dense);
+    const result = await ws.readFile("dense-lines.txt", { startLine: 499_990, endLine: 500_000 });
+    expect(result.totalLines).toBe(500_000);
+    expect(result.content.split("\n")).toHaveLength(11);
+    expect(result.sizeBytes).toBe(Buffer.byteLength(dense));
+  });
+
   it("uses one verified descriptor for binary inspection and content", async () => {
     const open = vi.spyOn(fs.promises, "open");
     const result = await ws.readFile("hello.txt");
@@ -330,15 +356,39 @@ describe("workspace identity", () => {
     cleanup(policy);
   });
 
-  it("does not inspect a symlinked project manifest", () => {
+  it("does not inspect a symlinked project manifest", async () => {
     const linked = makeTmpDir("linked-project");
     const outsideManifest = makeTmpDir("outside-manifest");
     write(outsideManifest, "package.json", JSON.stringify({ scripts: { "secret-token": "echo no" } }));
     fs.symlinkSync(path.join(outsideManifest, "package.json"), path.join(linked, "package.json"));
     const linkedWs = new Workspace(linked);
-    expect(linkedWs.detectProject()).toMatchObject({ projectType: "unknown", scriptNames: [] });
+    expect(await linkedWs.detectProject()).toMatchObject({ projectType: "unknown", scriptNames: [] });
     cleanup(linked);
     cleanup(outsideManifest);
+  });
+
+  it("fails closed when project metadata is swapped before descriptor open", async () => {
+    const local = makeTmpDir("project-metadata-swap");
+    const external = makeTmpDir("project-metadata-outside");
+    const manifest = write(local, "package.json", JSON.stringify({ scripts: { safe: "true" } }));
+    const outsideFile = write(
+      external,
+      "package.json",
+      JSON.stringify({ scripts: { "outside-secret-script": "true" }, dependencies: { express: "latest" } })
+    );
+    const localWs = new Workspace(local);
+    const originalOpen = fs.promises.open.bind(fs.promises);
+    vi.spyOn(fs.promises, "open").mockImplementationOnce(async (file, flags, mode) => {
+      fs.renameSync(manifest, `${manifest}.safe`);
+      fs.symlinkSync(outsideFile, manifest);
+      return originalOpen(file, flags, mode);
+    });
+
+    const project = await localWs.detectProject();
+    expect(JSON.stringify(project)).not.toContain("outside-secret-script");
+    expect(project.frameworks).not.toContain("Express");
+    cleanup(local);
+    cleanup(external);
   });
 
   it("sanitizes and bounds untrusted project config", () => {

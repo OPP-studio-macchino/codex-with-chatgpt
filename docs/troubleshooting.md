@@ -132,7 +132,10 @@ shared or network filesystems are outside the supported boundary.
 C2C deliberately ignores global/system Git config and disables hooks, external
 diff drivers, textconv, renames, pagers, and parent-repository discovery. The
 result is a hardened inspection view, not necessarily byte-for-byte identical
-to the user's customized interactive Git output.
+to the user's customized interactive Git output. Status also ignores all
+submodules, and commands run from a sanitized temporary control-metadata
+snapshot. Use the dedicated `git_status` or `git_diff` tool; `workspace_info`
+intentionally contains no Git data.
 
 ## Git diff returns `UNSAFE_GIT_CONFIGURATION`
 

@@ -43,13 +43,13 @@ instructions.
 | Risk | Implemented control |
 | --- | --- |
 | `..` / absolute-path escape | Paths are resolved against the workspace and checked after canonicalization. |
-| Symlink and path-swap escape | The deepest existing ancestor is realpathed. A regular file is then opened once with no-follow/nonblocking flags, verified by descriptor and post-open path identity, and read only through that descriptor. Directory traversal rejects pre/post identity changes. |
+| Symlink and path-swap escape | The deepest existing ancestor is realpathed. A regular file, project manifest, or `.c2cignore` is opened once with no-follow/nonblocking flags, verified by descriptor and post-open path identity, and read only through that descriptor. Directory traversal rejects pre/post identity changes. |
 | Parent Git repository bleed | Git is used only when `.git` exists at the selected workspace root. |
 | Sensitive path exposure | A non-configurable denylist and `.c2cignore` apply to reads, listings, search, status, and diff. If `.c2cignore` exists but cannot be read, workspace access fails closed. |
-| Binary or huge source reads | Binary files are rejected; individual source files and each response are bounded, including growth after the initial descriptor stat. |
+| Binary or huge source reads | Binary files are rejected; individual source files and each response are bounded, including growth after the initial descriptor stat. `read_file` incrementally parses the same descriptor and retains only the requested page. |
 | Search exhaustion and mutable subprocess paths | Query, glob, result count, file count, file size, and runtime are bounded. Search is literal-only through verified file descriptors; regex subprocess search is disabled. |
-| Malicious Git configuration | Git runs without global/system config, optional locks, or lazy object fetching; transport protocols default to denied, and hooks, fsmonitor, pagers, external diff, and textconv are disabled. Before status/diff reads index or object data, C2C lists repository config names without following includes and rejects filters, includes, partial-clone promises, protocol overrides, credential helpers, and SSH commands. Pathspecs are literal. |
-| Secrets embedded in otherwise allowed text | Complete bounded logical units are scanned for common private-key, bearer-token, provider-key, cookie, URL-credential, and assignment patterns before UTF-8-safe truncation. Matching values are replaced and oversized raw units fail closed. |
+| Malicious Git configuration | Git runs without global/system config, optional locks, or lazy object fetching; transport protocols default to denied, and hooks, fsmonitor, pagers, external diff, and textconv are disabled. Before status/diff reads index or object data, C2C lists repository config names without following includes and rejects filters, includes, partial-clone promises, protocol overrides, credential helpers, and SSH commands. Execution uses a sanitized owner-only temporary control-metadata snapshot, all status paths ignore submodules, and pathspecs are literal. `workspace_info` never invokes Git. |
+| Secrets embedded in otherwise allowed text | Descriptor-streamed reads and literal search carry private-key block state across line/page boundaries. Other complete bounded units are scanned for bearer-token, provider-key, cookie, URL-credential, and assignment patterns before UTF-8-safe truncation. Matching values are replaced and oversized raw units fail closed. |
 
 The denylist and scanner are defense in depth. They cannot recognize every
 secret, arbitrary PII, customer data, proprietary algorithm, or encoded value.
@@ -88,8 +88,9 @@ Cloudflare Quick Tunnel or a caller-managed HTTPS origin uses C2C's OAuth flow:
 - dynamic registration and authorization require an active pairing window
   created by the owner;
 - dynamic clients are provisional until successful pairing;
-- provisional registrations expire after five minutes and are kept within a
-  bounded oldest-first replacement set;
+- provisional registrations expire after five minutes, are scoped to the
+  current pairing window, and are rejected at a hard cap rather than evicting
+  an already accepted owner candidate;
 - persisted authorized clients are capped;
 - redirect URIs must be credential-free HTTPS URLs, except loopback HTTP for
   development; fragments, control characters, duplicates, and oversized lists
@@ -102,10 +103,12 @@ Cloudflare Quick Tunnel or a caller-managed HTTPS origin uses C2C's OAuth flow:
 - requested scopes are allowlisted and enforced per tool;
 - pairing pages show the requesting client, workspace, callback origin, and
   scopes, and include no-store, CSP, anti-framing, and referrer protections;
-- pairing attempts are bounded per pending authorization request, so failures
-  against one request do not consume another request's budget;
-- pending authorization requests, registrations, request bodies, and
-  concurrent MCP work are bounded;
+- pairing attempts are bounded per pending authorization request and by a
+  window-global wrong-attempt budget; a correct owner-held code remains usable
+  after untrusted attempt state reaches its cap;
+- pending authorization requests, authorization codes, provisional clients,
+  registration fingerprints, per-window DCR attempts, pairing maps, request
+  bodies, concurrent OAuth routes, and concurrent MCP work are hard-bounded;
 - `c2c unpair` revokes clients and stored token hashes.
 
 A user must still inspect the pairing page. OAuth does not make a mistakenly

@@ -123,22 +123,20 @@ async function searchWithNode(
           return;
         }
         if (globRegex && !globRegex.test(childRel)) continue;
-        const content = await ws.readSearchText(childRel);
-        if (content === null) continue;
-        const lines = content.split("\n");
-        for (let i = 0; i < lines.length; i++) {
-          const line = lines[i];
+        await ws.forEachSearchLine(childRel, ({ lineNumber, text: line, redactionCount: lineRedactions }) => {
+          redactionCount += lineRedactions;
           const hit = matcher ? matcher.test(line) : line.toLowerCase().includes(needle);
           if (hit) {
             const redacted = redactAndTruncate(line, 500);
             redactionCount += redacted.redactionCount;
-            matches.push({ path: childRel, line: i + 1, text: redacted.text });
+            matches.push({ path: childRel, line: lineNumber, text: redacted.text });
             if (matches.length >= limit) {
               truncated = true;
-              return;
+              return false;
             }
           }
-        }
+          return true;
+        });
       }
     }
   };

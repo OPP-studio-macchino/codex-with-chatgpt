@@ -94,10 +94,11 @@ canonical workspace containment
 built-in sensitive denylist + .c2cignore
         |
         v
-descriptor-bound filesystem, literal search, Git, or execution-record operation
+descriptor-bound streaming filesystem/literal-search operation,
+sanitized-snapshot Git operation, or execution-record operation
         |
         v
-complete-unit credential-shaped value redaction
+stateful stream + bounded-unit credential-shaped value redaction
         |
         v
 UTF-8-safe bounded JSON MCP response
@@ -116,7 +117,12 @@ and terminal prompts. Before status/diff
 reads index or object data, a name-only config preflight that does not follow
 includes rejects executable filters, includes, partial-clone promises,
 protocol overrides, credential helpers, and SSH commands. Diff paths are then
-enumerated and filtered before their content is requested.
+enumerated and filtered before their content is requested. The preflighted
+HEAD, ref, and index control metadata is copied into an owner-only sanitized
+temporary Git directory for execution, so a later root-config swap is not read
+by the command. The original object database remains read-only input, status
+always uses `--ignore-submodules=all`, and `workspace_info` does not enter this
+data path at all.
 
 ## Process and state lifecycle
 

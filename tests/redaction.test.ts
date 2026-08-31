@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
-import { redactAndTruncate, redactSensitiveText } from "../src/security/redaction.js";
+import {
+  redactAndTruncate,
+  redactSensitiveText,
+  StreamingSecretRedactor,
+} from "../src/security/redaction.js";
 import { Logger, redact } from "../src/logger/index.js";
 import { cleanup, makeTmpDir } from "./helpers.js";
 
@@ -46,6 +50,32 @@ describe("outbound secret redaction", () => {
     expect(result.text).not.toContain("abc123");
     expect(result.text).not.toContain("supersecret");
     expect(result.text).toContain("[REDACTED PRIVATE KEY]");
+  });
+
+  it("keeps multiline private-key state across streamed lines", () => {
+    const redactor = new StreamingSecretRedactor();
+    const output = [
+      "safe prefix -----BEGIN PRIVATE KEY-----",
+      "cross-page-private-key-body",
+      "-----END PRIVATE KEY----- safe suffix",
+    ].map((line) => redactor.redactLine(line).text);
+    expect(output.join("\n")).not.toContain("cross-page-private-key-body");
+    expect(output[0]).toContain("safe prefix");
+    expect(output[2]).toContain("safe suffix");
+    expect(redactor.isInsideMultilineSecret()).toBe(false);
+  });
+
+  it("tracks a second block that begins after a complete same-line block", () => {
+    const redactor = new StreamingSecretRedactor();
+    const first = redactor.redactLine(
+      "-----BEGIN PRIVATE KEY-----one-----END PRIVATE KEY----- -----BEGIN RSA PRIVATE KEY-----"
+    );
+    const body = redactor.redactLine("second-block-body");
+    expect(first.text).not.toContain("one");
+    expect(body.text).not.toContain("second-block-body");
+    expect(redactor.isInsideMultilineSecret()).toBe(true);
+    redactor.redactLine("-----END RSA PRIVATE KEY-----");
+    expect(redactor.isInsideMultilineSecret()).toBe(false);
   });
 
   it("is idempotent and the logger also hides pairing codes", () => {

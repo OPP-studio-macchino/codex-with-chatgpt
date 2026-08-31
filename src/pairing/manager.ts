@@ -10,6 +10,7 @@ export interface PairingSession {
   workspaceId: string;
   createdAt: number;
   expiresAt: number;
+  wrongAttempts: number;
   used: boolean;
 }
 
@@ -61,6 +62,8 @@ export interface PairingManagerOptions {
   maxAttempts?: number;
   ipRateLimit?: number;
   ipRateWindowMs?: number;
+  maxStateEntries?: number;
+  maxGlobalWrongAttempts?: number;
 }
 
 export class PairingManager {
@@ -71,6 +74,8 @@ export class PairingManager {
   private readonly maxAttempts: number;
   private readonly ipRateLimit: number;
   private readonly ipRateWindowMs: number;
+  private readonly maxStateEntries: number;
+  private readonly maxGlobalWrongAttempts: number;
 
   constructor(
     private readonly workspaceId: string,
@@ -80,6 +85,8 @@ export class PairingManager {
     this.maxAttempts = opts.maxAttempts ?? 5;
     this.ipRateLimit = opts.ipRateLimit ?? 10;
     this.ipRateWindowMs = opts.ipRateWindowMs ?? 60_000;
+    this.maxStateEntries = opts.maxStateEntries ?? 64;
+    this.maxGlobalWrongAttempts = opts.maxGlobalWrongAttempts ?? 64;
   }
 
   /** Create a new pairing session. Invalidates previous sessions (one active at a time). */
@@ -94,17 +101,29 @@ export class PairingManager {
       workspaceId: this.workspaceId,
       createdAt: Date.now(),
       expiresAt: Date.now() + this.ttlMs,
+      wrongAttempts: 0,
       used: false,
     };
     this.sessions.set(session.id, session);
     return { sessionId: session.id, code: formatPairingCode(raw), expiresAt: session.expiresAt };
   }
 
+  private prune(now: number): void {
+    for (const [key, entry] of this.bindingAttempts) {
+      if (entry.expiresAt <= now) this.bindingAttempts.delete(key);
+    }
+    for (const [key, entry] of this.rateHits) {
+      if (entry.resetAt <= now) this.rateHits.delete(key);
+    }
+  }
+
   private checkRate(bindingId: string, ip: string | undefined): boolean {
     const now = Date.now();
+    this.prune(now);
     const key = `${bindingId}\0${ip ?? "unknown"}`;
     const entry = this.rateHits.get(key);
     if (!entry || now > entry.resetAt) {
+      if (!entry && this.rateHits.size >= this.maxStateEntries) return false;
       this.rateHits.set(key, { count: 1, resetAt: now + this.ipRateWindowMs });
       return true;
     }
@@ -116,12 +135,10 @@ export class PairingManager {
     if (!/^[A-Za-z0-9_-]{8,128}$/.test(bindingId)) {
       return { ok: false, reason: "no_active_session" };
     }
-    if (!this.checkRate(bindingId, ip)) {
-      return { ok: false, reason: "rate_limited" };
-    }
     const normalized = normalizePairingCode(codeInput);
     const inputHash = hashCode(normalized);
     const now = Date.now();
+    this.prune(now);
 
     const active = [...this.sessions.values()].filter((s) => !s.used);
     if (active.length === 0) return { ok: false, reason: "no_active_session" };
@@ -131,23 +148,29 @@ export class PairingManager {
         this.sessions.delete(session.id);
         return { ok: false, reason: "expired" };
       }
-      const attemptKey = `${session.id}:${bindingId}`;
-      const attempts = this.bindingAttempts.get(attemptKey) ?? {
-        attemptsLeft: this.maxAttempts,
-        expiresAt: session.expiresAt,
-      };
-      if (attempts.attemptsLeft <= 0) {
-        return { ok: false, reason: "too_many_attempts" };
-      }
+      // A correct owner-held code must remain usable even after untrusted
+      // requests exhaust wrong-attempt/rate state. It is still one-time.
       const match = timingSafeEqual(inputHash, session.codeHash);
       if (match) {
-        // one-time use: destroy immediately
         session.used = true;
         this.sessions.delete(session.id);
         this.bindingAttempts.clear();
         this.rateHits.clear();
         return { ok: true, sessionId: session.id };
       }
+      if (session.wrongAttempts >= this.maxGlobalWrongAttempts || !this.checkRate(bindingId, ip)) {
+        return { ok: false, reason: "rate_limited" };
+      }
+      const attemptKey = `${session.id}:${bindingId}`;
+      let attempts = this.bindingAttempts.get(attemptKey);
+      if (!attempts) {
+        if (this.bindingAttempts.size >= this.maxStateEntries) return { ok: false, reason: "rate_limited" };
+        attempts = { attemptsLeft: this.maxAttempts, expiresAt: session.expiresAt };
+      }
+      if (attempts.attemptsLeft <= 0) {
+        return { ok: false, reason: "too_many_attempts" };
+      }
+      session.wrongAttempts++;
       attempts.attemptsLeft--;
       this.bindingAttempts.set(attemptKey, attempts);
       if (attempts.attemptsLeft <= 0) {
@@ -160,10 +183,22 @@ export class PairingManager {
 
   hasActiveSession(): boolean {
     const now = Date.now();
-    for (const session of this.sessions.values()) {
+    this.prune(now);
+    for (const [id, session] of this.sessions) {
       if (!session.used && now <= session.expiresAt) return true;
+      if (session.used || now > session.expiresAt) this.sessions.delete(id);
     }
     return false;
+  }
+
+  activeSessionId(): string | null {
+    const now = Date.now();
+    this.prune(now);
+    for (const [id, session] of this.sessions) {
+      if (!session.used && now <= session.expiresAt) return session.id;
+      if (session.used || now > session.expiresAt) this.sessions.delete(id);
+    }
+    return null;
   }
 
   invalidateAll(): void {

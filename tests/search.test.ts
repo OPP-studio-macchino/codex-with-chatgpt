@@ -26,6 +26,16 @@ beforeAll(() => {
     "src/long-credential.ts",
     `const password = "${"S".repeat(620)}"; // long-redact-boundary\r\n`
   );
+  write(
+    root,
+    "src/multiline-key.txt",
+    [
+      "-----BEGIN PRIVATE KEY-----",
+      "cross-line-search-secret-needle",
+      "-----END PRIVATE KEY-----",
+      "safe-after-key-search-needle",
+    ].join("\n") + "\n"
+  );
   write(root, "node_modules/pkg/index.js", "needle-alpha in dependencies\n");
   for (let i = 0; i < 30; i++) {
     write(root, `many/file-${i}.txt`, "needle-beta\nneedle-beta\n");
@@ -91,6 +101,15 @@ describe.each(engines())("search engine: %s", (engine) => {
     expect(result.matches[0].text).not.toContain("S".repeat(32));
     expect(result.matches[0].text).toContain("[REDACTED]");
     expect(result.redactionCount).toBeGreaterThan(0);
+  });
+
+  it("does not match private-key body text split across streamed lines", async () => {
+    configure();
+    const secret = await searchWorkspace(ws, { query: "cross-line-search-secret-needle" });
+    expect(secret.matches).toHaveLength(0);
+    const safe = await searchWorkspace(ws, { query: "safe-after-key-search-needle" });
+    expect(safe.matches).toHaveLength(1);
+    expect(safe.matches[0].text).not.toContain("cross-line-search-secret-needle");
   });
 
   it("respects the limit", async () => {

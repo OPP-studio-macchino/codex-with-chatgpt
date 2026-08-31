@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import { gitDiff, gitInfo, gitStatus } from "../src/workspace/git.js";
@@ -39,6 +39,10 @@ afterAll(() => {
   delete process.env.GIT_CEILING_DIRECTORIES;
   cleanup(repo);
   cleanup(plain);
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
 });
 
 describe("gitInfo", () => {
@@ -157,6 +161,73 @@ describe("gitStatus", () => {
       fs.rmSync(path.join(repo, `bulk-${String(index).padStart(3, "0")}.txt`), { force: true });
     }
   });
+
+  it.skipIf(process.platform === "win32")(
+    "ignores initialized submodules before their local filters or includes can run",
+    () => {
+      for (const viaInclude of [false, true]) {
+        const isolated = makeTmpDir(`git-submodule-${viaInclude ? "include" : "filter"}`);
+        const subSource = makeTmpDir(`git-submodule-source-${viaInclude ? "include" : "filter"}`);
+        makeGitRepo(isolated);
+        makeGitRepo(subSource);
+        write(subSource, ".gitattributes", "hello.txt filter=hostile\n");
+        git(subSource, "add", ".gitattributes");
+        git(subSource, "commit", "-m", "add submodule attributes");
+        git(isolated, "-c", "protocol.file.allow=always", "submodule", "add", subSource, "deps/hostile");
+        git(isolated, "commit", "-am", "add submodule fixture");
+
+        const submodule = path.join(isolated, "deps", "hostile");
+        const { command, marker } = markerHelper(submodule, "submodule-helper");
+        if (viaInclude) {
+          const included = write(
+            submodule,
+            ".git-hostile-include",
+            `[filter "hostile"]\n\tclean = ${command}\n`
+          );
+          git(submodule, "config", "include.path", included);
+        } else {
+          git(submodule, "config", "filter.hostile.clean", command);
+        }
+        write(submodule, "hello.txt", "changed inside ignored submodule\n");
+
+        expect(gitStatus(isolated).isRepo).toBe(true);
+        expect(gitInfo(isolated).isRepo).toBe(true);
+        expect(fs.existsSync(marker)).toBe(false);
+        cleanup(isolated);
+        cleanup(subSource);
+      }
+    }
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "executes status from a sanitized metadata snapshot after a root config swap",
+    () => {
+      const isolated = makeTmpDir("git-root-config-race");
+      makeGitRepo(isolated);
+      write(isolated, ".gitattributes", "hello.txt filter=hostile\n");
+      git(isolated, "add", ".gitattributes");
+      git(isolated, "commit", "-m", "add root attributes");
+      write(isolated, "hello.txt", "changed during config race\n");
+      const { command, marker } = markerHelper(isolated, "raced-root-helper");
+      const config = path.join(isolated, ".git", "config");
+      const safeConfig = fs.readFileSync(config, "utf8");
+      const hostileConfig = `${safeConfig}\n[filter "hostile"]\n\tclean = ${command}\n`;
+      const originalMkdtemp = fs.mkdtempSync.bind(fs);
+      vi.spyOn(fs, "mkdtempSync").mockImplementation(((prefix: string) => {
+        const snapshot = originalMkdtemp(prefix);
+        const replacement = path.join(isolated, ".git", "config.hostile-tmp");
+        fs.writeFileSync(replacement, hostileConfig);
+        fs.renameSync(replacement, config);
+        return snapshot;
+      }) as typeof fs.mkdtempSync);
+
+      const status = gitStatus(isolated);
+      expect(status.isRepo).toBe(true);
+      expect(fs.existsSync(marker)).toBe(false);
+      fs.writeFileSync(config, safeConfig);
+      cleanup(isolated);
+    }
+  );
 });
 
 describe("gitDiff pagination", () => {

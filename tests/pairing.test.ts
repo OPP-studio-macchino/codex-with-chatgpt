@@ -78,6 +78,26 @@ describe("PairingManager", () => {
     expect(manager.verify(owner.code, "owner-request", "proxy")).toMatchObject({ ok: true });
   });
 
+  it("hard-bounds unique attacker state while reserving a correct owner code", () => {
+    const manager = new PairingManager("ws1", {
+      maxAttempts: 100,
+      ipRateLimit: 100,
+      maxStateEntries: 64,
+      maxGlobalWrongAttempts: 64,
+    });
+    const owner = manager.create();
+    for (let index = 0; index < 20_000; index++) {
+      manager.verify("1111-1111", `binding-${index}`, `ip-${index}`);
+    }
+    const state = manager as unknown as {
+      bindingAttempts: Map<string, unknown>;
+      rateHits: Map<string, unknown>;
+    };
+    expect(state.bindingAttempts.size).toBeLessThanOrEqual(64);
+    expect(state.rateHits.size).toBeLessThanOrEqual(64);
+    expect(manager.verify(owner.code, "owner-request", "proxy")).toMatchObject({ ok: true });
+  });
+
   it("normalizes input", () => {
     expect(normalizePairingCode(" ab2-cd3 e ")).toBe("AB2CD3E");
     expect(formatPairingCode("ABCDEFGH")).toBe("ABCD-EFGH");

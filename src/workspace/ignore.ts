@@ -133,6 +133,49 @@ export const NOISE_PATTERNS: string[] = [
   "yarn.lock",
 ];
 
+function readVerifiedIgnoreFile(workspaceRoot: string): string | null {
+  const file = path.join(workspaceRoot, ".c2cignore");
+  const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+  const nonBlock = fs.constants.O_NONBLOCK ?? 0;
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | noFollow | nonBlock);
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.size > 1024 * 1024) {
+      throw new Error(".c2cignore must be a regular file no larger than 1 MiB");
+    }
+    const buffer = Buffer.alloc(opened.size + 1);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const bytesRead = fs.readSync(fd, buffer, offset, buffer.length - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset > 1024 * 1024) throw new Error(".c2cignore grew beyond 1 MiB");
+    const canonical = fs.realpathSync.native(file);
+    const after = fs.statSync(file);
+    if (
+      canonical !== path.resolve(file) ||
+      opened.dev !== after.dev ||
+      opened.ino !== after.ino
+    ) {
+      throw new Error(".c2cignore changed while being read");
+    }
+    return buffer.subarray(0, offset).toString("utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // best-effort close of a read-only descriptor
+      }
+    }
+  }
+}
+
 export class IgnoreRules {
   private sensitive: Ignore;
   private noise: Ignore;
@@ -142,19 +185,13 @@ export class IgnoreRules {
     this.sensitive = ignore({ ignorecase: true }).add(SENSITIVE_PATTERNS);
     this.noise = ignore({ ignorecase: true }).add(NOISE_PATTERNS);
     this.custom = ignore({ ignorecase: true });
-    const c2cignore = path.join(workspaceRoot, ".c2cignore");
-    if (fs.existsSync(c2cignore)) {
-      try {
-        const stat = fs.lstatSync(c2cignore);
-        if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 1024 * 1024) {
-          throw new Error(".c2cignore must be a regular file no larger than 1 MiB");
-        }
-        this.custom.add(fs.readFileSync(c2cignore, "utf8"));
-      } catch (error) {
-        throw new Error(
-          `Cannot enforce .c2cignore; refusing workspace access: ${(error as Error).message}`
-        );
-      }
+    try {
+      const content = readVerifiedIgnoreFile(workspaceRoot);
+      if (content !== null) this.custom.add(content);
+    } catch (error) {
+      throw new Error(
+        `Cannot enforce .c2cignore; refusing workspace access: ${(error as Error).message}`
+      );
     }
   }
 

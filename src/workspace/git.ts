@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { IgnoreRules } from "./ignore.js";
 import { redactAndTruncate, redactSensitiveText } from "../security/redaction.js";
@@ -39,17 +40,38 @@ const UNSAFE_GIT_CONFIG_KEYS = [
 const NULL_DEVICE = process.platform === "win32" ? "NUL" : "/dev/null";
 let cachedGitBinary: string | null | undefined;
 
+interface ValidatedGitLayout {
+  gitDir: string;
+  commonGitDir: string;
+  objectDir: string;
+  gitDirDev: number;
+  gitDirIno: number;
+  commonDirDev: number;
+  commonDirIno: number;
+  objectDirDev: number;
+  objectDirIno: number;
+}
+
+interface GitSnapshot {
+  gitDir: string;
+  objectDir: string;
+}
+
+const MAX_GIT_INDEX_BYTES = 64 * 1024 * 1024;
+const MAX_PACKED_REFS_BYTES = 16 * 1024 * 1024;
+const MAX_SHARED_INDEX_FILES = 8;
+
 function gitBinary(): string | null {
   if (cachedGitBinary === undefined) cachedGitBinary = findBinary("git", { includePath: false });
   return cachedGitBinary;
 }
 
-function safeGitEnv(root: string, binary: string): NodeJS.ProcessEnv {
+function safeGitEnv(root: string, binary: string, snapshot?: GitSnapshot): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const key of ["SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "TMPDIR", "TMP", "TEMP"]) {
     if (process.env[key] !== undefined) env[key] = process.env[key];
   }
-  return {
+  const safe: NodeJS.ProcessEnv = {
     ...env,
     PATH: path.dirname(binary),
     GIT_CONFIG_GLOBAL: NULL_DEVICE,
@@ -63,10 +85,17 @@ function safeGitEnv(root: string, binary: string): NodeJS.ProcessEnv {
     GIT_TERMINAL_PROMPT: "0",
     LC_ALL: "C",
   };
+  if (snapshot) {
+    safe.GIT_DIR = snapshot.gitDir;
+    safe.GIT_WORK_TREE = root;
+    safe.GIT_OBJECT_DIRECTORY = snapshot.objectDir;
+    safe.GIT_INDEX_FILE = path.join(snapshot.gitDir, "index");
+  }
+  return safe;
 }
 
 /** Low-level Git spawn used only for the non-executing configuration preflight. */
-function spawnGit(root: string, args: string[]): GitCommandResult {
+function spawnGitPreflight(root: string, args: string[]): GitCommandResult {
   const binary = gitBinary();
   if (!binary) {
     return { ok: false, stdout: "", stderr: "Trusted Git binary not found.", code: null };
@@ -94,16 +123,55 @@ function spawnGit(root: string, args: string[]): GitCommandResult {
   };
 }
 
-function readSmallTextFile(file: string): string | null {
+function readVerifiedFile(file: string, maxBytes: number): Buffer | null {
+  const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+  const nonBlock = fs.constants.O_NONBLOCK ?? 0;
+  let fd: number | null = null;
   try {
-    const stat = fs.lstatSync(file);
-    if (stat.isSymbolicLink() || !stat.isFile() || stat.size < 1 || stat.size > 4096) return null;
-    const value = fs.readFileSync(file, "utf8").trim();
-    if (!value || /[\u0000-\u001f\u007f]/.test(value)) return null;
-    return value;
+    const before = fs.lstatSync(file);
+    if (before.isSymbolicLink() || !before.isFile() || before.size < 0 || before.size > maxBytes) return null;
+    fd = fs.openSync(file, fs.constants.O_RDONLY | noFollow | nonBlock);
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.size > maxBytes) return null;
+    const buffer = Buffer.alloc(opened.size + 1);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const bytesRead = fs.readSync(fd, buffer, offset, buffer.length - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset > maxBytes) return null;
+    const canonical = fs.realpathSync.native(file);
+    const after = fs.statSync(file);
+    if (
+      canonical !== path.resolve(file) ||
+      opened.dev !== after.dev ||
+      opened.ino !== after.ino ||
+      before.dev !== opened.dev ||
+      before.ino !== opened.ino
+    ) {
+      return null;
+    }
+    return buffer.subarray(0, offset);
   } catch {
     return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // best effort for a verified read-only descriptor
+      }
+    }
   }
+}
+
+function readSmallTextFile(file: string): string | null {
+  const buffer = readVerifiedFile(file, 4096);
+  if (!buffer || buffer.length < 1) return null;
+  const value = buffer.toString("utf8").trim();
+  if (!value || /[\u0000-\u001f\u007f]/.test(value)) return null;
+  return value;
 }
 
 function hasUnsafeObjectIndirection(commonGitDir: string): boolean {
@@ -125,7 +193,33 @@ function hasUnsafeObjectIndirection(commonGitDir: string): boolean {
   }
 }
 
-function validatedGitDirectory(root: string): string | null {
+function layoutFor(gitDir: string, commonGitDir: string): ValidatedGitLayout | null {
+  try {
+    const canonicalGitDir = fs.realpathSync.native(gitDir);
+    const canonicalCommon = fs.realpathSync.native(commonGitDir);
+    const objectDir = fs.realpathSync.native(path.join(canonicalCommon, "objects"));
+    if (objectDir !== path.join(canonicalCommon, "objects")) return null;
+    const gitStat = fs.statSync(canonicalGitDir);
+    const commonStat = fs.statSync(canonicalCommon);
+    const objectStat = fs.statSync(objectDir);
+    if (!gitStat.isDirectory() || !commonStat.isDirectory() || !objectStat.isDirectory()) return null;
+    return {
+      gitDir: canonicalGitDir,
+      commonGitDir: canonicalCommon,
+      objectDir,
+      gitDirDev: gitStat.dev,
+      gitDirIno: gitStat.ino,
+      commonDirDev: commonStat.dev,
+      commonDirIno: commonStat.ino,
+      objectDirDev: objectStat.dev,
+      objectDirIno: objectStat.ino,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function validatedGitDirectory(root: string): ValidatedGitLayout | null {
   const marker = path.join(root, ".git");
   let markerStat: fs.Stats;
   try {
@@ -138,7 +232,7 @@ function validatedGitDirectory(root: string): string | null {
   if (markerStat.isDirectory()) {
     try {
       if (fs.realpathSync.native(marker) !== path.resolve(marker)) return null;
-      return hasUnsafeObjectIndirection(marker) ? null : marker;
+      return hasUnsafeObjectIndirection(marker) ? null : layoutFor(marker, marker);
     } catch {
       return null;
     }
@@ -164,8 +258,104 @@ function validatedGitDirectory(root: string): string | null {
     if (!fs.statSync(commonGitDir).isDirectory()) return null;
     if (path.dirname(path.dirname(linkedGitDir)) !== commonGitDir) return null;
     if (hasUnsafeObjectIndirection(commonGitDir)) return null;
-    return linkedGitDir;
+    return layoutFor(linkedGitDir, commonGitDir);
   } catch {
+    return null;
+  }
+}
+
+function sameDirectoryIdentity(file: string, dev: number, ino: number): boolean {
+  try {
+    const stat = fs.statSync(file);
+    return stat.isDirectory() && stat.dev === dev && stat.ino === ino && fs.realpathSync.native(file) === file;
+  } catch {
+    return false;
+  }
+}
+
+function resolveHead(layout: ValidatedGitLayout): { headText: string; oid: string | null } | null {
+  const head = readSmallTextFile(path.join(layout.gitDir, "HEAD"));
+  if (!head) return null;
+  if (/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i.test(head)) return { headText: `${head}\n`, oid: head };
+  const match = head.match(/^ref:\s+(refs\/[A-Za-z0-9._/-]+)$/);
+  if (!match || match[1].includes("..") || match[1].includes("//")) return null;
+  const refName = match[1];
+  const loose = readSmallTextFile(path.join(layout.commonGitDir, ...refName.split("/")));
+  if (loose && /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i.test(loose)) {
+    return { headText: `ref: ${refName}\n`, oid: loose };
+  }
+  const packed = readVerifiedFile(path.join(layout.commonGitDir, "packed-refs"), MAX_PACKED_REFS_BYTES);
+  if (packed) {
+    for (const line of packed.toString("utf8").split(/\r?\n/)) {
+      if (!line || line.startsWith("#") || line.startsWith("^")) continue;
+      const separator = line.indexOf(" ");
+      if (separator < 1) continue;
+      const oid = line.slice(0, separator);
+      if (line.slice(separator + 1) === refName && /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i.test(oid)) {
+        return { headText: `ref: ${refName}\n`, oid };
+      }
+    }
+  }
+  // An unborn branch is valid and has no object ID yet.
+  return { headText: `ref: ${refName}\n`, oid: null };
+}
+
+function copyVerifiedFile(source: string, destination: string, maxBytes: number): boolean {
+  const buffer = readVerifiedFile(source, maxBytes);
+  if (!buffer) return false;
+  fs.writeFileSync(destination, buffer, { mode: 0o600, flag: "wx" });
+  return true;
+}
+
+function createGitSnapshot(root: string): GitSnapshot | null {
+  const layout = validatedGitDirectory(root);
+  if (!layout) return null;
+  const head = resolveHead(layout);
+  if (!head) return null;
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-git-snapshot-"));
+  try {
+    fs.chmodSync(temp, 0o700);
+    fs.mkdirSync(path.join(temp, "refs"), { mode: 0o700 });
+    fs.writeFileSync(path.join(temp, "HEAD"), head.headText, { mode: 0o600, flag: "wx" });
+    if (head.headText.startsWith("ref: ") && head.oid) {
+      const refName = head.headText.slice(5).trim();
+      const destination = path.join(temp, ...refName.split("/"));
+      fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(destination, `${head.oid}\n`, { mode: 0o600, flag: "wx" });
+    }
+    const objectFormat = head.oid?.length === 64 ? "\n[extensions]\n\tobjectFormat = sha256\n" : "";
+    fs.writeFileSync(
+      path.join(temp, "config"),
+      `[core]\n\trepositoryFormatVersion = ${head.oid?.length === 64 ? "1" : "0"}\n\tbare = false\n\tfileMode = true\n${objectFormat}`,
+      { mode: 0o600, flag: "wx" }
+    );
+
+    const sourceIndex = path.join(layout.gitDir, "index");
+    if (fs.existsSync(sourceIndex) && !copyVerifiedFile(sourceIndex, path.join(temp, "index"), MAX_GIT_INDEX_BYTES)) {
+      throw new Error("unsafe index");
+    }
+    const shared = new Set<string>();
+    for (const directory of [layout.gitDir, layout.commonGitDir]) {
+      for (const name of fs.readdirSync(directory)) {
+        if (/^sharedindex\.[a-f0-9]{40}(?:[a-f0-9]{24})?$/i.test(name)) shared.add(path.join(directory, name));
+      }
+    }
+    if (shared.size > MAX_SHARED_INDEX_FILES) throw new Error("too many shared indexes");
+    for (const source of shared) {
+      if (!copyVerifiedFile(source, path.join(temp, path.basename(source)), MAX_GIT_INDEX_BYTES)) {
+        throw new Error("unsafe shared index");
+      }
+    }
+    if (
+      !sameDirectoryIdentity(layout.gitDir, layout.gitDirDev, layout.gitDirIno) ||
+      !sameDirectoryIdentity(layout.commonGitDir, layout.commonDirDev, layout.commonDirIno) ||
+      !sameDirectoryIdentity(layout.objectDir, layout.objectDirDev, layout.objectDirIno)
+    ) {
+      throw new Error("git metadata changed");
+    }
+    return { gitDir: temp, objectDir: layout.objectDir };
+  } catch {
+    fs.rmSync(temp, { recursive: true, force: true });
     return null;
   }
 }
@@ -176,7 +366,7 @@ function hasUnsafeGitConfiguration(root: string): boolean {
   // Do not follow repository-controlled include/includeIf directives while
   // inspecting configuration. Their presence is itself unsupported. Listing
   // names only also avoids copying command values or credentials into memory.
-  const config = spawnGit(root, [
+  const config = spawnGitPreflight(root, [
     "config",
     "--no-includes",
     "--name-only",
@@ -200,7 +390,7 @@ function repositoryState(root: string): RepositoryState {
   // configuration therefore fails closed before status or diff can reach it.
   if (hasUnsafeGitConfiguration(root)) return "unsafe_configuration";
 
-  const check = spawnGit(root, ["rev-parse", "--is-inside-work-tree", "--show-toplevel"]);
+  const check = spawnGitPreflight(root, ["rev-parse", "--is-inside-work-tree", "--show-toplevel"]);
   if (!check.ok) return "absent";
   const lines = check.stdout.trim().split(/\r?\n/);
   if (lines[0] !== "true" || !lines[1]) return "absent";
@@ -235,7 +425,32 @@ export function runGit(root: string, args: string[]): GitCommandResult {
       code: null,
     };
   }
-  return spawnGit(root, args);
+  const binary = gitBinary();
+  const snapshot = createGitSnapshot(root);
+  if (!binary || !snapshot) {
+    return { ok: false, stdout: "", stderr: UNSAFE_GIT_CONFIGURATION_ERROR, code: null };
+  }
+  try {
+    const result = spawnSync(
+      binary,
+      [...SAFE_GIT_CONFIG, "--literal-pathspecs", `--git-dir=${snapshot.gitDir}`, `--work-tree=${root}`, ...args],
+      {
+        cwd: root,
+        encoding: "utf8",
+        maxBuffer: 16 * 1024 * 1024,
+        timeout: 30_000,
+        env: safeGitEnv(root, binary, snapshot),
+      }
+    );
+    return {
+      ok: result.status === 0,
+      stdout: result.stdout ?? "",
+      stderr: result.stderr ?? "",
+      code: result.status,
+    };
+  } finally {
+    fs.rmSync(snapshot.gitDir, { recursive: true, force: true });
+  }
 }
 
 function sanitizeGitLabel(value: string): string {
@@ -313,6 +528,7 @@ export function gitStatus(root: string): GitStatusResult {
     "--porcelain=v2",
     "--branch",
     "--no-renames",
+    "--ignore-submodules=all",
     "-z",
     "--",
     ".",

@@ -37,9 +37,10 @@ describe("OAuth authorization store", () => {
     for (let index = 0; index < 8; index++) {
       clients.push(store.registerClient({ redirectUris: [`https://example.com/callback/${index}`] }));
     }
-    const replacement = store.registerClient({ redirectUris: ["https://owner.example/callback"] });
-    expect(store.getClient(clients[0].clientId)).toBeUndefined();
-    expect(store.getClient(replacement.clientId)).toBeDefined();
+    expect(() =>
+      store.registerClient({ redirectUris: ["https://attacker-over-cap.example/callback"] })
+    ).toThrow("PROVISIONAL_CLIENT_LIMIT");
+    expect(store.getClient(clients[0].clientId)).toBeDefined();
   });
 
   it("enforces redirect validation inside the store boundary", () => {

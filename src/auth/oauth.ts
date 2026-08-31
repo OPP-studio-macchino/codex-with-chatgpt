@@ -33,6 +33,9 @@ interface PendingAuthRequest {
 }
 
 const MAX_PENDING_AUTH_REQUESTS = 64;
+const MAX_REGISTRATION_FINGERPRINTS = 64;
+const MAX_DCR_ATTEMPTS_PER_PAIRING_WINDOW = 32;
+const MAX_CONCURRENT_OAUTH_REQUESTS = 8;
 
 function scalarStringFields(
   value: unknown,
@@ -164,6 +167,9 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
   const router = Router();
   const pendingRequests = new Map<string, PendingAuthRequest>();
   const registrationHits = new Map<string, { count: number; resetAt: number }>();
+  let registrationWindowId: string | null = null;
+  let registrationWindowAttempts = 0;
+  let concurrentOAuthRequests = 0;
 
   router.use((_req, res, next) => {
     res.set({
@@ -174,6 +180,26 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
       "Content-Security-Policy":
         "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
     });
+    next();
+  });
+
+  // Apply a hard admission bound before any OAuth route body parser. This is
+  // intentionally process-local: the bridge itself is a single local owner
+  // process and should not queue an unbounded remote OAuth workload.
+  router.use((_req, res, next) => {
+    if (concurrentOAuthRequests >= MAX_CONCURRENT_OAUTH_REQUESTS) {
+      res.status(503).json({ error: "temporarily_unavailable" });
+      return;
+    }
+    concurrentOAuthRequests++;
+    let released = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      concurrentOAuthRequests--;
+    };
+    res.once("finish", release);
+    res.once("close", release);
     next();
   });
 
@@ -215,22 +241,36 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
       });
       return;
     }
-    if (!deps.pairing.hasActiveSession()) {
+    const activeWindowId = deps.pairing.activeSessionId();
+    if (!activeWindowId) {
       res.status(403).json({ error: "pairing_required" });
       return;
     }
     const now = Date.now();
-    if (registrationHits.size > 1024) {
-      for (const [fingerprint, entry] of registrationHits) {
-        if (now > entry.resetAt) registrationHits.delete(fingerprint);
-      }
+    if (registrationWindowId !== activeWindowId) {
+      registrationWindowId = activeWindowId;
+      registrationWindowAttempts = 0;
+      registrationHits.clear();
+      deps.store.beginPairingWindow(activeWindowId);
     }
+    for (const [fingerprint, entry] of registrationHits) {
+      if (now > entry.resetAt) registrationHits.delete(fingerprint);
+    }
+    if (registrationWindowAttempts >= MAX_DCR_ATTEMPTS_PER_PAIRING_WINDOW) {
+      res.status(429).json({ error: "pairing_window_registration_limit" });
+      return;
+    }
+    registrationWindowAttempts++;
     const origins = (redirectUris as string[]).map((uri) => new URL(uri).origin).sort().join("|");
     const key = createHash("sha256")
       .update(`${req.socket.remoteAddress ?? "unknown"}\0${origins}`)
       .digest("hex");
     const hit = registrationHits.get(key);
     if (!hit || now > hit.resetAt) {
+      if (!hit && registrationHits.size >= MAX_REGISTRATION_FINGERPRINTS) {
+        res.status(429).json({ error: "registration_fingerprint_limit" });
+        return;
+      }
       registrationHits.set(key, { count: 1, resetAt: now + 60_000 });
     } else {
       hit.count++;
@@ -246,7 +286,10 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
         redirectUris: redirectUris as string[],
       });
     } catch (error) {
-      if ((error as Error).message === "CLIENT_REGISTRATION_LIMIT") {
+      if (
+        (error as Error).message === "CLIENT_REGISTRATION_LIMIT" ||
+        (error as Error).message === "PROVISIONAL_CLIENT_LIMIT"
+      ) {
         res.status(429).json({ error: "registration_limit_reached" });
         return;
       }
@@ -380,6 +423,10 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
       res.status(400).send("This authorization request has expired. Please reconnect from ChatGPT.");
       return;
     }
+    if (!deps.store.canIssueAuthorizationCode()) {
+      res.status(503).send("Authorization capacity is temporarily unavailable. Generate a new pairing code later.");
+      return;
+    }
     const verdict = deps.pairing.verify(body.pairing_code ?? "", request.id, req.ip);
     if (!verdict.ok) {
       const messages: Record<string, string> = {
@@ -407,14 +454,23 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
     }
     pendingRequests.delete(request.id);
     deps.store.markClientAuthorized(request.clientId);
-    const code = deps.store.createAuthorizationCode({
-      clientId: request.clientId,
-      redirectUri: request.redirectUri,
-      codeChallenge: request.codeChallenge,
-      scopes: request.scopes,
-      pairingSessionId: verdict.sessionId,
-      resource: request.resource,
-    });
+    let code: string;
+    try {
+      code = deps.store.createAuthorizationCode({
+        clientId: request.clientId,
+        redirectUri: request.redirectUri,
+        codeChallenge: request.codeChallenge,
+        scopes: request.scopes,
+        pairingSessionId: verdict.sessionId,
+        resource: request.resource,
+      });
+    } catch (error) {
+      if ((error as Error).message === "AUTHORIZATION_CODE_LIMIT") {
+        res.status(503).send("Authorization capacity is temporarily unavailable. Generate a new pairing code later.");
+        return;
+      }
+      throw error;
+    }
     deps.logger.info(`Pairing verified; issued authorization code for client ${request.clientId}`);
     const url = new URL(request.redirectUri);
     url.searchParams.set("code", code);

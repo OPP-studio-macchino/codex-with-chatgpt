@@ -372,7 +372,8 @@ describe("authorization + token flow", () => {
 
   it("keeps an owner registration usable after provisional-client flooding", async () => {
     const pairing = bridge.pairing.create();
-    for (let index = 0; index < 8; index++) {
+    const ownerId = await registerClient();
+    for (let index = 0; index < 7; index++) {
       const response = await fetch(`${base}/oauth/register`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -380,10 +381,35 @@ describe("authorization + token flow", () => {
       });
       expect(response.status).toBe(201);
     }
-    const ownerId = await registerClient();
+    const rejected = await fetch(`${base}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ redirect_uris: ["https://attacker-over-cap.example/callback"] }),
+    });
+    expect(rejected.status).toBe(429);
+    expect(bridge.authStore.getClient(ownerId)).toBeDefined();
     const { challenge } = pkceVerifierAndChallenge();
     const ownerRequest = await createPendingRequest(ownerId, challenge);
     expect((await submitPairing(ownerRequest, pairing.code)).status).toBe(302);
+  });
+
+  it("hard-caps total dynamic registration attempts in one pairing window", async () => {
+    bridge.pairing.create();
+    let windowLimitSeen = false;
+    for (let index = 0; index < 40; index++) {
+      const response = await fetch(`${base}/oauth/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ redirect_uris: [`https://rotating-${index}.example/callback`] }),
+      });
+      const body = (await response.json()) as { error?: string };
+      if (body.error === "pairing_window_registration_limit") {
+        windowLimitSeen = true;
+        break;
+      }
+    }
+    expect(windowLimitSeen).toBe(true);
+    bridge.pairing.invalidateAll();
   });
 });
 

@@ -100,6 +100,7 @@ const RULES: Rule[] = [
 
 const MAX_REDACTION_INPUT_BYTES = 4 * 1024 * 1024;
 const TRUNCATION_MARKER = " [TRUNCATED]";
+const PRIVATE_KEY_BEGIN = /-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----/;
 
 function utf8Prefix(input: string, maxBytes: number): string {
   if (maxBytes <= 0) return "";
@@ -122,6 +123,56 @@ export function redactSensitiveText(input: string): RedactionResult {
     });
   }
   return { text, redactionCount };
+}
+
+/**
+ * Stateful line redaction for descriptor-streamed files. It prevents a
+ * multi-line private-key block from becoming visible when pagination or search
+ * splits BEGIN/body/END across separate output units.
+ */
+export class StreamingSecretRedactor {
+  private privateKeyLabel: string | null = null;
+
+  redactLine(input: string): RedactionResult {
+    if (this.privateKeyLabel) {
+      const endMarker = `-----END ${this.privateKeyLabel}-----`;
+      const end = input.indexOf(endMarker);
+      if (end < 0) {
+        return { text: "[REDACTED PRIVATE KEY CONTENT]", redactionCount: 1 };
+      }
+      this.privateKeyLabel = null;
+      const suffix = input.slice(end + endMarker.length);
+      const remainder = suffix ? this.redactLine(suffix) : { text: "", redactionCount: 0 };
+      return {
+        text: `[REDACTED PRIVATE KEY]${remainder.text}`,
+        redactionCount: 1 + remainder.redactionCount,
+      };
+    }
+
+    const begin = PRIVATE_KEY_BEGIN.exec(input);
+    if (!begin || begin.index === undefined) return redactSensitiveText(input);
+    const endMarker = `-----END ${begin[1]}-----`;
+    const end = input.indexOf(endMarker, begin.index + begin[0].length);
+    const prefix = redactSensitiveText(input.slice(0, begin.index));
+    if (end >= 0) {
+      const suffix = input.slice(end + endMarker.length);
+      const remainder = suffix ? this.redactLine(suffix) : { text: "", redactionCount: 0 };
+      return {
+        text: `${prefix.text}[REDACTED PRIVATE KEY]${remainder.text}`,
+        redactionCount: prefix.redactionCount + 1 + remainder.redactionCount,
+      };
+    }
+
+    this.privateKeyLabel = begin[1];
+    return {
+      text: `${prefix.text}[REDACTED PRIVATE KEY]`,
+      redactionCount: prefix.redactionCount + 1,
+    };
+  }
+
+  isInsideMultilineSecret(): boolean {
+    return this.privateKeyLabel !== null;
+  }
 }
 
 /**

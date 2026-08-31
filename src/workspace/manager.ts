@@ -1,9 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHmac } from "node:crypto";
+import { StringDecoder } from "node:string_decoder";
 import { IgnoreRules } from "./ignore.js";
-import { getStateDir, getWorkspaceIdentityKey, readJsonIfExists } from "../config/paths.js";
-import { redactAndTruncate, redactSensitiveText } from "../security/redaction.js";
+import { getStateDir, getWorkspaceIdentityKey } from "../config/paths.js";
+import { redactAndTruncate, StreamingSecretRedactor } from "../security/redaction.js";
 
 export type WorkspaceErrorCode =
   | "INVALID_PATH"
@@ -70,13 +71,79 @@ export interface ProjectConfig {
   maxIterations?: number;
 }
 
+export interface ProjectInfo {
+  projectType: string;
+  languages: string[];
+  frameworks: string[];
+  packageManager: string | null;
+  scriptNames: string[];
+}
+
+export interface SearchLine {
+  lineNumber: number;
+  text: string;
+  redactionCount: number;
+}
+
 const DEFAULT_MAX_LINES = 400;
 const HARD_MAX_LINES = 2000;
 const DEFAULT_MAX_BYTES = 256 * 1024;
 const HARD_MAX_SOURCE_BYTES = 5 * 1024 * 1024;
+const STREAM_CHUNK_BYTES = 64 * 1024;
+
+function readVerifiedRootFileSync(root: string, relative: string, maxBytes: number): Buffer | null {
+  const file = path.join(root, relative);
+  const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+  const nonBlock = fs.constants.O_NONBLOCK ?? 0;
+  let fd: number | null = null;
+  try {
+    const before = fs.lstatSync(file);
+    if (before.isSymbolicLink() || !before.isFile() || before.size > maxBytes) return null;
+    fd = fs.openSync(file, fs.constants.O_RDONLY | noFollow | nonBlock);
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.size > maxBytes) return null;
+    const buffer = Buffer.alloc(opened.size + 1);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const bytesRead = fs.readSync(fd, buffer, offset, buffer.length - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset > maxBytes) return null;
+    const canonical = fs.realpathSync.native(file);
+    const after = fs.statSync(file);
+    if (
+      canonical !== path.resolve(file) ||
+      !canonical.startsWith(root + path.sep) ||
+      before.dev !== opened.dev ||
+      before.ino !== opened.ino ||
+      opened.dev !== after.dev ||
+      opened.ino !== after.ino
+    ) {
+      return null;
+    }
+    return buffer.subarray(0, offset);
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // best-effort close of a read-only descriptor
+      }
+    }
+  }
+}
 
 function loadProjectConfig(root: string): ProjectConfig {
-  const raw = readJsonIfExists<Record<string, unknown>>(path.join(root, ".c2c.json"), 64 * 1024);
+  const buffer = readVerifiedRootFileSync(root, ".c2c.json", 64 * 1024);
+  let raw: Record<string, unknown> | null = null;
+  try {
+    raw = buffer ? (JSON.parse(buffer.toString("utf8")) as Record<string, unknown>) : null;
+  } catch {
+    raw = null;
+  }
   if (!raw) return {};
   const config: ProjectConfig = {};
   if (typeof raw.name === "string") {
@@ -250,28 +317,51 @@ export class Workspace {
     }
   }
 
-  private async isBinaryHandle(handle: fs.promises.FileHandle): Promise<boolean> {
-    const buf = Buffer.alloc(8192);
-    const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
-    for (let i = 0; i < bytesRead; i++) {
-      if (buf[i] === 0) return true;
-    }
-    return false;
-  }
-
-  private async readHandleBounded(
+  private async scanTextHandle(
     handle: fs.promises.FileHandle,
-    maxBytes: number
-  ): Promise<Buffer | null> {
-    const buffer = Buffer.alloc(maxBytes + 1);
-    let offset = 0;
-    while (offset < buffer.length) {
-      const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+    maxBytes: number,
+    visitor: (line: string, lineNumber: number) => boolean | void
+  ): Promise<{ totalLines: number; totalBytes: number; completed: boolean }> {
+    const decoder = new StringDecoder("utf8");
+    let pending = "";
+    let position = 0;
+    let totalLines = 0;
+    let completed = true;
+    const emit = (raw: string): boolean => {
+      totalLines++;
+      const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+      if (visitor(line, totalLines) === false) {
+        completed = false;
+        return false;
+      }
+      return true;
+    };
+
+    for (;;) {
+      const remaining = maxBytes + 1 - position;
+      if (remaining <= 0) {
+        throw new WorkspaceError("FILE_TOO_LARGE", `File exceeds the ${maxBytes}-byte source limit.`);
+      }
+      const chunk = Buffer.allocUnsafe(Math.min(STREAM_CHUNK_BYTES, remaining));
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
       if (bytesRead === 0) break;
-      offset += bytesRead;
+      const bytes = chunk.subarray(0, bytesRead);
+      position += bytesRead;
+      if (position > maxBytes) {
+        throw new WorkspaceError("FILE_TOO_LARGE", `File exceeds the ${maxBytes}-byte source limit.`);
+      }
+      if (bytes.includes(0)) throw new WorkspaceError("BINARY_FILE", "Binary file content is not returned.");
+      pending += decoder.write(bytes);
+      let newline: number;
+      while ((newline = pending.indexOf("\n")) >= 0) {
+        const line = pending.slice(0, newline);
+        pending = pending.slice(newline + 1);
+        if (!emit(line)) return { totalLines, totalBytes: position, completed };
+      }
     }
-    if (offset > maxBytes) return null;
-    return buffer.subarray(0, offset);
+    pending += decoder.end();
+    if (pending.length > 0 && !emit(pending)) return { totalLines, totalBytes: position, completed };
+    return { totalLines, totalBytes: position, completed };
   }
 
   async readDirectoryEntries(requested: string): Promise<VerifiedDirectory> {
@@ -318,18 +408,30 @@ export class Workspace {
     return { ...after, entries };
   }
 
-  async readSearchText(requested: string, maxBytes = 2 * 1024 * 1024): Promise<string | null> {
+  async forEachSearchLine(
+    requested: string,
+    visitor: (line: SearchLine) => boolean | void,
+    maxBytes = 2 * 1024 * 1024
+  ): Promise<boolean> {
     let opened: Awaited<ReturnType<Workspace["openVerifiedRegularFile"]>>;
     try {
       opened = await this.openVerifiedRegularFile(requested);
     } catch {
-      return null;
+      return false;
     }
     try {
-      if (opened.stat.size > maxBytes || (await this.isBinaryHandle(opened.handle))) return null;
-      const buffer = await this.readHandleBounded(opened.handle, maxBytes);
-      if (!buffer || buffer.includes(0)) return null;
-      return buffer.toString("utf8");
+      if (opened.stat.size > maxBytes) return false;
+      const redactor = new StreamingSecretRedactor();
+      await this.scanTextHandle(opened.handle, maxBytes, (line, lineNumber) => {
+        const redacted = redactor.redactLine(line);
+        return visitor({ lineNumber, text: redacted.text, redactionCount: redacted.redactionCount });
+      });
+      return true;
+    } catch (error) {
+      if (error instanceof WorkspaceError && (error.code === "BINARY_FILE" || error.code === "FILE_TOO_LARGE")) {
+        return false;
+      }
+      throw error;
     } finally {
       await opened.handle.close().catch(() => undefined);
     }
@@ -348,10 +450,6 @@ export class Workspace {
           `File exceeds the ${HARD_MAX_SOURCE_BYTES}-byte source limit: ${rel}`
         );
       }
-      if (await this.isBinaryHandle(opened.handle)) {
-        throw new WorkspaceError("BINARY_FILE", `Binary file (${stat.size} bytes): ${rel}. Content is not returned.`);
-      }
-
       const startLine = Math.max(1, Math.floor(opts.startLine ?? 1));
       const maxLines = Math.min(HARD_MAX_LINES, Math.max(1, Math.floor(opts.maxLines ?? DEFAULT_MAX_LINES)));
       const endLimit = opts.endLine
@@ -363,22 +461,12 @@ export class Workspace {
       let collectedBytes = 0;
       let byteTruncated = false;
       let actualEnd = startLine - 1;
-      const buffer = await this.readHandleBounded(opened.handle, HARD_MAX_SOURCE_BYTES);
-      if (!buffer) {
-        throw new WorkspaceError(
-          "FILE_TOO_LARGE",
-          `File exceeds the ${HARD_MAX_SOURCE_BYTES}-byte source limit: ${rel}`
-        );
-      }
-      const text = buffer.toString("utf8");
-      const lines = text === "" ? [] : text.split(/\r?\n/);
-      if (lines.length > 0 && lines.at(-1) === "") lines.pop();
-      const totalLines = lines.length;
-      for (let index = 0; index < lines.length; index++) {
-        const lineNumber = index + 1;
-        const line = lines[index];
+      let redactionCount = 0;
+      const redactor = new StreamingSecretRedactor();
+      const scan = await this.scanTextHandle(opened.handle, HARD_MAX_SOURCE_BYTES, (line, lineNumber) => {
+        const redacted = redactor.redactLine(line);
         if (lineNumber >= startLine && lineNumber <= endLimit && !byteTruncated) {
-          const cost = Buffer.byteLength(line, "utf8") + (selectedLines.length > 0 ? 1 : 0);
+          const cost = Buffer.byteLength(redacted.text, "utf8") + (selectedLines.length > 0 ? 1 : 0);
           if (collectedBytes + cost > maxBytes) {
             if (selectedLines.length === 0) {
               throw new WorkspaceError(
@@ -388,26 +476,27 @@ export class Workspace {
             }
             byteTruncated = true;
           } else {
-            selectedLines.push(line);
+            selectedLines.push(redacted.text);
+            redactionCount += redacted.redactionCount;
             collectedBytes += cost;
             actualEnd = lineNumber;
           }
         }
-      }
+      });
 
+      const totalLines = scan.totalLines;
       const remaining = Math.max(0, totalLines - actualEnd);
-      const redacted = redactSensitiveText(selectedLines.join("\n"));
       return {
         path: rel,
-        sizeBytes: stat.size,
+        sizeBytes: scan.totalBytes,
         totalLines,
         startLine: Math.min(startLine, Math.max(totalLines, 1)),
         endLine: actualEnd,
         truncated: remaining > 0,
         remainingLines: remaining,
         nextStartLine: remaining > 0 ? actualEnd + 1 : null,
-        content: redacted.text,
-        redactionCount: redacted.redactionCount,
+        content: selectedLines.join("\n"),
+        redactionCount,
       };
     } finally {
       await opened.handle.close().catch(() => undefined);
@@ -479,17 +568,43 @@ export class Workspace {
   }
 
   /** Lightweight project detection for workspace_info. */
-  detectProject(): {
-    projectType: string;
-    languages: string[];
-    frameworks: string[];
-    packageManager: string | null;
-    scriptNames: string[];
-  } {
-    const has = (f: string): boolean => {
+  private async hasVerifiedFile(requested: string): Promise<boolean> {
+    let opened: Awaited<ReturnType<Workspace["openVerifiedRegularFile"]>>;
+    try {
+      opened = await this.openVerifiedRegularFile(requested);
+    } catch {
+      return false;
+    }
+    await opened.handle.close().catch(() => undefined);
+    return true;
+  }
+
+  private async readVerifiedJson<T>(requested: string, maxBytes = 2 * 1024 * 1024): Promise<T | null> {
+    let opened: Awaited<ReturnType<Workspace["openVerifiedRegularFile"]>>;
+    try {
+      opened = await this.openVerifiedRegularFile(requested);
+    } catch {
+      return null;
+    }
+    try {
+      if (opened.stat.size > maxBytes) return null;
+      let text = "";
+      const scan = await this.scanTextHandle(opened.handle, maxBytes, (line, lineNumber) => {
+        text += `${lineNumber > 1 ? "\n" : ""}${line}`;
+      });
+      if (!scan.completed) return null;
+      return JSON.parse(text) as T;
+    } catch {
+      return null;
+    } finally {
+      await opened.handle.close().catch(() => undefined);
+    }
+  }
+
+  async detectProject(): Promise<ProjectInfo> {
+    const has = async (f: string): Promise<boolean> => {
       try {
-        const stat = fs.lstatSync(path.join(this.root, f));
-        return stat.isFile() && !stat.isSymbolicLink();
+        return await this.hasVerifiedFile(f);
       } catch {
         return false;
       }
@@ -500,14 +615,14 @@ export class Workspace {
     let packageManager: string | null = null;
     let scriptNames: string[] = [];
 
-    if (has("package.json")) {
+    const pkg = await this.readVerifiedJson<{
+      scripts?: Record<string, string>;
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    }>("package.json");
+    if (pkg) {
       projectType = "node";
       languages.add("JavaScript");
-      const pkg = readJsonIfExists<{
-        scripts?: Record<string, string>;
-        dependencies?: Record<string, string>;
-        devDependencies?: Record<string, string>;
-      }>(path.join(this.root, "package.json"));
       scriptNames = Object.keys(
         pkg?.scripts && typeof pkg.scripts === "object" && !Array.isArray(pkg.scripts) ? pkg.scripts : {}
       )
@@ -537,25 +652,25 @@ export class Workspace {
       for (const [dep, label] of Object.entries(known)) {
         if (Object.hasOwn(dependencies, dep) || Object.hasOwn(devDependencies, dep)) frameworks.add(label);
       }
-      if (has("pnpm-lock.yaml")) packageManager = "pnpm";
-      else if (has("yarn.lock")) packageManager = "yarn";
-      else if (has("bun.lockb") || has("bun.lock")) packageManager = "bun";
-      else if (has("package-lock.json")) packageManager = "npm";
+      if (await has("pnpm-lock.yaml")) packageManager = "pnpm";
+      else if (await has("yarn.lock")) packageManager = "yarn";
+      else if ((await has("bun.lockb")) || (await has("bun.lock"))) packageManager = "bun";
+      else if (await has("package-lock.json")) packageManager = "npm";
     }
-    if (has("tsconfig.json")) languages.add("TypeScript");
-    if (has("pyproject.toml") || has("requirements.txt") || has("setup.py")) {
+    if (await has("tsconfig.json")) languages.add("TypeScript");
+    if ((await has("pyproject.toml")) || (await has("requirements.txt")) || (await has("setup.py"))) {
       languages.add("Python");
       if (projectType === "unknown") projectType = "python";
     }
-    if (has("Cargo.toml")) {
+    if (await has("Cargo.toml")) {
       languages.add("Rust");
       if (projectType === "unknown") projectType = "rust";
     }
-    if (has("go.mod")) {
+    if (await has("go.mod")) {
       languages.add("Go");
       if (projectType === "unknown") projectType = "go";
     }
-    if (has("Package.swift")) {
+    if (await has("Package.swift")) {
       languages.add("Swift");
       if (projectType === "unknown") projectType = "swift";
     }
