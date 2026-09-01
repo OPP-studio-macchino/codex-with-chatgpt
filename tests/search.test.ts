@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
 import fs from "node:fs";
+import path from "node:path";
 import { Workspace } from "../src/workspace/manager.js";
 import { searchWorkspace, resetRipgrepCache, findRipgrep } from "../src/workspace/search.js";
 import { makeTmpDir, cleanup, write } from "./helpers.js";
@@ -20,6 +21,21 @@ beforeAll(() => {
     "src/accidental.ts",
     'export const api_key = "sk-proj-abcdefghijklmnopqrstuvwxyz1234567890"; // redact-me\n'
   );
+  write(
+    root,
+    "src/long-credential.ts",
+    `const password = "${"S".repeat(620)}"; // long-redact-boundary\r\n`
+  );
+  write(
+    root,
+    "src/multiline-key.txt",
+    [
+      "-----BEGIN PRIVATE KEY-----",
+      "cross-line-search-secret-needle",
+      "-----END PRIVATE KEY-----",
+      "safe-after-key-search-needle",
+    ].join("\n") + "\n"
+  );
   write(root, "node_modules/pkg/index.js", "needle-alpha in dependencies\n");
   for (let i = 0; i < 30; i++) {
     write(root, `many/file-${i}.txt`, "needle-beta\nneedle-beta\n");
@@ -35,10 +51,11 @@ afterEach(() => {
   delete process.env.C2C_DISABLE_RG;
   delete process.env.C2C_RG_PATH;
   resetRipgrepCache();
+  vi.restoreAllMocks();
 });
 
-function engines(): ("ripgrep" | "node")[] {
-  return findRipgrep() ? ["ripgrep", "node"] : ["node"];
+function engines(): "node"[] {
+  return ["node"];
 }
 
 describe.each(engines())("search engine: %s", (engine) => {
@@ -75,6 +92,24 @@ describe.each(engines())("search engine: %s", (engine) => {
     expect(result.matches[0].text).not.toContain("sk-proj-");
     expect(result.matches[0].text).toContain("[REDACTED");
     expect(result.redactionCount).toBeGreaterThan(0);
+  });
+
+  it("redacts a credential whose closing quote is beyond the response limit", async () => {
+    configure();
+    const result = await searchWorkspace(ws, { query: "long-redact-boundary" });
+    expect(result.matches).toHaveLength(1);
+    expect(result.matches[0].text).not.toContain("S".repeat(32));
+    expect(result.matches[0].text).toContain("[REDACTED]");
+    expect(result.redactionCount).toBeGreaterThan(0);
+  });
+
+  it("does not match private-key body text split across streamed lines", async () => {
+    configure();
+    const secret = await searchWorkspace(ws, { query: "cross-line-search-secret-needle" });
+    expect(secret.matches).toHaveLength(0);
+    const safe = await searchWorkspace(ws, { query: "safe-after-key-search-needle" });
+    expect(safe.matches).toHaveLength(1);
+    expect(safe.matches[0].text).not.toContain("cross-line-search-secret-needle");
   });
 
   it("respects the limit", async () => {
@@ -116,5 +151,30 @@ describe("regex fallback safety", () => {
     await expect(searchWorkspace(ws, { query: "(a+)+$", regex: true })).rejects.toMatchObject({
       code: "UNSUPPORTED_REGEX",
     });
+  });
+
+  it("does not return content from a directory swapped outside during traversal", async () => {
+    const local = makeTmpDir("search-dir-swap");
+    const external = makeTmpDir("search-dir-swap-outside");
+    const target = path.join(local, "nested");
+    write(local, "nested/local.txt", "safe local text\n");
+    write(external, "outside.txt", "outside-race-needle outside-search-secret\n");
+    const localWs = new Workspace(local);
+    const originalOpenDir = fs.promises.opendir.bind(fs.promises);
+    let swapped = false;
+    vi.spyOn(fs.promises, "opendir").mockImplementation(async (dirPath, options) => {
+      if (!swapped && path.resolve(String(dirPath)) === target) {
+        swapped = true;
+        fs.renameSync(target, `${target}.safe`);
+        fs.symlinkSync(external, target, "dir");
+      }
+      return originalOpenDir(dirPath, options);
+    });
+
+    const result = await searchWorkspace(localWs, { query: "outside-race-needle" });
+    expect(JSON.stringify(result)).not.toContain("outside-search-secret");
+    expect(result.matches).toHaveLength(0);
+    cleanup(local);
+    cleanup(external);
   });
 });

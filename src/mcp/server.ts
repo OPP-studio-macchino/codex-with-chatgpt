@@ -3,7 +3,7 @@ import { z } from "zod";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { Workspace, WorkspaceError } from "../workspace/manager.js";
 import { searchWorkspace } from "../workspace/search.js";
-import { gitDiff, gitInfo, gitStatus, type DiffMode } from "../workspace/git.js";
+import { gitDiff, gitStatus, type DiffMode } from "../workspace/git.js";
 import { latestExecutionRecord, readExecutionRecords } from "../execution/records.js";
 import type { Logger } from "../logger/index.js";
 import { PRODUCT_NAME, VERSION } from "../version.js";
@@ -61,7 +61,8 @@ export function createMcpServer(ctx: McpContext): McpServer {
       title: "Workspace info",
       description:
         `Get an overview of the connected workspace: identity, project type, languages, ` +
-        `frameworks, git state and available scripts. Call this first. ${UNTRUSTED_NOTE}`,
+        `frameworks and available scripts. Git is intentionally a separate git.read boundary. ` +
+        `Call this first. ${UNTRUSTED_NOTE}`,
       inputSchema: {},
       annotations: { readOnlyHint: true },
     },
@@ -69,19 +70,12 @@ export function createMcpServer(ctx: McpContext): McpServer {
       const denied = requireScope(extra.authInfo, "workspace.read");
       if (denied) return denied;
       try {
-        const project = workspace.detectProject();
-        const git = gitInfo(workspace.root);
+        const project = await workspace.detectProject();
         return ok({
           workspaceId: workspace.id,
           workspaceName: workspace.name,
           rootAlias: "workspace:/",
           ...project,
-          git: {
-            isRepo: git.isRepo,
-            branch: git.branch,
-            commit: git.commit,
-            dirty: git.dirty,
-          },
         });
       } catch (error) {
         return mapError(error, ctx.logger);
@@ -146,7 +140,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
     {
       title: "Search workspace",
       description:
-        `Search file contents across the workspace (ripgrep when available). Returns matching ` +
+        `Search file contents across the workspace with descriptor-bound literal matching. Returns matching ` +
         `lines with file paths and line numbers. ${UNTRUSTED_NOTE}`,
       inputSchema: {
         query: z.string().min(2).max(512).describe("Text to search for (literal by default)"),

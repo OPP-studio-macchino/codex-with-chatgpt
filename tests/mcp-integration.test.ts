@@ -94,13 +94,12 @@ describe("MCP tools over Streamable HTTP", () => {
       projectType: string;
       frameworks: string[];
       scriptNames: string[];
-      git: { isRepo: boolean; branch: string };
+      git?: unknown;
     }>(result);
     expect(info.workspaceId).toBe(bridge.workspace.id);
     expect(info.projectType).toBe("node");
     expect(info.frameworks).toContain("React");
-    expect(info.git.isRepo).toBe(true);
-    expect(info.git.branch).toBe("main");
+    expect(info.git).toBeUndefined();
     expect(info.scriptNames).toContain("deploy");
     expect(textOf(result)).not.toContain("must-not-leave");
   });
@@ -216,6 +215,9 @@ describe("MCP tools over Streamable HTTP", () => {
     expect(textOf(denied)).toContain("INSUFFICIENT_SCOPE");
     const allowed = await limitedClient.callTool({ name: "read_file", arguments: { path: "hello.txt" } });
     expect(allowed.isError ?? false).toBe(false);
+    const workspaceOnly = await limitedClient.callTool({ name: "workspace_info", arguments: {} });
+    expect(workspaceOnly.isError ?? false).toBe(false);
+    expect(jsonOf<{ git?: unknown }>(workspaceOnly).git).toBeUndefined();
     await limitedClient.close();
   });
 });

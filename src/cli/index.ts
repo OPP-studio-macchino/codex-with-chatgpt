@@ -756,9 +756,9 @@ program
   .description("Show workspace identity and project info")
   .option("-w, --workspace <path>")
   .option("--json", "machine-readable output", false)
-  .action((opts: { workspace?: string; json: boolean }) => {
+  .action(async (opts: { workspace?: string; json: boolean }) => {
     const workspace = new Workspace(resolveWorkspace(opts.workspace));
-    const project = workspace.detectProject();
+    const project = await workspace.detectProject();
     const data = { workspaceId: workspace.id, name: workspace.name, root: workspace.root, ...project };
     if (opts.json) say(JSON.stringify(data));
     else {

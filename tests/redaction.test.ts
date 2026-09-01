@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
-import { redactSensitiveText } from "../src/security/redaction.js";
+import {
+  redactAndTruncate,
+  redactSensitiveText,
+  StreamingSecretRedactor,
+} from "../src/security/redaction.js";
 import { Logger, redact } from "../src/logger/index.js";
 import { cleanup, makeTmpDir } from "./helpers.js";
 
@@ -48,6 +52,32 @@ describe("outbound secret redaction", () => {
     expect(result.text).toContain("[REDACTED PRIVATE KEY]");
   });
 
+  it("keeps multiline private-key state across streamed lines", () => {
+    const redactor = new StreamingSecretRedactor();
+    const output = [
+      "safe prefix -----BEGIN PRIVATE KEY-----",
+      "cross-page-private-key-body",
+      "-----END PRIVATE KEY----- safe suffix",
+    ].map((line) => redactor.redactLine(line).text);
+    expect(output.join("\n")).not.toContain("cross-page-private-key-body");
+    expect(output[0]).toContain("safe prefix");
+    expect(output[2]).toContain("safe suffix");
+    expect(redactor.isInsideMultilineSecret()).toBe(false);
+  });
+
+  it("tracks a second block that begins after a complete same-line block", () => {
+    const redactor = new StreamingSecretRedactor();
+    const first = redactor.redactLine(
+      "-----BEGIN PRIVATE KEY-----one-----END PRIVATE KEY----- -----BEGIN RSA PRIVATE KEY-----"
+    );
+    const body = redactor.redactLine("second-block-body");
+    expect(first.text).not.toContain("one");
+    expect(body.text).not.toContain("second-block-body");
+    expect(redactor.isInsideMultilineSecret()).toBe(true);
+    redactor.redactLine("-----END RSA PRIVATE KEY-----");
+    expect(redactor.isInsideMultilineSecret()).toBe(false);
+  });
+
   it("is idempotent and the logger also hides pairing codes", () => {
     const once = redactSensitiveText('password = "[REDACTED]"').text;
     expect(redactSensitiveText(once).text).toBe(once);
@@ -60,5 +90,38 @@ describe("outbound secret redaction", () => {
     new Logger({ file }).info("x".repeat(100_000), { detail: "y".repeat(100_000) });
     expect(fs.statSync(file).size).toBeLessThan(20_000);
     cleanup(dir);
+  });
+
+  it.each(['"', "'", "`"])(
+    "redacts a long credential before truncating when the delimiter is %s",
+    (delimiter) => {
+      const secret = "S".repeat(620);
+      const input = `const password = ${delimiter}${secret}${delimiter};\r\n`;
+      const result = redactAndTruncate(input, 500);
+      expect(result.text).not.toContain("S".repeat(32));
+      expect(result.text).toContain("[REDACTED]");
+      expect(result.redactionCount).toBe(1);
+      expect(Buffer.byteLength(result.text, "utf8")).toBeLessThanOrEqual(500);
+    }
+  );
+
+  it.each([499, 500, 501])("adds an explicit marker across the %i-byte boundary", (size) => {
+    const result = redactAndTruncate("a".repeat(size), 500);
+    expect(Buffer.byteLength(result.text, "utf8")).toBeLessThanOrEqual(500);
+    expect(result.truncated).toBe(size > 500);
+    expect(result.text.includes("[TRUNCATED]")).toBe(size > 500);
+  });
+
+  it("does not split a multi-byte character at the byte limit", () => {
+    const result = redactAndTruncate("界".repeat(200), 500);
+    expect(Buffer.byteLength(result.text, "utf8")).toBeLessThanOrEqual(500);
+    expect(result.text).not.toContain("�");
+    expect(result.text).toContain("[TRUNCATED]");
+  });
+
+  it("fails closed for an oversized logical unit", () => {
+    const result = redactAndTruncate(`password = "${"X".repeat(5 * 1024 * 1024)}"`, 500);
+    expect(result.text).toBe("[REDACTED OVERSIZED TEXT] [TRUNCATED]");
+    expect(result.redactionCount).toBe(1);
   });
 });

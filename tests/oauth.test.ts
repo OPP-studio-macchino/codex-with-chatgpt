@@ -28,6 +28,7 @@ afterAll(async () => {
 });
 
 async function registerClient(): Promise<string> {
+  if (!bridge.pairing.hasActiveSession()) bridge.pairing.create();
   const response = await fetch(`${base}/oauth/register`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -70,6 +71,31 @@ async function authorizeWithPairing(
   const location = postResponse.headers.get("location");
   const code = location ? new URL(location).searchParams.get("code") : null;
   return { code, location, status: postResponse.status };
+}
+
+async function createPendingRequest(clientId: string, challenge: string): Promise<string> {
+  const authorizeUrl = new URL(`${base}/oauth/authorize`);
+  authorizeUrl.searchParams.set("client_id", clientId);
+  authorizeUrl.searchParams.set("redirect_uri", REDIRECT_URI);
+  authorizeUrl.searchParams.set("response_type", "code");
+  authorizeUrl.searchParams.set("code_challenge", challenge);
+  authorizeUrl.searchParams.set("code_challenge_method", "S256");
+  authorizeUrl.searchParams.set("scope", "workspace.read");
+  const response = await fetch(authorizeUrl);
+  expect(response.status).toBe(200);
+  const html = await response.text();
+  const requestId = html.match(/name="request_id" value="([a-f0-9]+)"/)?.[1];
+  expect(requestId).toBeTruthy();
+  return requestId!;
+}
+
+async function submitPairing(requestId: string, code: string): Promise<Response> {
+  return fetch(`${base}/oauth/authorize`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ request_id: requestId, pairing_code: code }),
+    redirect: "manual",
+  });
 }
 
 async function exchangeToken(
@@ -273,6 +299,7 @@ describe("authorization + token flow", () => {
   });
 
   it("escapes untrusted client and workspace labels on the pairing page", async () => {
+    if (!bridge.pairing.hasActiveSession()) bridge.pairing.create();
     const response = await fetch(`${base}/oauth/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -310,6 +337,79 @@ describe("authorization + token flow", () => {
     });
     expect(response.status).toBe(400);
     expect(((await response.json()) as { error: string }).error).toBe("invalid_grant");
+  });
+
+  it("requires an owner-created pairing window before dynamic registration", async () => {
+    bridge.pairing.invalidateAll();
+    const response = await fetch(`${base}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ redirect_uris: ["https://no-owner.example/callback"] }),
+    });
+    expect(response.status).toBe(403);
+    expect(((await response.json()) as { error: string }).error).toBe("pairing_required");
+  });
+
+  it("does not let attacker requests invalidate the owner pairing flow", async () => {
+    const pairing = bridge.pairing.create();
+    const attackerId = await registerClient();
+    const ownerId = await registerClient();
+    const { challenge } = pkceVerifierAndChallenge();
+    const attackerRequest = await createPendingRequest(attackerId, challenge);
+    const ownerRequest = await createPendingRequest(ownerId, challenge);
+
+    for (const wrong of ["AAAA-AAAA", "BBBB-BBBB", "CCCC-CCCC", "DDDD-DDDD", "EEEE-EEEE"]) {
+      const response = await submitPairing(attackerRequest, wrong);
+      expect([401, 410]).toContain(response.status);
+    }
+    const ownerResponse = await submitPairing(ownerRequest, pairing.code);
+    expect(ownerResponse.status).toBe(302);
+    expect(ownerResponse.headers.get("location")).toContain("code=c2c_ac_");
+
+    const replay = await submitPairing(attackerRequest, pairing.code);
+    expect(replay.status).not.toBe(302);
+  });
+
+  it("keeps an owner registration usable after provisional-client flooding", async () => {
+    const pairing = bridge.pairing.create();
+    const ownerId = await registerClient();
+    for (let index = 0; index < 7; index++) {
+      const response = await fetch(`${base}/oauth/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ redirect_uris: [`https://attacker-${index}.example/callback`] }),
+      });
+      expect(response.status).toBe(201);
+    }
+    const rejected = await fetch(`${base}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ redirect_uris: ["https://attacker-over-cap.example/callback"] }),
+    });
+    expect(rejected.status).toBe(429);
+    expect(bridge.authStore.getClient(ownerId)).toBeDefined();
+    const { challenge } = pkceVerifierAndChallenge();
+    const ownerRequest = await createPendingRequest(ownerId, challenge);
+    expect((await submitPairing(ownerRequest, pairing.code)).status).toBe(302);
+  });
+
+  it("hard-caps total dynamic registration attempts in one pairing window", async () => {
+    bridge.pairing.create();
+    let windowLimitSeen = false;
+    for (let index = 0; index < 40; index++) {
+      const response = await fetch(`${base}/oauth/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ redirect_uris: [`https://rotating-${index}.example/callback`] }),
+      });
+      const body = (await response.json()) as { error?: string };
+      if (body.error === "pairing_window_registration_limit") {
+        windowLimitSeen = true;
+        break;
+      }
+    }
+    expect(windowLimitSeen).toBe(true);
+    bridge.pairing.invalidateAll();
   });
 });
 

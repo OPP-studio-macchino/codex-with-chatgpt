@@ -48,13 +48,29 @@ possible secret format will be removed. Review the workspace and
 - OpenAI Secure MCP Tunnel support keeps the MCP listener on loopback and uses
   a per-workspace, owner-only fixed-header token.
 - Cloudflare Quick Tunnel is an explicit fallback, never an automatic setup.
-- OAuth redirect validation, PKCE, request/body limits, rate limits, bounded
-  registrations, security headers, and immediate revocation are enforced.
+- OAuth redirect validation, PKCE, request/body limits, route concurrency,
+  per-window registration budgets, bounded state maps, request-bound pairing
+  attempts, security headers, and immediate revocation are enforced. Dynamic
+  registration requires an active owner pairing window; accepted provisional
+  clients are never evicted to admit later untrusted registrations.
 - Canonical realpath containment blocks `..`, absolute-path, and symlink escape.
+  File reads, project manifests, and `.c2cignore` stay on verified descriptors;
+  directory reads are rejected when their path identity changes during traversal.
 - Sensitive paths are filtered from reads, listings, search, Git status, and
-  Git diff; outbound text also passes through credential redaction.
-- Git inspection ignores global/system config and disables hooks, external diff
-  programs, text conversion, pagers, optional locks, and parent-repository bleed.
+  Git diff. File reads and literal search use a stateful line-stream redactor so
+  multiline private-key blocks stay hidden across page and line boundaries.
+- `read_file` parses incrementally from the same verified descriptor and retains
+  only the requested page instead of buffering and splitting the entire source.
+- Workspace search is literal-only and uses the verified in-process reader;
+  regex subprocess search is disabled at this containment boundary.
+- Git inspection ignores global/system config, disables hooks, external diff
+  programs, text conversion, pagers, optional locks, lazy object fetching, and
+  parent-repository bleed. Repositories with executable filters, config includes,
+  partial-clone promises, credential helpers, or SSH commands fail closed before
+  status/diff reads index or object data. Git executes from an owner-only,
+  sanitized temporary control-metadata snapshot; all status paths ignore
+  submodules. `workspace_info` never invokes Git and remains a separate
+  `workspace.read` operation.
 - Runtime/state files use private directories and owner-only atomic writes where
   the platform supports POSIX permissions.
 - Health responses disclose only service and status. Admin routes require both

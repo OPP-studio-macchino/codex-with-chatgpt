@@ -1,10 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHmac } from "node:crypto";
-import readline from "node:readline";
+import { StringDecoder } from "node:string_decoder";
 import { IgnoreRules } from "./ignore.js";
-import { getStateDir, getWorkspaceIdentityKey, readJsonIfExists } from "../config/paths.js";
-import { redactSensitiveText } from "../security/redaction.js";
+import { getStateDir, getWorkspaceIdentityKey } from "../config/paths.js";
+import { redactAndTruncate, StreamingSecretRedactor } from "../security/redaction.js";
 
 export type WorkspaceErrorCode =
   | "INVALID_PATH"
@@ -15,6 +15,7 @@ export type WorkspaceErrorCode =
   | "NOT_A_DIRECTORY"
   | "BINARY_FILE"
   | "FILE_TOO_LARGE"
+  | "UNSAFE_PATH_MUTATION"
   | "UNSAFE_STATE_DIRECTORY"
   | "UNSUPPORTED_REGEX";
 
@@ -59,18 +60,90 @@ export interface ListDirectoryResult {
   hasMore: boolean;
 }
 
+export interface VerifiedDirectory {
+  abs: string;
+  rel: string;
+  entries: fs.Dirent[];
+}
+
 export interface ProjectConfig {
   name?: string;
   maxIterations?: number;
+}
+
+export interface ProjectInfo {
+  projectType: string;
+  languages: string[];
+  frameworks: string[];
+  packageManager: string | null;
+  scriptNames: string[];
+}
+
+export interface SearchLine {
+  lineNumber: number;
+  text: string;
+  redactionCount: number;
 }
 
 const DEFAULT_MAX_LINES = 400;
 const HARD_MAX_LINES = 2000;
 const DEFAULT_MAX_BYTES = 256 * 1024;
 const HARD_MAX_SOURCE_BYTES = 5 * 1024 * 1024;
+const STREAM_CHUNK_BYTES = 64 * 1024;
+
+function readVerifiedRootFileSync(root: string, relative: string, maxBytes: number): Buffer | null {
+  const file = path.join(root, relative);
+  const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+  const nonBlock = fs.constants.O_NONBLOCK ?? 0;
+  let fd: number | null = null;
+  try {
+    const before = fs.lstatSync(file);
+    if (before.isSymbolicLink() || !before.isFile() || before.size > maxBytes) return null;
+    fd = fs.openSync(file, fs.constants.O_RDONLY | noFollow | nonBlock);
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile() || opened.size > maxBytes) return null;
+    const buffer = Buffer.alloc(opened.size + 1);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const bytesRead = fs.readSync(fd, buffer, offset, buffer.length - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset > maxBytes) return null;
+    const canonical = fs.realpathSync.native(file);
+    const after = fs.statSync(file);
+    if (
+      canonical !== path.resolve(file) ||
+      !canonical.startsWith(root + path.sep) ||
+      before.dev !== opened.dev ||
+      before.ino !== opened.ino ||
+      opened.dev !== after.dev ||
+      opened.ino !== after.ino
+    ) {
+      return null;
+    }
+    return buffer.subarray(0, offset);
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // best-effort close of a read-only descriptor
+      }
+    }
+  }
+}
 
 function loadProjectConfig(root: string): ProjectConfig {
-  const raw = readJsonIfExists<Record<string, unknown>>(path.join(root, ".c2c.json"), 64 * 1024);
+  const buffer = readVerifiedRootFileSync(root, ".c2c.json", 64 * 1024);
+  let raw: Record<string, unknown> | null = null;
+  try {
+    raw = buffer ? (JSON.parse(buffer.toString("utf8")) as Record<string, unknown>) : null;
+  } catch {
+    raw = null;
+  }
   if (!raw) return {};
   const config: ProjectConfig = {};
   if (typeof raw.name === "string") {
@@ -78,7 +151,7 @@ function loadProjectConfig(root: string): ProjectConfig {
       .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ")
       .replace(/\s+/g, " ")
       .trim();
-    if (name) config.name = name.slice(0, 100);
+    if (name) config.name = redactAndTruncate(name, 100).text;
   }
   if (
     typeof raw.maxIterations === "number" &&
@@ -189,17 +262,178 @@ export class Workspace {
     return { abs: canonical, rel };
   }
 
-  private async isBinary(abs: string): Promise<boolean> {
-    const fd = await fs.promises.open(abs, "r");
+  private unsafeMutation(rel: string): WorkspaceError {
+    return new WorkspaceError(
+      "UNSAFE_PATH_MUTATION",
+      `UNSAFE_PATH_MUTATION: '${rel || "."}' changed while it was being accessed.`
+    );
+  }
+
+  private async openVerifiedRegularFile(
+    requested: string
+  ): Promise<{ handle: fs.promises.FileHandle; stat: fs.Stats; abs: string; rel: string }> {
+    const resolved = this.resolve(requested);
+    const flags =
+      fs.constants.O_RDONLY |
+      (fs.constants.O_NOFOLLOW ?? 0) |
+      (fs.constants.O_NONBLOCK ?? 0);
+    let handle: fs.promises.FileHandle;
     try {
-      const buf = Buffer.alloc(8192);
-      const { bytesRead } = await fd.read(buf, 0, buf.length, 0);
-      for (let i = 0; i < bytesRead; i++) {
-        if (buf[i] === 0) return true;
+      handle = await fs.promises.open(resolved.abs, flags);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ELOOP" || code === "EMLINK") throw this.unsafeMutation(resolved.rel);
+      throw new WorkspaceError("FILE_NOT_FOUND", `File not found: ${resolved.rel}`);
+    }
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile()) {
+        throw new WorkspaceError("NOT_A_FILE", `Not a regular file: ${resolved.rel}`);
       }
-      return false;
+      let canonicalAfter: string;
+      let pathStat: fs.Stats;
+      try {
+        canonicalAfter = await fs.promises.realpath(resolved.abs);
+        pathStat = await fs.promises.stat(resolved.abs);
+      } catch {
+        throw this.unsafeMutation(resolved.rel);
+      }
+      if (
+        normCase(canonicalAfter) !== normCase(resolved.abs) ||
+        !this.contains(canonicalAfter) ||
+        pathStat.dev !== stat.dev ||
+        pathStat.ino !== stat.ino
+      ) {
+        throw this.unsafeMutation(resolved.rel);
+      }
+      const actualRel = path.relative(this.root, canonicalAfter).split(path.sep).join("/");
+      if (actualRel !== resolved.rel || this.ignoreRules.isSensitive(actualRel)) {
+        throw this.unsafeMutation(resolved.rel);
+      }
+      return { handle, stat, abs: canonicalAfter, rel: actualRel };
+    } catch (error) {
+      await handle.close().catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private async scanTextHandle(
+    handle: fs.promises.FileHandle,
+    maxBytes: number,
+    visitor: (line: string, lineNumber: number) => boolean | void
+  ): Promise<{ totalLines: number; totalBytes: number; completed: boolean }> {
+    const decoder = new StringDecoder("utf8");
+    let pending = "";
+    let position = 0;
+    let totalLines = 0;
+    let completed = true;
+    const emit = (raw: string): boolean => {
+      totalLines++;
+      const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+      if (visitor(line, totalLines) === false) {
+        completed = false;
+        return false;
+      }
+      return true;
+    };
+
+    for (;;) {
+      const remaining = maxBytes + 1 - position;
+      if (remaining <= 0) {
+        throw new WorkspaceError("FILE_TOO_LARGE", `File exceeds the ${maxBytes}-byte source limit.`);
+      }
+      const chunk = Buffer.allocUnsafe(Math.min(STREAM_CHUNK_BYTES, remaining));
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
+      if (bytesRead === 0) break;
+      const bytes = chunk.subarray(0, bytesRead);
+      position += bytesRead;
+      if (position > maxBytes) {
+        throw new WorkspaceError("FILE_TOO_LARGE", `File exceeds the ${maxBytes}-byte source limit.`);
+      }
+      if (bytes.includes(0)) throw new WorkspaceError("BINARY_FILE", "Binary file content is not returned.");
+      pending += decoder.write(bytes);
+      let newline: number;
+      while ((newline = pending.indexOf("\n")) >= 0) {
+        const line = pending.slice(0, newline);
+        pending = pending.slice(newline + 1);
+        if (!emit(line)) return { totalLines, totalBytes: position, completed };
+      }
+    }
+    pending += decoder.end();
+    if (pending.length > 0 && !emit(pending)) return { totalLines, totalBytes: position, completed };
+    return { totalLines, totalBytes: position, completed };
+  }
+
+  async readDirectoryEntries(requested: string): Promise<VerifiedDirectory> {
+    const before = this.resolve(requested);
+    let beforeStat: fs.Stats;
+    let dir: fs.Dir;
+    try {
+      beforeStat = await fs.promises.lstat(before.abs);
+      if (!beforeStat.isDirectory() || beforeStat.isSymbolicLink()) {
+        throw new WorkspaceError("NOT_A_DIRECTORY", `Not a directory: ${before.rel}`);
+      }
+      dir = await fs.promises.opendir(before.abs);
+    } catch (error) {
+      if (error instanceof WorkspaceError) throw error;
+      throw new WorkspaceError("FILE_NOT_FOUND", `Directory not found: ${before.rel || "."}`);
+    }
+    const entries: fs.Dirent[] = [];
+    try {
+      for (;;) {
+        const entry = await dir.read();
+        if (!entry) break;
+        entries.push(entry);
+      }
     } finally {
-      await fd.close();
+      await dir.close().catch(() => undefined);
+    }
+    let after: { abs: string; rel: string };
+    let afterStat: fs.Stats;
+    try {
+      after = this.resolve(requested);
+      afterStat = await fs.promises.lstat(after.abs);
+    } catch {
+      throw this.unsafeMutation(before.rel);
+    }
+    if (
+      normCase(after.abs) !== normCase(before.abs) ||
+      !afterStat.isDirectory() ||
+      afterStat.isSymbolicLink() ||
+      afterStat.dev !== beforeStat.dev ||
+      afterStat.ino !== beforeStat.ino
+    ) {
+      throw this.unsafeMutation(before.rel);
+    }
+    return { ...after, entries };
+  }
+
+  async forEachSearchLine(
+    requested: string,
+    visitor: (line: SearchLine) => boolean | void,
+    maxBytes = 2 * 1024 * 1024
+  ): Promise<boolean> {
+    let opened: Awaited<ReturnType<Workspace["openVerifiedRegularFile"]>>;
+    try {
+      opened = await this.openVerifiedRegularFile(requested);
+    } catch {
+      return false;
+    }
+    try {
+      if (opened.stat.size > maxBytes) return false;
+      const redactor = new StreamingSecretRedactor();
+      await this.scanTextHandle(opened.handle, maxBytes, (line, lineNumber) => {
+        const redacted = redactor.redactLine(line);
+        return visitor({ lineNumber, text: redacted.text, redactionCount: redacted.redactionCount });
+      });
+      return true;
+    } catch (error) {
+      if (error instanceof WorkspaceError && (error.code === "BINARY_FILE" || error.code === "FILE_TOO_LARGE")) {
+        return false;
+      }
+      throw error;
+    } finally {
+      await opened.handle.close().catch(() => undefined);
     }
   }
 
@@ -207,105 +441,87 @@ export class Workspace {
     requested: string,
     opts: { startLine?: number; endLine?: number; maxLines?: number; maxBytes?: number } = {}
   ): Promise<ReadFileResult> {
-    const { abs, rel } = this.resolve(requested);
-    let stat: fs.Stats;
+    const opened = await this.openVerifiedRegularFile(requested);
+    const { stat, rel } = opened;
     try {
-      stat = await fs.promises.stat(abs);
-    } catch {
-      throw new WorkspaceError("FILE_NOT_FOUND", `File not found: ${rel}`);
-    }
-    if (!stat.isFile()) {
-      throw new WorkspaceError("NOT_A_FILE", `Not a regular file: ${rel}`);
-    }
-    if (stat.size > HARD_MAX_SOURCE_BYTES) {
-      throw new WorkspaceError(
-        "FILE_TOO_LARGE",
-        `File exceeds the ${HARD_MAX_SOURCE_BYTES}-byte source limit: ${rel}`
-      );
-    }
-    if (await this.isBinary(abs)) {
-      throw new WorkspaceError("BINARY_FILE", `Binary file (${stat.size} bytes): ${rel}. Content is not returned.`);
-    }
-
-    const startLine = Math.max(1, Math.floor(opts.startLine ?? 1));
-    const maxLines = Math.min(HARD_MAX_LINES, Math.max(1, Math.floor(opts.maxLines ?? DEFAULT_MAX_LINES)));
-    const endLimit = opts.endLine
-      ? Math.min(Math.floor(opts.endLine), startLine + HARD_MAX_LINES - 1)
-      : startLine + maxLines - 1;
-    const maxBytes = Math.min(1024 * 1024, Math.max(1024, Math.floor(opts.maxBytes ?? DEFAULT_MAX_BYTES)));
-
-    const lines: string[] = [];
-    let totalLines = 0;
-    let collectedBytes = 0;
-    let byteTruncated = false;
-    let actualEnd = startLine - 1;
-
-    const stream = fs.createReadStream(abs, { encoding: "utf8" });
-    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-    for await (const line of rl) {
-      totalLines++;
-      if (totalLines >= startLine && totalLines <= endLimit && !byteTruncated) {
-        const cost = Buffer.byteLength(line, "utf8") + (lines.length > 0 ? 1 : 0);
-        if (collectedBytes + cost > maxBytes) {
-          if (lines.length === 0) {
-            stream.destroy();
-            throw new WorkspaceError(
-              "FILE_TOO_LARGE",
-              `Line ${totalLines} exceeds the ${maxBytes}-byte response limit: ${rel}`
-            );
-          }
-          byteTruncated = true;
-        } else {
-          lines.push(line);
-          collectedBytes += cost;
-          actualEnd = totalLines;
-        }
+      if (stat.size > HARD_MAX_SOURCE_BYTES) {
+        throw new WorkspaceError(
+          "FILE_TOO_LARGE",
+          `File exceeds the ${HARD_MAX_SOURCE_BYTES}-byte source limit: ${rel}`
+        );
       }
-    }
-    rl.close();
+      const startLine = Math.max(1, Math.floor(opts.startLine ?? 1));
+      const maxLines = Math.min(HARD_MAX_LINES, Math.max(1, Math.floor(opts.maxLines ?? DEFAULT_MAX_LINES)));
+      const endLimit = opts.endLine
+        ? Math.min(Math.floor(opts.endLine), startLine + HARD_MAX_LINES - 1)
+        : startLine + maxLines - 1;
+      const maxBytes = Math.min(1024 * 1024, Math.max(1024, Math.floor(opts.maxBytes ?? DEFAULT_MAX_BYTES)));
 
-    const remaining = Math.max(0, totalLines - actualEnd);
-    const redacted = redactSensitiveText(lines.join("\n"));
-    return {
-      path: rel,
-      sizeBytes: stat.size,
-      totalLines,
-      startLine: Math.min(startLine, Math.max(totalLines, 1)),
-      endLine: actualEnd,
-      truncated: remaining > 0,
-      remainingLines: remaining,
-      nextStartLine: remaining > 0 ? actualEnd + 1 : null,
-      content: redacted.text,
-      redactionCount: redacted.redactionCount,
-    };
+      const selectedLines: string[] = [];
+      let collectedBytes = 0;
+      let byteTruncated = false;
+      let actualEnd = startLine - 1;
+      let redactionCount = 0;
+      const redactor = new StreamingSecretRedactor();
+      const scan = await this.scanTextHandle(opened.handle, HARD_MAX_SOURCE_BYTES, (line, lineNumber) => {
+        const redacted = redactor.redactLine(line);
+        if (lineNumber >= startLine && lineNumber <= endLimit && !byteTruncated) {
+          const cost = Buffer.byteLength(redacted.text, "utf8") + (selectedLines.length > 0 ? 1 : 0);
+          if (collectedBytes + cost > maxBytes) {
+            if (selectedLines.length === 0) {
+              throw new WorkspaceError(
+                "FILE_TOO_LARGE",
+                `Line ${lineNumber} exceeds the ${maxBytes}-byte response limit: ${rel}`
+              );
+            }
+            byteTruncated = true;
+          } else {
+            selectedLines.push(redacted.text);
+            redactionCount += redacted.redactionCount;
+            collectedBytes += cost;
+            actualEnd = lineNumber;
+          }
+        }
+      });
+
+      const totalLines = scan.totalLines;
+      const remaining = Math.max(0, totalLines - actualEnd);
+      return {
+        path: rel,
+        sizeBytes: scan.totalBytes,
+        totalLines,
+        startLine: Math.min(startLine, Math.max(totalLines, 1)),
+        endLine: actualEnd,
+        truncated: remaining > 0,
+        remainingLines: remaining,
+        nextStartLine: remaining > 0 ? actualEnd + 1 : null,
+        content: selectedLines.join("\n"),
+        redactionCount,
+      };
+    } finally {
+      await opened.handle.close().catch(() => undefined);
+    }
   }
 
   async listDirectory(
     requested: string,
     opts: { depth?: number; limit?: number; offset?: number } = {}
   ): Promise<ListDirectoryResult> {
-    const { abs, rel } = this.resolve(requested);
-    let stat: fs.Stats;
-    try {
-      stat = await fs.promises.stat(abs);
-    } catch {
-      throw new WorkspaceError("FILE_NOT_FOUND", `Directory not found: ${rel || "."}`);
-    }
-    if (!stat.isDirectory()) {
-      throw new WorkspaceError("NOT_A_DIRECTORY", `Not a directory: ${rel}`);
-    }
+    const initial = await this.readDirectoryEntries(requested);
+    const { abs, rel } = initial;
     const depth = Math.min(4, Math.max(1, Math.floor(opts.depth ?? 1)));
     const limit = Math.min(1000, Math.max(1, Math.floor(opts.limit ?? 200)));
     const offset = Math.min(10_000, Math.max(0, Math.floor(opts.offset ?? 0)));
 
     const all: DirEntry[] = [];
     const walk = async (dirAbs: string, dirRel: string, level: number): Promise<void> => {
-      let entries: fs.Dirent[];
+      let verified: VerifiedDirectory;
       try {
-        entries = await fs.promises.readdir(dirAbs, { withFileTypes: true });
+        verified = dirAbs === abs && dirRel === rel ? initial : await this.readDirectoryEntries(dirRel);
       } catch {
         return;
       }
+      const entries = verified.entries;
       entries.sort((a, b) => {
         const ad = a.isDirectory() ? 0 : 1;
         const bd = b.isDirectory() ? 0 : 1;
@@ -315,16 +531,25 @@ export class Workspace {
         const childRel = dirRel ? `${dirRel}/${entry.name}` : entry.name;
         if (this.ignoreRules.isHidden(childRel) || this.ignoreRules.isHidden(childRel + "/")) continue;
         if (entry.isDirectory()) {
-          all.push({ path: childRel + "/", type: "dir" });
-          if (level < depth) await walk(path.join(dirAbs, entry.name), childRel, level + 1);
-        } else if (entry.isFile()) {
-          let size: number | undefined;
           try {
-            size = (await fs.promises.stat(path.join(dirAbs, entry.name))).size;
+            const child = await this.readDirectoryEntries(childRel);
+            all.push({ path: childRel + "/", type: "dir" });
+            if (level < depth) await walk(child.abs, childRel, level + 1);
           } catch {
-            size = undefined;
+            continue;
           }
-          all.push({ path: childRel, type: "file", sizeBytes: size });
+        } else if (entry.isFile()) {
+          let opened: Awaited<ReturnType<Workspace["openVerifiedRegularFile"]>>;
+          try {
+            opened = await this.openVerifiedRegularFile(childRel);
+          } catch {
+            continue;
+          }
+          try {
+            all.push({ path: childRel, type: "file", sizeBytes: opened.stat.size });
+          } finally {
+            await opened.handle.close().catch(() => undefined);
+          }
         }
         if (all.length >= Math.min(12_000, offset + limit + 2000)) return;
       }
@@ -343,17 +568,43 @@ export class Workspace {
   }
 
   /** Lightweight project detection for workspace_info. */
-  detectProject(): {
-    projectType: string;
-    languages: string[];
-    frameworks: string[];
-    packageManager: string | null;
-    scriptNames: string[];
-  } {
-    const has = (f: string): boolean => {
+  private async hasVerifiedFile(requested: string): Promise<boolean> {
+    let opened: Awaited<ReturnType<Workspace["openVerifiedRegularFile"]>>;
+    try {
+      opened = await this.openVerifiedRegularFile(requested);
+    } catch {
+      return false;
+    }
+    await opened.handle.close().catch(() => undefined);
+    return true;
+  }
+
+  private async readVerifiedJson<T>(requested: string, maxBytes = 2 * 1024 * 1024): Promise<T | null> {
+    let opened: Awaited<ReturnType<Workspace["openVerifiedRegularFile"]>>;
+    try {
+      opened = await this.openVerifiedRegularFile(requested);
+    } catch {
+      return null;
+    }
+    try {
+      if (opened.stat.size > maxBytes) return null;
+      let text = "";
+      const scan = await this.scanTextHandle(opened.handle, maxBytes, (line, lineNumber) => {
+        text += `${lineNumber > 1 ? "\n" : ""}${line}`;
+      });
+      if (!scan.completed) return null;
+      return JSON.parse(text) as T;
+    } catch {
+      return null;
+    } finally {
+      await opened.handle.close().catch(() => undefined);
+    }
+  }
+
+  async detectProject(): Promise<ProjectInfo> {
+    const has = async (f: string): Promise<boolean> => {
       try {
-        const stat = fs.lstatSync(path.join(this.root, f));
-        return stat.isFile() && !stat.isSymbolicLink();
+        return await this.hasVerifiedFile(f);
       } catch {
         return false;
       }
@@ -364,19 +615,19 @@ export class Workspace {
     let packageManager: string | null = null;
     let scriptNames: string[] = [];
 
-    if (has("package.json")) {
+    const pkg = await this.readVerifiedJson<{
+      scripts?: Record<string, string>;
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    }>("package.json");
+    if (pkg) {
       projectType = "node";
       languages.add("JavaScript");
-      const pkg = readJsonIfExists<{
-        scripts?: Record<string, string>;
-        dependencies?: Record<string, string>;
-        devDependencies?: Record<string, string>;
-      }>(path.join(this.root, "package.json"));
       scriptNames = Object.keys(
         pkg?.scripts && typeof pkg.scripts === "object" && !Array.isArray(pkg.scripts) ? pkg.scripts : {}
       )
         .slice(0, 200)
-        .map((name) => redactSensitiveText(name.slice(0, 200)).text)
+        .map((name) => redactAndTruncate(name, 200).text)
         .sort();
       const dependencies =
         pkg?.dependencies && typeof pkg.dependencies === "object" && !Array.isArray(pkg.dependencies)
@@ -401,25 +652,25 @@ export class Workspace {
       for (const [dep, label] of Object.entries(known)) {
         if (Object.hasOwn(dependencies, dep) || Object.hasOwn(devDependencies, dep)) frameworks.add(label);
       }
-      if (has("pnpm-lock.yaml")) packageManager = "pnpm";
-      else if (has("yarn.lock")) packageManager = "yarn";
-      else if (has("bun.lockb") || has("bun.lock")) packageManager = "bun";
-      else if (has("package-lock.json")) packageManager = "npm";
+      if (await has("pnpm-lock.yaml")) packageManager = "pnpm";
+      else if (await has("yarn.lock")) packageManager = "yarn";
+      else if ((await has("bun.lockb")) || (await has("bun.lock"))) packageManager = "bun";
+      else if (await has("package-lock.json")) packageManager = "npm";
     }
-    if (has("tsconfig.json")) languages.add("TypeScript");
-    if (has("pyproject.toml") || has("requirements.txt") || has("setup.py")) {
+    if (await has("tsconfig.json")) languages.add("TypeScript");
+    if ((await has("pyproject.toml")) || (await has("requirements.txt")) || (await has("setup.py"))) {
       languages.add("Python");
       if (projectType === "unknown") projectType = "python";
     }
-    if (has("Cargo.toml")) {
+    if (await has("Cargo.toml")) {
       languages.add("Rust");
       if (projectType === "unknown") projectType = "rust";
     }
-    if (has("go.mod")) {
+    if (await has("go.mod")) {
       languages.add("Go");
       if (projectType === "unknown") projectType = "go";
     }
-    if (has("Package.swift")) {
+    if (await has("Package.swift")) {
       languages.add("Swift");
       if (projectType === "unknown") projectType = "swift";
     }

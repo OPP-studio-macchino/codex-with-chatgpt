@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir, getStateDir } from "../config/paths.js";
-import { redactSensitiveText } from "../security/redaction.js";
+import { redactAndTruncate, redactSensitiveText } from "../security/redaction.js";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 const LEVELS: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
@@ -57,11 +57,11 @@ export class Logger {
       new Date().toISOString(),
       level.toUpperCase().padEnd(5),
       `[${this.name}]`,
-      redact(msg).slice(0, MAX_LOG_FIELD_CHARS),
+      redactAndTruncate(redact(msg), MAX_LOG_FIELD_CHARS).text,
     ];
     if (extra !== undefined) {
       try {
-        parts.push(redact(JSON.stringify(extra)).slice(0, MAX_LOG_FIELD_CHARS));
+        parts.push(redactAndTruncate(redact(JSON.stringify(extra)), MAX_LOG_FIELD_CHARS).text);
       } catch {
         parts.push("[unserializable]");
       }

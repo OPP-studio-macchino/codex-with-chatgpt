@@ -29,10 +29,21 @@ ChatGPT が MCP ツールを呼ぶと、要求されたソース抜粋、検索�
 - 初期状態はローカル限定。外部接続はすべて明示オプションです。
 - 推奨経路として OpenAI Secure MCP Tunnel 用の固定ヘッダー認証を追加。
 - Cloudflare Quick Tunnel は明示承認が必要なフォールバックに変更。
-- OAuth の redirect URI、PKCE、登録数、レート、本文サイズを制限。
-- symlink、`..`、絶対パスを含むワークスペース外参照を realpath で拒否。
-- 読み取り・検索・Git status/diff・実行記録に秘密パス除外と出力マスキングを適用。
-- Git のグローバル設定、hook、外部 diff、textconv、pager を無効化して読み取り。
+- OAuth の redirect URI、PKCE、本文サイズ、route 同時実行数、pairing window ごとの
+  登録総数と state map を hard cap。試行回数は認可要求ごとに分離し、先に受理した
+  provisional client を後続の未信頼登録のために追い出しません。
+- symlink、`..`、絶対パスを含むワークスペース外参照を realpath で拒否。ファイルは
+  検証済みの同一 descriptor からstreaming読出しし、project metadata と `.c2cignore`
+  もdescriptorへ束縛。走査中に identity が変わった directory は拒否。
+- 読み取り・検索・Git status/diff・実行記録に秘密パス除外を適用し、資格情報候補は
+  statefulな行streamでマスキング。複数行private keyもpage・検索行の境界を越えて遮蔽。
+- ワークスペース検索は検証済み reader による literal 検索のみ。正規表現 subprocess
+  検索は containment 境界を保証できないため無効。
+- Git のグローバル設定、hook、外部 diff、textconv、pager、lazy fetch を無効化。
+  filter、include、partial clone、credential helper、SSH command を含む repository は、
+  index/object を読む前に Git status/diff を fail-closed で拒否。実行時はowner-onlyの
+  sanitized一時control-metadata snapshotを使用し、全status経路でsubmoduleを無視。
+  `workspace_info`はGitを呼ばず、`git.read`境界と分離。
 - 管理 API は loopback と所有者専用トークンの両方を要求。
 - `doctor` は公開トンネルを勝手に開かず、`update-check` は更新を適用しません。
 - Skill から無断インストール、自動 pull/stash、グローバル設定変更を除去。

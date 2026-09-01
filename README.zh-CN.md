@@ -25,10 +25,20 @@ ChatGPT 调用 MCP 工具时，请求到的源码片段、搜索结果、diff、
 - 默认仅本地运行；所有远程传输都需要显式选项。
 - 优先支持 OpenAI Secure MCP Tunnel，并使用每工作区的私有固定请求头令牌。
 - Cloudflare Quick Tunnel 仅作为明确选择的备用方案。
-- 强化 OAuth redirect URI、PKCE、注册数量、速率、请求体和安全响应头限制。
-- 使用 canonical realpath 阻止 `..`、绝对路径和符号链接逃逸。
-- 对文件、搜索、Git 状态/diff 和执行记录统一执行敏感路径过滤与输出遮蔽。
-- Git 读取禁用全局配置、hooks、external diff、textconv、pager 和父仓库穿透。
+- 强化 OAuth redirect URI、PKCE、请求体、路由并发、每个配对窗口的注册总量和状态表
+  hard cap。尝试次数按授权请求隔离，已接受的 provisional client 不会为后续不受信任
+  注册而被驱逐。
+- 使用 canonical realpath 阻止 `..`、绝对路径和符号链接逃逸；文件始终从同一个已验证
+  descriptor 流式读取，project metadata 与 `.c2cignore` 也绑定到 descriptor；目录在遍历
+  期间 identity 发生变化时会被拒绝。
+- 对文件、搜索、Git 状态/diff 和执行记录统一执行敏感路径过滤；先对完整的有界逻辑单元
+  进行有状态行流遮蔽，跨分页和搜索行的多行 private key 仍会被隐藏。
+- 工作区搜索仅支持通过已验证 reader 执行的 literal 模式；无法保证 containment 的正则
+  subprocess 搜索已禁用。
+- Git 读取禁用全局配置、hooks、external diff、textconv、pager、lazy fetch 和父仓库穿透。
+  含 filter、include、partial clone、credential helper 或 SSH command 的仓库会在读取
+  index/object 前拒绝 Git status/diff。执行使用 owner-only 的临时 sanitized control-metadata
+  snapshot，所有 status 路径忽略 submodule；`workspace_info` 不调用 Git。
 - 管理接口同时要求 loopback 来源和 owner-only 管理令牌。
 - `doctor` 不会打开公网隧道，`update-check` 不会安装更新，全局 Codex 配置修改被
   拆分到单独的 `sandbox-allow` 命令。

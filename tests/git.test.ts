@@ -1,11 +1,64 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { gitDiff, gitInfo, gitStatus } from "../src/workspace/git.js";
 import { makeTmpDir, cleanup, write, makeGitRepo, git } from "./helpers.js";
 
 let repo: string;
 let plain: string;
+
+const UNSAFE_GIT_CONFIGURATION =
+  "UNSAFE_GIT_CONFIGURATION: Git inspection is disabled for this repository.";
+
+function commandQuote(value: string): string {
+  const portable = process.platform === "win32" ? value.replaceAll("\\", "/") : value;
+  return JSON.stringify(portable);
+}
+
+function markerHelper(root: string, name = "git-helper"): { command: string; marker: string } {
+  const marker = path.join(root, `${name}-executed`);
+  const helper = write(
+    root,
+    `${name}.cjs`,
+    'require("node:fs").writeFileSync(process.argv[2], "executed\\n");\nprocess.exit(1);\n'
+  );
+  const command = [process.execPath, helper, marker].map(commandQuote).join(" ");
+  return { command, marker };
+}
+
+function objectPath(root: string, oid: string): string {
+  return path.join(root, ".git", "objects", oid.slice(0, 2), oid.slice(2));
+}
+
+function externalObjectFixture(name: string): { isolated: string; external: string; marker: string; oid: string } {
+  const isolated = makeTmpDir(`${name}-isolated`);
+  const external = makeTmpDir(`${name}-external`);
+  const marker = "workspace-external-object-marker";
+  makeGitRepo(isolated);
+  makeGitRepo(external);
+  for (const root of [isolated, external]) {
+    write(root, "hello.txt", `${marker}\n`);
+    git(root, "add", "hello.txt");
+    git(root, "commit", "-m", "add synthetic object marker");
+  }
+  write(isolated, "hello.txt", "inside workspace change\n");
+  return { isolated, external, marker, oid: git(isolated, "rev-parse", "HEAD:hello.txt").trim() };
+}
+
+function expectObjectStoreFailure(root: string, marker: string): void {
+  const residues = snapshotResidueCount();
+  const status = gitStatus(root);
+  expect(status.isRepo).toBe(false);
+  expect(JSON.stringify(status)).not.toContain(marker);
+  expect(() => gitDiff(root, { mode: "unstaged" })).toThrow();
+  expect(snapshotResidueCount()).toBe(residues);
+}
+
+function snapshotResidueCount(): number {
+  return fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith("c2c-git-snapshot-")).length;
+}
 
 beforeAll(() => {
   repo = makeTmpDir("git-repo");
@@ -20,6 +73,10 @@ afterAll(() => {
   delete process.env.GIT_CEILING_DIRECTORIES;
   cleanup(repo);
   cleanup(plain);
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
 });
 
 describe("gitInfo", () => {
@@ -138,6 +195,197 @@ describe("gitStatus", () => {
       fs.rmSync(path.join(repo, `bulk-${String(index).padStart(3, "0")}.txt`), { force: true });
     }
   });
+
+  it.skipIf(process.platform === "win32")(
+    "ignores initialized submodules before their local filters or includes can run",
+    () => {
+      for (const viaInclude of [false, true]) {
+        const isolated = makeTmpDir(`git-submodule-${viaInclude ? "include" : "filter"}`);
+        const subSource = makeTmpDir(`git-submodule-source-${viaInclude ? "include" : "filter"}`);
+        makeGitRepo(isolated);
+        makeGitRepo(subSource);
+        write(subSource, ".gitattributes", "hello.txt filter=hostile\n");
+        git(subSource, "add", ".gitattributes");
+        git(subSource, "commit", "-m", "add submodule attributes");
+        git(isolated, "-c", "protocol.file.allow=always", "submodule", "add", subSource, "deps/hostile");
+        git(isolated, "commit", "-am", "add submodule fixture");
+
+        const submodule = path.join(isolated, "deps", "hostile");
+        const { command, marker } = markerHelper(submodule, "submodule-helper");
+        if (viaInclude) {
+          const included = write(
+            submodule,
+            ".git-hostile-include",
+            `[filter "hostile"]\n\tclean = ${command}\n`
+          );
+          git(submodule, "config", "include.path", included);
+        } else {
+          git(submodule, "config", "filter.hostile.clean", command);
+        }
+        write(submodule, "hello.txt", "changed inside ignored submodule\n");
+
+        expect(gitStatus(isolated).isRepo).toBe(true);
+        expect(gitInfo(isolated).isRepo).toBe(true);
+        expect(fs.existsSync(marker)).toBe(false);
+        cleanup(isolated);
+        cleanup(subSource);
+      }
+    }
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "executes status from a sanitized metadata snapshot after a root config swap",
+    () => {
+      const isolated = makeTmpDir("git-root-config-race");
+      makeGitRepo(isolated);
+      write(isolated, ".gitattributes", "hello.txt filter=hostile\n");
+      git(isolated, "add", ".gitattributes");
+      git(isolated, "commit", "-m", "add root attributes");
+      write(isolated, "hello.txt", "changed during config race\n");
+      const { command, marker } = markerHelper(isolated, "raced-root-helper");
+      const config = path.join(isolated, ".git", "config");
+      const safeConfig = fs.readFileSync(config, "utf8");
+      const hostileConfig = `${safeConfig}\n[filter "hostile"]\n\tclean = ${command}\n`;
+      const originalMkdtemp = fs.mkdtempSync.bind(fs);
+      vi.spyOn(fs, "mkdtempSync").mockImplementation(((prefix: string) => {
+        const snapshot = originalMkdtemp(prefix);
+        const replacement = path.join(isolated, ".git", "config.hostile-tmp");
+        fs.writeFileSync(replacement, hostileConfig);
+        fs.renameSync(replacement, config);
+        return snapshot;
+      }) as typeof fs.mkdtempSync);
+
+      const status = gitStatus(isolated);
+      expect(status.isRepo).toBe(true);
+      expect(fs.existsSync(marker)).toBe(false);
+      fs.writeFileSync(config, safeConfig);
+      cleanup(isolated);
+    }
+  );
+});
+
+describe.skipIf(process.platform === "win32")("Git object-store containment", () => {
+  it("constructs one private object snapshot per gitDiff call", () => {
+    const isolated = makeTmpDir("git-diff-one-snapshot");
+    makeGitRepo(isolated);
+    write(isolated, "hello.txt", "one snapshot\n");
+    const originalMkdtemp = fs.mkdtempSync.bind(fs);
+    let snapshots = 0;
+    vi.spyOn(fs, "mkdtempSync").mockImplementation(((prefix: string) => {
+      if (prefix.endsWith("c2c-git-snapshot-")) snapshots++;
+      return originalMkdtemp(prefix);
+    }) as typeof fs.mkdtempSync);
+
+    expect(gitDiff(isolated, { mode: "unstaged" }).diff).toContain("one snapshot");
+    expect(snapshots).toBe(1);
+    cleanup(isolated);
+  });
+
+  it("fails closed on the monotonic snapshot deadline without residue", () => {
+    const isolated = makeTmpDir("git-object-deadline");
+    makeGitRepo(isolated);
+    write(isolated, "hello.txt", "deadline marker\n");
+    const residues = snapshotResidueCount();
+    const clock = vi.spyOn(performance, "now");
+
+    clock.mockReturnValueOnce(0).mockReturnValue(251);
+    expect(gitStatus(isolated).isRepo).toBe(false);
+    clock.mockReset().mockReturnValueOnce(0).mockReturnValue(251);
+    expect(() => gitDiff(isolated, { mode: "unstaged" })).toThrow(UNSAFE_GIT_CONFIGURATION);
+    expect(snapshotResidueCount()).toBe(residues);
+    cleanup(isolated);
+  });
+
+  it("keeps file and byte caps as fail-closed cleanup backstops", () => {
+    const fileCap = makeTmpDir("git-object-file-cap");
+    makeGitRepo(fileCap);
+    const entries = path.join(fileCap, ".git", "objects", "cap-fixture");
+    fs.mkdirSync(entries);
+    for (let index = 0; index <= 20_000; index++) {
+      fs.closeSync(fs.openSync(path.join(entries, String(index)), "wx"));
+    }
+    const residues = snapshotResidueCount();
+    vi.spyOn(performance, "now").mockReturnValue(0);
+    expect(gitStatus(fileCap).isRepo).toBe(false);
+    expect(snapshotResidueCount()).toBe(residues);
+    cleanup(fileCap);
+    vi.restoreAllMocks();
+
+    const byteCap = makeTmpDir("git-object-byte-cap");
+    makeGitRepo(byteCap);
+    const oversized = path.join(byteCap, ".git", "objects", "oversized");
+    fs.closeSync(fs.openSync(oversized, "wx"));
+    fs.truncateSync(oversized, 512 * 1024 * 1024 + 1);
+    expect(gitStatus(byteCap).isRepo).toBe(false);
+    expect(snapshotResidueCount()).toBe(residues);
+    cleanup(byteCap);
+  }, 30_000);
+
+  it("keeps normal object stores usable and rejects loose-object and fanout symlinks", () => {
+    for (const attack of ["loose", "fanout"] as const) {
+      const { isolated, external, marker, oid } = externalObjectFixture(`git-object-${attack}`);
+      expect(gitStatus(isolated).isRepo).toBe(true);
+      expect(gitDiff(isolated, { mode: "unstaged" }).diff).toContain("inside workspace change");
+
+      const target = attack === "loose" ? objectPath(isolated, oid) : path.dirname(objectPath(isolated, oid));
+      const externalTarget = attack === "loose" ? objectPath(external, oid) : path.dirname(objectPath(external, oid));
+      fs.renameSync(target, `${target}.backup`);
+      fs.symlinkSync(externalTarget, target, attack === "loose" ? "file" : "dir");
+
+      expectObjectStoreFailure(isolated, marker);
+      cleanup(isolated);
+      cleanup(external);
+    }
+  });
+
+  it("rejects symlinked packed object metadata", () => {
+    for (const extension of ["pack", "idx", "rev", "multi-pack-index", "commit-graph"] as const) {
+      const { isolated, external, marker } = externalObjectFixture(`git-packed-${extension}`);
+      git(isolated, "gc", "--prune=now");
+      const packDir = path.join(isolated, ".git", "objects", "pack");
+      if (extension === "rev") {
+        const pack = fs.readdirSync(packDir).find((name) => name.endsWith(".pack"));
+        git(isolated, "index-pack", "--rev-index", path.join(packDir, pack!));
+      } else if (extension === "multi-pack-index") {
+        git(isolated, "multi-pack-index", "write");
+      } else if (extension === "commit-graph") {
+        git(isolated, "commit-graph", "write", "--reachable");
+      }
+      const target = extension === "commit-graph"
+        ? path.join(isolated, ".git", "objects", "info", extension)
+        : extension === "multi-pack-index"
+          ? path.join(packDir, extension)
+          : path.join(packDir, fs.readdirSync(packDir).find((name) => name.endsWith(`.${extension}`))!);
+      expect(fs.existsSync(target)).toBe(true);
+      expect(gitStatus(isolated).isRepo).toBe(true);
+      expect(gitDiff(isolated, { mode: "unstaged" }).diff).toContain("inside workspace change");
+      const externalTarget = path.join(external, ".git", "objects", path.relative(path.join(isolated, ".git", "objects"), target));
+      fs.mkdirSync(path.dirname(externalTarget), { recursive: true });
+      fs.copyFileSync(target, externalTarget);
+      fs.renameSync(target, `${target}.backup`);
+      fs.symlinkSync(externalTarget, target, "file");
+
+      expectObjectStoreFailure(isolated, marker);
+      cleanup(isolated);
+      cleanup(external);
+    }
+  });
+
+  it("rejects an object swap after preflight and before the private snapshot is copied", () => {
+    const { isolated, external, marker, oid } = externalObjectFixture("git-object-race");
+    const target = objectPath(isolated, oid);
+    const originalMkdtemp = fs.mkdtempSync.bind(fs);
+    vi.spyOn(fs, "mkdtempSync").mockImplementation(((prefix: string) => {
+      const snapshot = originalMkdtemp(prefix);
+      fs.renameSync(target, `${target}.backup`);
+      fs.symlinkSync(objectPath(external, oid), target, "file");
+      return snapshot;
+    }) as typeof fs.mkdtempSync);
+
+    expectObjectStoreFailure(isolated, marker);
+    cleanup(isolated);
+    cleanup(external);
+  });
 });
 
 describe("gitDiff pagination", () => {
@@ -234,6 +482,131 @@ describe("gitDiff pagination", () => {
     expect(fs.existsSync(path.join(isolated, "driver-executed"))).toBe(false);
     cleanup(isolated);
   });
+
+  it(
+    "fails closed before repository clean/process/smudge filters can execute",
+    () => {
+      for (const driver of ["clean", "process", "smudge"] as const) {
+        const isolated = makeTmpDir(`git-${driver}-filter`);
+        makeGitRepo(isolated);
+        write(isolated, ".gitattributes", "hello.txt filter=hostile\n");
+        git(isolated, "add", ".gitattributes");
+        git(isolated, "commit", "-m", "add filter attributes");
+        const { command, marker } = markerHelper(isolated, `${driver}-helper`);
+        git(isolated, "config", `filter.hostile.${driver}`, command);
+        if (driver === "process") git(isolated, "config", "filter.hostile.required", "true");
+        write(isolated, "hello.txt", `changed for ${driver}\n`);
+
+        expect(gitStatus(isolated).isRepo).toBe(false);
+        expect(() => gitDiff(isolated, { mode: "unstaged" })).toThrow(UNSAFE_GIT_CONFIGURATION);
+        expect(fs.existsSync(marker)).toBe(false);
+        cleanup(isolated);
+      }
+    }
+  );
+
+  it(
+    "rejects included filter configuration without following the include",
+    () => {
+      const isolated = makeTmpDir("git-included-filter");
+      makeGitRepo(isolated);
+      write(isolated, ".gitattributes", "hello.txt filter=hostile\n");
+      git(isolated, "add", ".gitattributes");
+      git(isolated, "commit", "-m", "add filter attributes");
+      const { command, marker } = markerHelper(isolated, "included-helper");
+      const included = write(
+        isolated,
+        ".git/hostile-include",
+        `[filter "hostile"]\n\tclean = ${command}\n`
+      );
+      git(isolated, "config", "include.path", included);
+      write(isolated, "hello.txt", "changed with included filter\n");
+
+      expect(() => gitDiff(isolated, { mode: "unstaged" })).toThrow(UNSAFE_GIT_CONFIGURATION);
+      expect(fs.existsSync(marker)).toBe(false);
+      cleanup(isolated);
+    }
+  );
+
+  it(
+    "rejects filters selected through .git/info/attributes",
+    () => {
+      const isolated = makeTmpDir("git-info-attributes-filter");
+      makeGitRepo(isolated);
+      const { command, marker } = markerHelper(isolated, "info-attributes-helper");
+      write(isolated, ".git/info/attributes", "hello.txt filter=hostile\n");
+      git(isolated, "config", "filter.hostile.clean", command);
+      write(isolated, "hello.txt", "changed with info attributes\n");
+
+      expect(() => gitDiff(isolated, { mode: "unstaged" })).toThrow(UNSAFE_GIT_CONFIGURATION);
+      expect(fs.existsSync(marker)).toBe(false);
+      cleanup(isolated);
+    }
+  );
+
+  it(
+    "rejects filters configured in linked-worktree configuration",
+    () => {
+      const source = makeTmpDir("git-filter-worktree-source");
+      const container = makeTmpDir("git-filter-worktree-container");
+      const linked = path.join(container, "linked");
+      makeGitRepo(source);
+      write(source, ".gitattributes", "hello.txt filter=hostile\n");
+      git(source, "add", ".gitattributes");
+      git(source, "commit", "-m", "add filter attributes");
+      git(source, "config", "extensions.worktreeConfig", "true");
+      git(source, "worktree", "add", "-b", "c2c-filter-test", linked);
+      const { command, marker } = markerHelper(linked, "worktree-helper");
+      git(linked, "config", "--worktree", "filter.hostile.clean", command);
+      write(linked, "hello.txt", "changed in linked worktree\n");
+
+      expect(() => gitDiff(linked, { mode: "unstaged" })).toThrow(UNSAFE_GIT_CONFIGURATION);
+      expect(fs.existsSync(marker)).toBe(false);
+      cleanup(container);
+      cleanup(source);
+    }
+  );
+
+  it(
+    "rejects a promisor repository before a missing object can start a transport",
+    () => {
+      const isolated = makeTmpDir("git-promisor");
+      makeGitRepo(isolated);
+      const blob = git(isolated, "rev-parse", "HEAD:hello.txt").trim();
+      const object = path.join(isolated, ".git", "objects", blob.slice(0, 2), blob.slice(2));
+      fs.renameSync(object, path.join(isolated, "missing-blob-backup"));
+      const { command, marker } = markerHelper(isolated, "transport-helper");
+      git(isolated, "config", "remote.origin.url", `ext::${command}`);
+      git(isolated, "config", "remote.origin.promisor", "true");
+      git(isolated, "config", "remote.origin.partialCloneFilter", "blob:none");
+      git(isolated, "config", "extensions.partialClone", "origin");
+      git(isolated, "config", "protocol.ext.allow", "always");
+      write(isolated, "hello.txt", "changed with missing base blob\n");
+
+      expect(() => gitDiff(isolated, { mode: "unstaged" })).toThrow(UNSAFE_GIT_CONFIGURATION);
+      expect(fs.existsSync(marker)).toBe(false);
+      cleanup(isolated);
+    }
+  );
+
+  it(
+    "rejects credential and SSH helpers without exposing their configured values",
+    () => {
+      for (const key of ["credential.helper", "core.askPass", "core.sshCommand"] as const) {
+        const isolated = makeTmpDir(`git-${key.replaceAll(".", "-")}`);
+        makeGitRepo(isolated);
+        const { command, marker } = markerHelper(isolated, "network-helper");
+        git(isolated, "config", key, command);
+        write(isolated, "hello.txt", `changed with ${key}\n`);
+
+        expect(() => gitDiff(isolated, { mode: "unstaged" })).toThrow(
+          UNSAFE_GIT_CONFIGURATION
+        );
+        expect(fs.existsSync(marker)).toBe(false);
+        cleanup(isolated);
+      }
+    }
+  );
 
   it("handles non-repos gracefully", () => {
     const diff = gitDiff(plain, { mode: "unstaged" });

@@ -33,12 +33,14 @@ describe("OAuth authorization store", () => {
   it("bounds unauthenticated provisional registrations", () => {
     const file = path.join(stateDir, "auth-limit.json");
     const store = new AuthStore("workspace-limit", { file });
+    const clients = [];
     for (let index = 0; index < 8; index++) {
-      store.registerClient({ redirectUris: [`https://example.com/callback/${index}`] });
+      clients.push(store.registerClient({ redirectUris: [`https://example.com/callback/${index}`] }));
     }
-    expect(() => store.registerClient({ redirectUris: ["https://example.com/overflow"] })).toThrow(
-      "CLIENT_REGISTRATION_LIMIT"
-    );
+    expect(() =>
+      store.registerClient({ redirectUris: ["https://attacker-over-cap.example/callback"] })
+    ).toThrow("PROVISIONAL_CLIENT_LIMIT");
+    expect(store.getClient(clients[0].clientId)).toBeDefined();
   });
 
   it("enforces redirect validation inside the store boundary", () => {
