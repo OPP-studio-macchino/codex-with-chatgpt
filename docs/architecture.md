@@ -118,11 +118,14 @@ reads index or object data, a name-only config preflight that does not follow
 includes rejects executable filters, includes, partial-clone promises,
 protocol overrides, credential helpers, and SSH commands. Diff paths are then
 enumerated and filtered before their content is requested. The preflighted
-HEAD, ref, and index control metadata is copied into an owner-only sanitized
-temporary Git directory for execution, so a later root-config swap is not read
-by the command. The original object database remains read-only input, status
-always uses `--ignore-submodules=all`, and `workspace_info` does not enter this
-data path at all.
+HEAD, ref, and index control metadata and a bounded, verified copy of the Git
+object database are placed in an owner-only temporary snapshot. Native Git
+uses only that snapshot's object directory and never receives the original
+object database. Object count, aggregate bytes, and a short monotonic deadline
+bound snapshot construction, which fails closed; one `gitDiff` shares the same
+snapshot for name enumeration and the actual diff. The selected worktree
+remains mutable read-only input, status always uses `--ignore-submodules=all`,
+and `workspace_info` does not enter this data path at all.
 
 ## Process and state lifecycle
 

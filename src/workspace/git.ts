@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { IgnoreRules } from "./ignore.js";
 import { redactAndTruncate, redactSensitiveText } from "../security/redaction.js";
 import { findBinary } from "../tunnel/detect.js";
@@ -60,6 +61,11 @@ interface GitSnapshot {
 const MAX_GIT_INDEX_BYTES = 64 * 1024 * 1024;
 const MAX_PACKED_REFS_BYTES = 16 * 1024 * 1024;
 const MAX_SHARED_INDEX_FILES = 8;
+// ponytail: bounded full snapshot; replace with a descriptor-bound selective snapshot if this cap blocks normal repositories.
+const MAX_GIT_OBJECT_FILES = 20_000;
+const MAX_GIT_OBJECT_BYTES = 512 * 1024 * 1024;
+const MAX_GIT_SNAPSHOT_MS = 250;
+const GIT_COPY_BUFFER_BYTES = 64 * 1024;
 
 function gitBinary(): string | null {
   if (cachedGitBinary === undefined) cachedGitBinary = findBinary("git", { includePath: false });
@@ -300,11 +306,108 @@ function resolveHead(layout: ValidatedGitLayout): { headText: string; oid: strin
   return { headText: `ref: ${refName}\n`, oid: null };
 }
 
-function copyVerifiedFile(source: string, destination: string, maxBytes: number): boolean {
-  const buffer = readVerifiedFile(source, maxBytes);
-  if (!buffer) return false;
-  fs.writeFileSync(destination, buffer, { mode: 0o600, flag: "wx" });
-  return true;
+function withinDeadline(deadline: number): boolean {
+  return performance.now() <= deadline;
+}
+
+function copyVerifiedFile(source: string, destination: string, maxBytes: number, deadline = Infinity): number | null {
+  const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+  let sourceFd: number | null = null;
+  let destinationFd: number | null = null;
+  try {
+    if (!withinDeadline(deadline)) return null;
+    const before = fs.lstatSync(source);
+    if (before.isSymbolicLink() || !before.isFile() || before.size < 0 || before.size > maxBytes) return null;
+    if (!withinDeadline(deadline)) return null;
+    sourceFd = fs.openSync(source, fs.constants.O_RDONLY | noFollow);
+    const opened = fs.fstatSync(sourceFd);
+    if (!opened.isFile() || opened.size !== before.size) return null;
+    if (!withinDeadline(deadline)) return null;
+    destinationFd = fs.openSync(destination, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+    const buffer = Buffer.allocUnsafe(Math.min(GIT_COPY_BUFFER_BYTES, Math.max(1, opened.size)));
+    let remaining = opened.size;
+    while (remaining > 0) {
+      if (!withinDeadline(deadline)) return null;
+      const read = fs.readSync(sourceFd, buffer, 0, Math.min(buffer.length, remaining), null);
+      if (read === 0) return null;
+      let written = 0;
+      while (written < read) {
+        if (!withinDeadline(deadline)) return null;
+        written += fs.writeSync(destinationFd, buffer, written, read - written, null);
+      }
+      remaining -= read;
+    }
+    if (!withinDeadline(deadline)) return null;
+    const after = fs.statSync(source);
+    return (
+      withinDeadline(deadline) &&
+      fs.realpathSync.native(source) === path.resolve(source) &&
+      after.isFile() &&
+      after.dev === before.dev &&
+      after.ino === before.ino &&
+      after.size === before.size &&
+      opened.dev === before.dev &&
+      opened.ino === before.ino &&
+      opened.size === before.size
+    ) ? opened.size : null;
+  } catch {
+    return null;
+  } finally {
+    if (destinationFd !== null) {
+      try {
+        fs.closeSync(destinationFd);
+      } catch {
+        // best effort for a private snapshot descriptor
+      }
+    }
+    if (sourceFd !== null) {
+      try {
+        fs.closeSync(sourceFd);
+      } catch {
+        // best effort for a verified source descriptor
+      }
+    }
+  }
+}
+
+function copyVerifiedObjectStore(source: string, destination: string, deadline: number): boolean {
+  let fileCount = 0;
+  let totalBytes = 0;
+
+  const copyDirectory = (from: string, to: string, relative: string): boolean => {
+    try {
+      if (!withinDeadline(deadline)) return false;
+      const before = fs.lstatSync(from);
+      if (before.isSymbolicLink() || !before.isDirectory() || fs.realpathSync.native(from) !== path.resolve(from)) {
+        return false;
+      }
+      if (!withinDeadline(deadline)) return false;
+      fs.mkdirSync(to, { mode: 0o700 });
+      for (const entry of fs.readdirSync(from)) {
+        if (!withinDeadline(deadline)) return false;
+        const childRelative = relative ? `${relative}/${entry}` : entry;
+        if (childRelative === "info/alternates") return false;
+        const childFrom = path.join(from, entry);
+        const childTo = path.join(to, entry);
+        const child = fs.lstatSync(childFrom);
+        if (child.isDirectory()) {
+          if (!copyDirectory(childFrom, childTo, childRelative)) return false;
+        } else {
+          if (++fileCount > MAX_GIT_OBJECT_FILES) return false;
+          const bytes = copyVerifiedFile(childFrom, childTo, MAX_GIT_OBJECT_BYTES - totalBytes, deadline);
+          if (bytes === null) return false;
+          totalBytes += bytes;
+        }
+      }
+      if (!withinDeadline(deadline)) return false;
+      const after = fs.statSync(from);
+      return withinDeadline(deadline) && after.isDirectory() && after.dev === before.dev && after.ino === before.ino && fs.realpathSync.native(from) === path.resolve(from);
+    } catch {
+      return false;
+    }
+  };
+
+  return copyDirectory(source, destination, "");
 }
 
 function createGitSnapshot(root: string): GitSnapshot | null {
@@ -329,9 +432,12 @@ function createGitSnapshot(root: string): GitSnapshot | null {
       `[core]\n\trepositoryFormatVersion = ${head.oid?.length === 64 ? "1" : "0"}\n\tbare = false\n\tfileMode = true\n${objectFormat}`,
       { mode: 0o600, flag: "wx" }
     );
+    const snapshotObjects = path.join(temp, "objects");
+    const deadline = performance.now() + MAX_GIT_SNAPSHOT_MS;
+    if (!copyVerifiedObjectStore(layout.objectDir, snapshotObjects, deadline)) throw new Error("unsafe object store");
 
     const sourceIndex = path.join(layout.gitDir, "index");
-    if (fs.existsSync(sourceIndex) && !copyVerifiedFile(sourceIndex, path.join(temp, "index"), MAX_GIT_INDEX_BYTES)) {
+    if (fs.existsSync(sourceIndex) && copyVerifiedFile(sourceIndex, path.join(temp, "index"), MAX_GIT_INDEX_BYTES, deadline) === null) {
       throw new Error("unsafe index");
     }
     const shared = new Set<string>();
@@ -342,7 +448,7 @@ function createGitSnapshot(root: string): GitSnapshot | null {
     }
     if (shared.size > MAX_SHARED_INDEX_FILES) throw new Error("too many shared indexes");
     for (const source of shared) {
-      if (!copyVerifiedFile(source, path.join(temp, path.basename(source)), MAX_GIT_INDEX_BYTES)) {
+      if (copyVerifiedFile(source, path.join(temp, path.basename(source)), MAX_GIT_INDEX_BYTES, deadline) === null) {
         throw new Error("unsafe shared index");
       }
     }
@@ -353,7 +459,7 @@ function createGitSnapshot(root: string): GitSnapshot | null {
     ) {
       throw new Error("git metadata changed");
     }
-    return { gitDir: temp, objectDir: layout.objectDir };
+    return { gitDir: temp, objectDir: snapshotObjects };
   } catch {
     fs.rmSync(temp, { recursive: true, force: true });
     return null;
@@ -425,29 +531,38 @@ export function runGit(root: string, args: string[]): GitCommandResult {
       code: null,
     };
   }
+  return withGitSnapshot(root, (run) => run(args)) ?? {
+    ok: false,
+    stdout: "",
+    stderr: UNSAFE_GIT_CONFIGURATION_ERROR,
+    code: null,
+  };
+}
+
+function withGitSnapshot<T>(root: string, callback: (run: (args: string[]) => GitCommandResult) => T): T | null {
   const binary = gitBinary();
   const snapshot = createGitSnapshot(root);
-  if (!binary || !snapshot) {
-    return { ok: false, stdout: "", stderr: UNSAFE_GIT_CONFIGURATION_ERROR, code: null };
-  }
+  if (!binary || !snapshot) return null;
   try {
-    const result = spawnSync(
-      binary,
-      [...SAFE_GIT_CONFIG, "--literal-pathspecs", `--git-dir=${snapshot.gitDir}`, `--work-tree=${root}`, ...args],
-      {
-        cwd: root,
-        encoding: "utf8",
-        maxBuffer: 16 * 1024 * 1024,
-        timeout: 30_000,
-        env: safeGitEnv(root, binary, snapshot),
-      }
-    );
-    return {
-      ok: result.status === 0,
-      stdout: result.stdout ?? "",
-      stderr: result.stderr ?? "",
-      code: result.status,
-    };
+    return callback((args) => {
+      const result = spawnSync(
+        binary,
+        [...SAFE_GIT_CONFIG, "--literal-pathspecs", `--git-dir=${snapshot.gitDir}`, `--work-tree=${root}`, ...args],
+        {
+          cwd: root,
+          encoding: "utf8",
+          maxBuffer: 16 * 1024 * 1024,
+          timeout: 30_000,
+          env: safeGitEnv(root, binary, snapshot),
+        }
+      );
+      return {
+        ok: result.status === 0,
+        stdout: result.stdout ?? "",
+        stderr: result.stderr ?? "",
+        code: result.status,
+      };
+    });
   } finally {
     fs.rmSync(snapshot.gitDir, { recursive: true, force: true });
   }
@@ -650,69 +765,73 @@ export function gitDiff(root: string, opts: GitDiffOptions = {}, relPath?: strin
   const maxBytes = Math.min(256 * 1024, Math.max(1024, Math.floor(opts.maxBytes ?? 64 * 1024)));
   const policy = new IgnoreRules(root);
 
-  const names = runGit(root, [
-    ...diffArgs(mode),
-    "--name-only",
-    "-z",
-    "--",
-    relPath || ".",
-  ]);
-  if (!names.ok) {
-    throw new Error(`Unable to enumerate Git diff paths (exit ${names.code ?? "unknown"}).`);
-  }
-  const allPaths = names.stdout.split("\0").filter(Boolean);
-  const allowedPaths = allPaths.filter((filePath) => !policy.isSensitive(filePath));
-  const selectedPaths: string[] = [];
-  let selectedPathBytes = 0;
-  for (const filePath of allowedPaths) {
-    const cost = Buffer.byteLength(filePath, "utf8") + 1;
-    if (selectedPaths.length >= MAX_DIFF_FILES || selectedPathBytes + cost > MAX_DIFF_PATH_BYTES) break;
-    selectedPaths.push(filePath);
-    selectedPathBytes += cost;
-  }
-  const redactedPathCount = allPaths.length - allowedPaths.length;
-  const truncatedByFileLimit = allowedPaths.length > selectedPaths.length;
+  const diff = withGitSnapshot(root, (run) => {
+    const names = run([
+      ...diffArgs(mode),
+      "--name-only",
+      "-z",
+      "--",
+      relPath || ".",
+    ]);
+    if (!names.ok) {
+      throw new Error(`Unable to enumerate Git diff paths (exit ${names.code ?? "unknown"}).`);
+    }
+    const allPaths = names.stdout.split("\0").filter(Boolean);
+    const allowedPaths = allPaths.filter((filePath) => !policy.isSensitive(filePath));
+    const selectedPaths: string[] = [];
+    let selectedPathBytes = 0;
+    for (const filePath of allowedPaths) {
+      const cost = Buffer.byteLength(filePath, "utf8") + 1;
+      if (selectedPaths.length >= MAX_DIFF_FILES || selectedPathBytes + cost > MAX_DIFF_PATH_BYTES) break;
+      selectedPaths.push(filePath);
+      selectedPathBytes += cost;
+    }
+    const redactedPathCount = allPaths.length - allowedPaths.length;
+    const truncatedByFileLimit = allowedPaths.length > selectedPaths.length;
 
-  if (selectedPaths.length === 0) {
+    if (selectedPaths.length === 0) {
+      return {
+        ...emptyDiff(mode),
+        isRepo: true,
+        offset,
+        eligibleFileCount: allowedPaths.length,
+        redactedPathCount,
+        truncatedByFileLimit,
+      };
+    }
+
+    const result = run([...diffArgs(mode), "--", ...selectedPaths]);
+    if (!result.ok) {
+      throw new Error(`Unable to produce Git diff (exit ${result.code ?? "unknown"}).`);
+    }
+    const redacted = redactSensitiveText(result.stdout);
+    const full = Buffer.from(redacted.text, "utf8");
+    const slice = full.subarray(offset, offset + maxBytes);
+    let text = slice.toString("utf8");
+    let sliceLen = slice.length;
+    if (offset + sliceLen < full.length) {
+      const lastNewline = text.lastIndexOf("\n");
+      if (lastNewline > 0) {
+        text = text.slice(0, lastNewline + 1);
+        sliceLen = Buffer.byteLength(text, "utf8");
+      }
+    }
+    const hasMore = offset + sliceLen < full.length;
     return {
-      ...emptyDiff(mode),
       isRepo: true,
+      mode,
+      totalBytes: full.length,
       offset,
+      returnedBytes: sliceLen,
+      hasMore,
+      nextOffset: hasMore ? offset + sliceLen : null,
+      diff: text,
       eligibleFileCount: allowedPaths.length,
       redactedPathCount,
+      redactionCount: redacted.redactionCount,
       truncatedByFileLimit,
     };
-  }
-
-  const result = runGit(root, [...diffArgs(mode), "--", ...selectedPaths]);
-  if (!result.ok) {
-    throw new Error(`Unable to produce Git diff (exit ${result.code ?? "unknown"}).`);
-  }
-  const redacted = redactSensitiveText(result.stdout);
-  const full = Buffer.from(redacted.text, "utf8");
-  const slice = full.subarray(offset, offset + maxBytes);
-  let text = slice.toString("utf8");
-  let sliceLen = slice.length;
-  if (offset + sliceLen < full.length) {
-    const lastNewline = text.lastIndexOf("\n");
-    if (lastNewline > 0) {
-      text = text.slice(0, lastNewline + 1);
-      sliceLen = Buffer.byteLength(text, "utf8");
-    }
-  }
-  const hasMore = offset + sliceLen < full.length;
-  return {
-    isRepo: true,
-    mode,
-    totalBytes: full.length,
-    offset,
-    returnedBytes: sliceLen,
-    hasMore,
-    nextOffset: hasMore ? offset + sliceLen : null,
-    diff: text,
-    eligibleFileCount: allowedPaths.length,
-    redactedPathCount,
-    redactionCount: redacted.redactionCount,
-    truncatedByFileLimit,
-  };
+  });
+  if (!diff) throw new Error(UNSAFE_GIT_CONFIGURATION_ERROR);
+  return diff;
 }

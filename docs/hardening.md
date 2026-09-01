@@ -31,7 +31,7 @@ provider payload was used during validation.
 | Setup/doctor/Skill could automatically create or restore a public Quick Tunnel | Unannounced external exposure and third-party transport | Local-only default; explicit, mutually exclusive transport flags; doctor never opens a tunnel |
 | Documentation claimed the repository never leaves the machine | Incorrect consent boundary | README, Skill, architecture, and threat model now state that requested MCP output is processed externally |
 | No private official-tunnel authentication mode | Public ingress was the primary path | Added per-workspace fixed-header auth for OpenAI Secure MCP Tunnel, read from a `0600` file on every request |
-| Git inspection inherited user/system/repository behavior | A hostile repo configuration could invoke helpers, start a lazy-fetch transport, or leak extra content | Sanitized environment/config, disabled hooks/fsmonitor/external diff/textconv/pager/lazy fetch, default-denied transport protocols, literal pathspecs, root `.git` requirement, prefiltered diff paths, preflight rejection of executable/network configuration, and execution from a sanitized owner-only temporary control-metadata snapshot |
+| Git inspection inherited user/system/repository behavior | A hostile repo configuration could invoke helpers, start a lazy-fetch transport, or leak extra content | Sanitized environment/config, disabled hooks/fsmonitor/external diff/textconv/pager/lazy fetch, default-denied transport protocols, literal pathspecs, root `.git` requirement, prefiltered diff paths, preflight rejection of executable/network configuration, and execution from a sanitized owner-only temporary control-metadata and verified object-store snapshot; object-store symlink and alternate escapes fail closed |
 | Status recursed into submodule metadata, and `workspace_info` crossed into Git | Submodule helpers could run through `workspace.read`; root config could change between preflight and execution | `workspace_info` contains no Git inspection, every status/info path forces `--ignore-submodules=all`, and status/diff commands do not reuse the mutable root Git config after preflight |
 | Helper discovery trusted arbitrary `PATH` entries | A selected workspace could shadow `git`, `rg`, or `cloudflared` with executable content | Git and Quick Tunnel execution now resolve canonical executables only from fixed system locations; repository-local shims are rejected. Ripgrep discovery is diagnostic only; workspace search no longer launches a path-based subprocess. |
 | Arbitrary `.git` files, symlinks, or object alternates could point outside the selected workspace | Git diff could read blobs from unrelated repository metadata | Reject `.git` symlinks, arbitrary control files, and alternate object stores; allow only embedded metadata or validated Git worktree back-pointers |
@@ -104,9 +104,11 @@ run so this document does not become a stale numeric claim.
   tunnel/provider compromise remain outside the bridge boundary. The
   descriptor-bound reader reduces path-swap exposure but is not a formal
   `openat2`-style guarantee for hostile shared or network filesystems.
-- The sanitized Git snapshot binds executable control metadata, but the
-  selected worktree and original object database remain mutable read-only
-  inputs; this is not an OS sandbox for a compromised Git binary.
+- The selected worktree remains mutable read-only input. Native Git consumes a
+  verified private object-store snapshot whose bounded construction fails
+  closed, but its JavaScript deadline cannot preempt one filesystem syscall on
+  a stalled or hostile shared filesystem, and this is not an OS sandbox for a
+  compromised Git binary.
 - Regex workspace search is intentionally unavailable at this containment
   boundary; use literal search or a separately reviewed local tool outside C2C.
 - Repositories that intentionally require filters, config includes, partial

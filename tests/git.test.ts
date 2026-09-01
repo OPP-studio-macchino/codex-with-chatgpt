@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { gitDiff, gitInfo, gitStatus } from "../src/workspace/git.js";
 import { makeTmpDir, cleanup, write, makeGitRepo, git } from "./helpers.js";
 
@@ -24,6 +26,38 @@ function markerHelper(root: string, name = "git-helper"): { command: string; mar
   );
   const command = [process.execPath, helper, marker].map(commandQuote).join(" ");
   return { command, marker };
+}
+
+function objectPath(root: string, oid: string): string {
+  return path.join(root, ".git", "objects", oid.slice(0, 2), oid.slice(2));
+}
+
+function externalObjectFixture(name: string): { isolated: string; external: string; marker: string; oid: string } {
+  const isolated = makeTmpDir(`${name}-isolated`);
+  const external = makeTmpDir(`${name}-external`);
+  const marker = "workspace-external-object-marker";
+  makeGitRepo(isolated);
+  makeGitRepo(external);
+  for (const root of [isolated, external]) {
+    write(root, "hello.txt", `${marker}\n`);
+    git(root, "add", "hello.txt");
+    git(root, "commit", "-m", "add synthetic object marker");
+  }
+  write(isolated, "hello.txt", "inside workspace change\n");
+  return { isolated, external, marker, oid: git(isolated, "rev-parse", "HEAD:hello.txt").trim() };
+}
+
+function expectObjectStoreFailure(root: string, marker: string): void {
+  const residues = snapshotResidueCount();
+  const status = gitStatus(root);
+  expect(status.isRepo).toBe(false);
+  expect(JSON.stringify(status)).not.toContain(marker);
+  expect(() => gitDiff(root, { mode: "unstaged" })).toThrow();
+  expect(snapshotResidueCount()).toBe(residues);
+}
+
+function snapshotResidueCount(): number {
+  return fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith("c2c-git-snapshot-")).length;
 }
 
 beforeAll(() => {
@@ -228,6 +262,130 @@ describe("gitStatus", () => {
       cleanup(isolated);
     }
   );
+});
+
+describe.skipIf(process.platform === "win32")("Git object-store containment", () => {
+  it("constructs one private object snapshot per gitDiff call", () => {
+    const isolated = makeTmpDir("git-diff-one-snapshot");
+    makeGitRepo(isolated);
+    write(isolated, "hello.txt", "one snapshot\n");
+    const originalMkdtemp = fs.mkdtempSync.bind(fs);
+    let snapshots = 0;
+    vi.spyOn(fs, "mkdtempSync").mockImplementation(((prefix: string) => {
+      if (prefix.endsWith("c2c-git-snapshot-")) snapshots++;
+      return originalMkdtemp(prefix);
+    }) as typeof fs.mkdtempSync);
+
+    expect(gitDiff(isolated, { mode: "unstaged" }).diff).toContain("one snapshot");
+    expect(snapshots).toBe(1);
+    cleanup(isolated);
+  });
+
+  it("fails closed on the monotonic snapshot deadline without residue", () => {
+    const isolated = makeTmpDir("git-object-deadline");
+    makeGitRepo(isolated);
+    write(isolated, "hello.txt", "deadline marker\n");
+    const residues = snapshotResidueCount();
+    const clock = vi.spyOn(performance, "now");
+
+    clock.mockReturnValueOnce(0).mockReturnValue(251);
+    expect(gitStatus(isolated).isRepo).toBe(false);
+    clock.mockReset().mockReturnValueOnce(0).mockReturnValue(251);
+    expect(() => gitDiff(isolated, { mode: "unstaged" })).toThrow(UNSAFE_GIT_CONFIGURATION);
+    expect(snapshotResidueCount()).toBe(residues);
+    cleanup(isolated);
+  });
+
+  it("keeps file and byte caps as fail-closed cleanup backstops", () => {
+    const fileCap = makeTmpDir("git-object-file-cap");
+    makeGitRepo(fileCap);
+    const entries = path.join(fileCap, ".git", "objects", "cap-fixture");
+    fs.mkdirSync(entries);
+    for (let index = 0; index <= 20_000; index++) {
+      fs.closeSync(fs.openSync(path.join(entries, String(index)), "wx"));
+    }
+    const residues = snapshotResidueCount();
+    vi.spyOn(performance, "now").mockReturnValue(0);
+    expect(gitStatus(fileCap).isRepo).toBe(false);
+    expect(snapshotResidueCount()).toBe(residues);
+    cleanup(fileCap);
+    vi.restoreAllMocks();
+
+    const byteCap = makeTmpDir("git-object-byte-cap");
+    makeGitRepo(byteCap);
+    const oversized = path.join(byteCap, ".git", "objects", "oversized");
+    fs.closeSync(fs.openSync(oversized, "wx"));
+    fs.truncateSync(oversized, 512 * 1024 * 1024 + 1);
+    expect(gitStatus(byteCap).isRepo).toBe(false);
+    expect(snapshotResidueCount()).toBe(residues);
+    cleanup(byteCap);
+  }, 30_000);
+
+  it("keeps normal object stores usable and rejects loose-object and fanout symlinks", () => {
+    for (const attack of ["loose", "fanout"] as const) {
+      const { isolated, external, marker, oid } = externalObjectFixture(`git-object-${attack}`);
+      expect(gitStatus(isolated).isRepo).toBe(true);
+      expect(gitDiff(isolated, { mode: "unstaged" }).diff).toContain("inside workspace change");
+
+      const target = attack === "loose" ? objectPath(isolated, oid) : path.dirname(objectPath(isolated, oid));
+      const externalTarget = attack === "loose" ? objectPath(external, oid) : path.dirname(objectPath(external, oid));
+      fs.renameSync(target, `${target}.backup`);
+      fs.symlinkSync(externalTarget, target, attack === "loose" ? "file" : "dir");
+
+      expectObjectStoreFailure(isolated, marker);
+      cleanup(isolated);
+      cleanup(external);
+    }
+  });
+
+  it("rejects symlinked packed object metadata", () => {
+    for (const extension of ["pack", "idx", "rev", "multi-pack-index", "commit-graph"] as const) {
+      const { isolated, external, marker } = externalObjectFixture(`git-packed-${extension}`);
+      git(isolated, "gc", "--prune=now");
+      const packDir = path.join(isolated, ".git", "objects", "pack");
+      if (extension === "rev") {
+        const pack = fs.readdirSync(packDir).find((name) => name.endsWith(".pack"));
+        git(isolated, "index-pack", "--rev-index", path.join(packDir, pack!));
+      } else if (extension === "multi-pack-index") {
+        git(isolated, "multi-pack-index", "write");
+      } else if (extension === "commit-graph") {
+        git(isolated, "commit-graph", "write", "--reachable");
+      }
+      const target = extension === "commit-graph"
+        ? path.join(isolated, ".git", "objects", "info", extension)
+        : extension === "multi-pack-index"
+          ? path.join(packDir, extension)
+          : path.join(packDir, fs.readdirSync(packDir).find((name) => name.endsWith(`.${extension}`))!);
+      expect(fs.existsSync(target)).toBe(true);
+      expect(gitStatus(isolated).isRepo).toBe(true);
+      expect(gitDiff(isolated, { mode: "unstaged" }).diff).toContain("inside workspace change");
+      const externalTarget = path.join(external, ".git", "objects", path.relative(path.join(isolated, ".git", "objects"), target));
+      fs.mkdirSync(path.dirname(externalTarget), { recursive: true });
+      fs.copyFileSync(target, externalTarget);
+      fs.renameSync(target, `${target}.backup`);
+      fs.symlinkSync(externalTarget, target, "file");
+
+      expectObjectStoreFailure(isolated, marker);
+      cleanup(isolated);
+      cleanup(external);
+    }
+  });
+
+  it("rejects an object swap after preflight and before the private snapshot is copied", () => {
+    const { isolated, external, marker, oid } = externalObjectFixture("git-object-race");
+    const target = objectPath(isolated, oid);
+    const originalMkdtemp = fs.mkdtempSync.bind(fs);
+    vi.spyOn(fs, "mkdtempSync").mockImplementation(((prefix: string) => {
+      const snapshot = originalMkdtemp(prefix);
+      fs.renameSync(target, `${target}.backup`);
+      fs.symlinkSync(objectPath(external, oid), target, "file");
+      return snapshot;
+    }) as typeof fs.mkdtempSync);
+
+    expectObjectStoreFailure(isolated, marker);
+    cleanup(isolated);
+    cleanup(external);
+  });
 });
 
 describe("gitDiff pagination", () => {
