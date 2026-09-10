@@ -5,21 +5,23 @@ import { redactAndTruncate } from "../security/redaction.js";
 import { isBuiltinSensitivePath } from "../workspace/ignore.js";
 
 /**
- * Lightweight execution records written by the Codex harness after each
- * iteration (via `c2c record`). ChatGPT reads them through the
- * `execution_summary` and `test_status` MCP tools.
+ * Lightweight execution records written by the Codex harness (`c2c record`)
+ * or the Codex App Server boundary after a terminal turn. ChatGPT reads them
+ * through the `execution_summary` and `test_status` MCP tools.
  */
 export interface ExecutionRecord {
   taskId: string;
   iteration: number;
-  changedFiles: string[] | number;
+  changedFiles: string[] | number | null;
   tests: string | null;
   exitStatus: "ok" | "failed" | "blocked";
+  runId?: string;
   timestamp: string;
   notes?: string;
 }
 
-function sanitizeChangedFiles(value: unknown): string[] | number {
+function sanitizeChangedFiles(value: unknown): string[] | number | null {
+  if (value === null) return null;
   if (Array.isArray(value)) {
     const files = value.slice(0, 50).map((entry) => {
       const candidate = String(entry).replace(/\\/g, "/");
@@ -32,7 +34,7 @@ function sanitizeChangedFiles(value: unknown): string[] | number {
   if (typeof value === "number" && Number.isFinite(value)) {
     return Math.min(100_000, Math.max(0, Math.floor(value)));
   }
-  return 0;
+  return null;
 }
 
 function sanitizeRecord(value: unknown): ExecutionRecord | null {
@@ -64,6 +66,10 @@ function sanitizeRecord(value: unknown): ExecutionRecord | null {
     tests: typeof record.tests === "string" ? redactAndTruncate(record.tests, 500).text : null,
     exitStatus: record.exitStatus,
     timestamp: record.timestamp,
+    runId:
+      typeof record.runId === "string" && /^[a-f0-9]{32}$/.test(record.runId)
+        ? record.runId
+        : undefined,
     notes: typeof record.notes === "string" ? redactAndTruncate(record.notes, 500).text : undefined,
   };
 }
@@ -90,6 +96,9 @@ export function appendExecutionRecord(workspaceId: string, record: ExecutionReco
   }
   if (!["ok", "failed", "blocked"].includes(record.exitStatus)) {
     throw new Error("Invalid execution status.");
+  }
+  if (record.runId !== undefined && !/^[a-f0-9]{32}$/.test(record.runId)) {
+    throw new Error("Invalid execution run id.");
   }
   if (record.timestamp.length > 64 || !Number.isFinite(Date.parse(record.timestamp))) {
     throw new Error("Invalid execution timestamp.");

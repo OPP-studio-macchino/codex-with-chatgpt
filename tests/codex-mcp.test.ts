@@ -126,6 +126,46 @@ describe("Codex MCP execution opt-in", () => {
     });
     const waitBody = JSON.parse((waited.content as { text: string }[])[0].text) as { state: string };
     expect(waitBody.state).toBe("completed");
+
+    const summary = await client.callTool({
+      name: "execution_summary",
+      arguments: { limit: 5 },
+    });
+    const records = JSON.parse((summary.content as { text: string }[])[0].text) as {
+      records: Array<Record<string, unknown>>;
+    };
+    expect(records.records).toEqual([
+      expect.objectContaining({
+        taskId: "mcp-task",
+        iteration: 1,
+        changedFiles: null,
+        tests: null,
+        exitStatus: "ok",
+        runId: startBody.run_id,
+      }),
+    ]);
+
+    const testStatus = await client.callTool({ name: "test_status", arguments: {} });
+    expect(JSON.parse((testStatus.content as { text: string }[])[0].text)).toMatchObject({
+      available: true,
+      taskId: "mcp-task",
+      iteration: 1,
+      tests: null,
+      exitStatus: "ok",
+    });
+
+    await client.callTool({
+      name: "codex_turn_wait",
+      arguments: { task_id: "mcp-task", run_id: startBody.run_id },
+    });
+    const repeatedSummary = await client.callTool({
+      name: "execution_summary",
+      arguments: { limit: 5 },
+    });
+    const repeatedRecords = JSON.parse(
+      (repeatedSummary.content as { text: string }[])[0].text
+    ) as { records: Array<{ runId?: string }> };
+    expect(repeatedRecords.records.filter((record) => record.runId === startBody.run_id)).toHaveLength(1);
   });
 
   it("never grants codex.execute through OAuth", async () => {
