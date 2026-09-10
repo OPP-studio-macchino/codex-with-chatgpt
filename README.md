@@ -24,9 +24,20 @@ The bridge exposes eight bounded, read-only MCP tools:
 - test and execution summaries recorded by Codex.
 
 It does not expose file-write, delete, shell, package-install, commit, push, or
-deployment tools. ChatGPT's suggestions remain advisory; Codex must validate
-them against the user's request, repository instructions, and actual test
-results before acting.
+deployment tools by default. ChatGPT's suggestions remain advisory; Codex must
+validate them against the user's request, repository instructions, and actual
+test results before acting.
+
+An optional Codex execution mode adds exactly `codex_turn_start` and
+`codex_turn_wait`. It is available only when **both** `--openai-secure-tunnel`
+and `--codex-execution` are explicitly selected; OAuth never receives the
+`codex.execute` scope. C2C starts the installed official `codex app-server`
+directly, never through a shell. Task threads are ephemeral, one child admits at
+most eight distinct task threads, and C2C recycles the child only when no turn
+is active. It never sends `thread/delete` for an ephemeral thread. A task whose
+ephemeral context was lost fails closed with `TASK_CONTEXT_EXPIRED` on its next
+iteration, while a retained terminal result for the same task and iteration is
+returned idempotently.
 
 ## The data boundary, plainly stated
 
@@ -91,6 +102,8 @@ for limitations and residual risks.
 - pnpm via Corepack
 - For OpenAI Secure MCP Tunnel: an official `tunnel-client` binary, a
   `tunnel_id`, a runtime API key, and the required Platform/ChatGPT permissions
+- For optional Codex execution: a reviewed installed official Codex CLI/App
+  Server binary (the current compatibility smoke targets Codex `0.151.0`)
 - For the fallback only: `cloudflared`
 
 Do not paste runtime API keys, OAuth tokens, cookies, or generated tunnel-token
@@ -139,6 +152,19 @@ First prepare per-workspace local authentication:
 ```bash
 c2c setup -w /absolute/path/to/workspace --openai-secure-tunnel --json
 ```
+
+To opt into bounded Codex execution for that bridge, add the separate execution
+flag:
+
+```bash
+c2c setup -w /absolute/path/to/workspace \
+  --openai-secure-tunnel --codex-execution --json
+```
+
+Execution turns force `on-request` approval with `approvalsReviewer=user`;
+threads start read-only, while turns use workspace-write with network disabled,
+`/tmp` and `$TMPDIR` excluded, and no extra writable roots. C2C never approves a
+Codex request on the user's behalf.
 
 The JSON response returns `localMcpUrl`, `trustedTunnelHeader`, and
 `trustedTunnelTokenFile`; it never returns the token value. Pass the token to
@@ -233,7 +259,8 @@ Project layout:
 ```text
 src/auth/       OAuth, fixed-header tunnel auth, token storage
 src/bridge/     loopback server, public/admin boundaries, runtime state
-src/mcp/        eight bounded read-only MCP tools
+src/mcp/        eight default read-only tools + two gated Codex execution tools
+src/codex/      official Codex App Server client and bounded child/task lifecycle
 src/workspace/  containment, ignore policy, search, safe Git inspection
 src/security/   outbound credential-shaped value redaction
 src/process/    authenticated daemon discovery and shutdown

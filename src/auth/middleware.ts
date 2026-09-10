@@ -10,6 +10,7 @@ export interface BearerAuthDeps {
   getBaseUrl: (req: Request) => string;
   logger: Logger;
   trustedTunnelTokenFile?: string;
+  trustedTunnelCodexExecution?: boolean;
 }
 
 /**
@@ -27,7 +28,13 @@ export function bearerAuth(deps: BearerAuthDeps) {
       const authInfo: AuthInfo = {
         token: "trusted-tunnel",
         clientId: "openai-secure-tunnel",
-        scopes: ["workspace.read", "workspace.search", "git.read", "execution.read"],
+        scopes: [
+          "workspace.read",
+          "workspace.search",
+          "git.read",
+          "execution.read",
+          ...(deps.trustedTunnelCodexExecution ? ["codex.execute"] : []),
+        ],
       };
       (req as Request & { auth?: AuthInfo }).auth = authInfo;
       next();

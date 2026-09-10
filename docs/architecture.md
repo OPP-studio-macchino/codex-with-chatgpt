@@ -24,13 +24,17 @@ explicit external HTTPS / Cloudflare --> loopback C2C bridge
 
 ChatGPT plans and reviews. Codex retains execution authority and independently
 validates every recommendation. Repository content is untrusted in both layers.
+By default the bridge remains read-only. When the user explicitly selects both
+OpenAI Secure MCP Tunnel and Codex execution, C2C exposes two additional MCP
+tools that drive the installed official `codex app-server` over JSONL stdio.
 
 ## Components
 
 | Module | Responsibility |
 | --- | --- |
 | `bridge/` | Express assembly, loopback-only listener, bounded request handling, minimal public health, protected admin routes, runtime state |
-| `mcp/` | Stateless Streamable HTTP handling and eight read-only tools with per-tool scopes |
+| `mcp/` | Stateless Streamable HTTP handling, eight default read-only tools, and two Codex execution tools gated by `codex.execute` |
+| `codex/` | Direct official App Server child, JSONL validation, policy floor, bounded run/task retention, and child-epoch rollover |
 | `auth/` | OAuth/PKCE flow for external HTTPS mode, hashed token store, and fixed-header auth for OpenAI Secure MCP Tunnel |
 | `pairing/` | One-time code generation, TTL, authorization-request-bound attempt limits, and request-rate limits |
 | `workspace/` | Canonical containment, descriptor-bound file reads, verified directory traversal, deny policy, `.c2cignore`, bounded literal search, hardened Git inspection |
@@ -52,9 +56,12 @@ validates every recommendation. Repository content is untrusted in both layers.
    work associated with the approved tunnel ID.
 4. ChatGPT sends an MCP request through the OpenAI-hosted tunnel endpoint.
 5. `tunnel-client` forwards it to loopback and attaches the local fixed header.
-6. C2C rereads the token file, authenticates the header, assigns four read
-   scopes, then dispatches the bounded MCP tool.
-7. The result returns through the same outbound tunnel path.
+6. C2C rereads the token file and authenticates the header. Normal tunnel mode
+   receives only four read scopes. If and only if the bridge was also started
+   with Codex execution, trusted-tunnel requests additionally receive
+   `codex.execute`; OAuth never receives that scope.
+7. The bounded MCP tool runs and the result returns through the same outbound
+   tunnel path.
 
 The local MCP address is not publicly routable. Source content returned by a
 tool still travels to OpenAI. Deleting the token with `c2c unpair` causes new
@@ -136,8 +143,15 @@ and `workspace_info` does not enter this data path at all.
 - Runtime files hold a private admin token. Stale records are cleared, but their
   PIDs are never signaled without authenticated identity proof.
 - Shutdown is requested through the loopback admin API.
-- Remote transport choice is fixed for a running daemon. Switching modes
-  requires an explicit stop/restart.
+- Remote transport choice and Codex execution mode are fixed for a running
+  daemon. Switching either requires an explicit stop/restart.
+- In execution mode, one App Server child owns at most eight ephemeral task
+  threads. A ninth distinct task is admitted only when no turn is active; C2C
+  then stops the old child, clears task/thread bindings, and starts a new child.
+  Ephemeral threads are never sent `thread/delete`.
+- Child rollover or failure expires old task context. A retained terminal result
+  for the same task/iteration is still idempotently readable; a later iteration
+  for that old task fails closed with `TASK_CONTEXT_EXPIRED`.
 
 ## Deliberately absent automation
 

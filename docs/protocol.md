@@ -1,7 +1,10 @@
 # C2C advisory protocol
 
 Control plane: short structured messages in a user-approved ChatGPT
-conversation. Data plane: bounded, authenticated read-only MCP calls.
+conversation. Data plane: bounded, authenticated read-only MCP calls by
+default. Optional auto-loop execution adds only `codex_turn_start` and
+`codex_turn_wait`, and only on a trusted OpenAI Secure MCP Tunnel bridge started
+with `--codex-execution`.
 
 Keep source bodies, diffs, logs, credentials, personal data, and provider
 payloads out of control messages. This minimizes duplication; it does not keep
@@ -164,8 +167,17 @@ Independently review iteration 4 via git_diff and reply PLAN or DONE.
 
 ## Loop limits
 
-`maxIterations` defaults to 12 and can be configured in `.c2c.json` from 1 to
-100. When reached, Codex pauses and asks the user whether to continue.
+Remote Codex execution is hard-capped at 12 iterations per task. The execution
+tools do not accept a higher iteration value, and configuration cannot raise
+that ceiling. Only one Codex turn may be active at a time. `codex_turn_wait`
+long-polls a retained local run for at most 20 seconds per call; a Codex turn is
+bounded to 20 minutes.
+
+A completed/blocked/failed result for the same `task_id` and iteration is
+idempotently returned while retained. If a child recycle or failure has erased
+an ephemeral task binding, the next iteration fails with
+`TASK_CONTEXT_EXPIRED`; C2C never silently creates a replacement thread for that
+old task.
 
 ## Boot Prompt
 
