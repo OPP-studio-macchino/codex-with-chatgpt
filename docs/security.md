@@ -27,16 +27,20 @@ audit or formal verification.
 
 ## Exposed capabilities
 
-The MCP server registers only eight read-oriented tools: workspace information,
-directory listing, file reading, search, Git status, Git diff, test status, and
-execution summaries. There is no MCP tool for writing or deleting files,
-executing commands, installing packages, committing, pushing, deploying, or
-sending messages.
+By default the MCP server registers only eight read-oriented tools: workspace
+information, directory listing, file reading, search, Git status, Git diff, test
+status, and execution summaries. There is no default MCP tool for writing or
+deleting files, executing commands, installing packages, committing, pushing,
+deploying, or sending messages.
 
-This removes those direct capabilities from the bridge. It does not prevent
-workspace text from influencing ChatGPT's advice, and it does not constrain a
-separate Codex process beyond Codex's own approvals, sandbox, and repository
-instructions.
+Only `--openai-secure-tunnel --codex-execution` adds two execution tools:
+`codex_turn_start` and `codex_turn_wait`. They drive the installed official
+Codex App Server; OAuth cannot receive `codex.execute`. C2C forces remote
+threads to `read-only` and every remote turn to `on-request`,
+`approvalsReviewer=user`, workspace-write with network disabled, `/tmp` and
+`$TMPDIR` excluded, and no extra writable roots. Approval or user-input requests
+block the turn; C2C never auto-approves them. Unknown server requests fail
+closed.
 
 ## Path and content controls
 
@@ -64,9 +68,11 @@ real credentials; redaction is the remaining guard, not a guarantee.
 `c2c setup --openai-secure-tunnel` creates a random, per-workspace token in an
 owner-only file and starts the bridge on loopback. The official `tunnel-client`
 must attach `X-C2C-Tunnel-Token` from that file to both MCP and discovery/probe
-requests. The bridge rereads the file on every request, compares values in
-constant time, and grants only the four read scopes. `c2c unpair` removes the
-file, so subsequent requests fail immediately.
+requests. The bridge rereads the file on every request and compares values in
+constant time. Normal tunnel mode grants only the four read scopes; execution
+mode additionally grants `codex.execute` only to this trusted-tunnel path.
+OAuth never grants that scope. `c2c unpair` removes the file, so subsequent
+requests fail immediately.
 
 This mode is intended to complement OpenAI's tunnel ID, runtime-key, and
 organization/workspace permission controls. C2C never prints the token value.
@@ -113,6 +119,17 @@ Cloudflare Quick Tunnel or a caller-managed HTTPS origin uses C2C's OAuth flow:
 
 A user must still inspect the pairing page. OAuth does not make a mistakenly
 approved malicious redirect safe.
+
+## Codex execution lifecycle
+
+Execution uses ephemeral App Server threads. One child admits at most eight
+distinct task threads and C2C never sends `thread/delete` for an ephemeral
+thread. A ninth task can recycle the child only when no turn is active. Child
+rollover or failure invalidates those task bindings; a later iteration fails
+with `TASK_CONTEXT_EXPIRED` instead of silently creating a new thread. Terminal
+same-iteration results remain idempotently readable while retained. JSONL input,
+instructions, summaries, runs, task-expiry markers, waits, and turn duration are
+bounded, and stale events from an old child epoch are ignored.
 
 ## Network surfaces
 

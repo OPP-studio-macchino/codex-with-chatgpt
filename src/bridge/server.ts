@@ -22,6 +22,7 @@ import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
 import { normalizeExternalBaseUrl } from "../config/transport.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 import { writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
+import { CodexAppServer } from "../codex/app-server.js";
 
 export interface BridgeOptions {
   workspaceRoot: string;
@@ -38,6 +39,10 @@ export interface BridgeOptions {
   externalBaseUrl?: string;
   /** Owner-only token file used by OpenAI Secure MCP Tunnel static headers. */
   trustedTunnelTokenFile?: string;
+  /** Enable the two Codex execution tools; valid only with trusted tunnel auth. */
+  codexExecution?: boolean;
+  /** Optional explicit installed official Codex executable path. */
+  codexBinary?: string;
 }
 
 export interface Bridge {
@@ -95,6 +100,15 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   ) {
     throw new Error("Trusted tunnel token file must use the per-workspace state location.");
   }
+  if (opts.codexExecution && !opts.trustedTunnelTokenFile) {
+    throw new Error("Codex execution requires OpenAI Secure MCP Tunnel authentication.");
+  }
+  if (opts.codexBinary && !opts.codexExecution) {
+    throw new Error("A Codex binary override requires Codex execution mode.");
+  }
+  const codex = opts.codexExecution
+    ? new CodexAppServer({ workspaceRoot: workspace.root, binary: opts.codexBinary, logger })
+    : undefined;
 
   let publicBaseUrl: string | null = null;
   const managedExternalUrl = Boolean(opts.externalBaseUrl);
@@ -141,7 +155,10 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
 
   // ---- MCP endpoint (bearer-protected) --------------------------------------
 
-  const mcpHandler = createMcpHttpHandler(() => createMcpServer({ workspace, logger }), logger);
+  const mcpHandler = createMcpHttpHandler(
+    () => createMcpServer({ workspace, logger, codex }),
+    logger
+  );
   let activeMcpRequests = 0;
   const admitMcpRequest = (_req: Request, res: Response, next: NextFunction): void => {
     if (activeMcpRequests >= 8) {
@@ -167,6 +184,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       getBaseUrl,
       logger,
       trustedTunnelTokenFile: opts.trustedTunnelTokenFile,
+      trustedTunnelCodexExecution: Boolean(opts.codexExecution),
     }),
     admitMcpRequest,
     express.json({ limit: "1mb", strict: true }),
@@ -215,6 +233,8 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       trustedTunnelAuth: Boolean(opts.trustedTunnelTokenFile),
       trustedTunnelTokenPresent:
         Boolean(opts.trustedTunnelTokenFile) && hasValidTrustedTunnelToken(workspace.id),
+      codexExecution: Boolean(opts.codexExecution),
+      codexRuntimeDetected: Boolean(codex),
       pid: process.pid,
       startedAt,
     });
@@ -292,6 +312,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       adminToken,
       publicUrl: managedExternalUrl ? publicBaseUrl : tunnel.getPublicUrl(),
       trustedTunnelAuth: Boolean(opts.trustedTunnelTokenFile),
+      codexExecution: Boolean(opts.codexExecution),
       startedAt,
     };
     writeRuntimeState(state);
@@ -302,6 +323,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const shutdown = async (): Promise<void> => {
     if (closed) return;
     closed = true;
+    await codex?.close().catch(() => undefined);
     await tunnel.stop().catch(() => undefined);
     await new Promise<void>((resolve) => server.close(() => resolve()));
     if (opts.persistRuntime !== false) clearRuntimeState(workspace.id);

@@ -126,13 +126,36 @@ interface AdminInfo {
   pairingActive: boolean;
   trustedTunnelAuth: boolean;
   trustedTunnelTokenPresent: boolean;
+  codexExecution: boolean;
+  codexRuntimeDetected: boolean;
   pid: number;
   startedAt: string;
 }
 
+interface CodexExecutionOptions {
+  openaiSecureTunnel: boolean;
+  codexExecution: boolean;
+  codexBinary?: string;
+}
+
+function assertCodexExecutionOptions(opts: CodexExecutionOptions): void {
+  if (opts.codexExecution && !opts.openaiSecureTunnel) {
+    throw new Error("--codex-execution requires --openai-secure-tunnel.");
+  }
+  if (opts.codexBinary && !opts.codexExecution) {
+    throw new Error("--codex-binary requires --codex-execution.");
+  }
+}
+
 async function ensureBridgeAndTunnel(
   workspaceRoot: string,
-  opts: { cloudflareQuickTunnel: boolean; externalBaseUrl?: string; openaiSecureTunnel: boolean }
+  opts: {
+    cloudflareQuickTunnel: boolean;
+    externalBaseUrl?: string;
+    openaiSecureTunnel: boolean;
+    codexExecution: boolean;
+    codexBinary?: string;
+  }
 ): Promise<{
   runtime: RuntimeState;
   info: AdminInfo;
@@ -140,10 +163,13 @@ async function ensureBridgeAndTunnel(
   localMcpUrl: string;
   trustedTunnelTokenFile: string | null;
 }> {
+  assertCodexExecutionOptions(opts);
   const requestedTransport = selectedTransport(opts);
   const { runtime } = await ensureBridge(workspaceRoot, {
     externalBaseUrl: opts.externalBaseUrl,
     trustedTunnelAuth: opts.openaiSecureTunnel,
+    codexExecution: opts.codexExecution,
+    codexBinary: opts.codexBinary,
   });
   let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
   assertTransportCompatible(info, requestedTransport);
@@ -185,11 +211,15 @@ program
   .option("--port <port>", "preferred port")
   .option("--external-base-url <url>", "managed tunnel HTTPS origin")
   .option("--trusted-tunnel-token-file <path>", "owner-only tunnel token file")
+  .option("--codex-execution", "enable bounded Codex App Server execution", false)
+  .option("--codex-binary <path>", "absolute installed official Codex executable path")
   .action(async (opts: {
     workspace: string;
     port?: string;
     externalBaseUrl?: string;
     trustedTunnelTokenFile?: string;
+    codexExecution: boolean;
+    codexBinary?: string;
   }) => {
     const workspaceRoot = resolveWorkspace(opts.workspace);
     const workspace = new Workspace(workspaceRoot);
@@ -199,6 +229,8 @@ program
       port: opts.port ? parseInt(opts.port, 10) : undefined,
       externalBaseUrl: opts.externalBaseUrl,
       trustedTunnelTokenFile: opts.trustedTunnelTokenFile,
+      codexExecution: opts.codexExecution,
+      codexBinary: opts.codexBinary,
       logger,
     });
     const shutdown = (): void => {
@@ -217,12 +249,16 @@ program
   .option("-w, --workspace <path>", "workspace root (defaults to current directory)")
   .option("--cloudflare-quick-tunnel", "explicitly expose through a temporary public Cloudflare URL", false)
   .option("--openai-secure-tunnel", "prepare local authentication for OpenAI Secure MCP Tunnel", false)
+  .option("--codex-execution", "enable bounded Codex App Server execution", false)
+  .option("--codex-binary <path>", "absolute installed official Codex executable path")
   .option("--external-base-url <url>", "HTTPS origin provided by a managed tunnel")
   .option("--json", "machine-readable output", false)
   .action(async (opts: {
     workspace?: string;
     cloudflareQuickTunnel: boolean;
     openaiSecureTunnel: boolean;
+    codexExecution: boolean;
+    codexBinary?: string;
     externalBaseUrl?: string;
     json: boolean;
   }) => {
@@ -251,6 +287,8 @@ program
             connectorName,
             trustedTunnelHeader: tokenFile ? TRUSTED_TUNNEL_HEADER : null,
             trustedTunnelTokenFile: tokenFile,
+            codexExecution: info.codexExecution,
+            codexRuntimeDetected: info.codexRuntimeDetected,
           })
         );
         return;
@@ -272,12 +310,16 @@ program
   .option("-w, --workspace <path>")
   .option("--cloudflare-quick-tunnel", "explicitly expose through a temporary public Cloudflare URL", false)
   .option("--openai-secure-tunnel", "prepare local authentication for OpenAI Secure MCP Tunnel", false)
+  .option("--codex-execution", "enable bounded Codex App Server execution", false)
+  .option("--codex-binary <path>", "absolute installed official Codex executable path")
   .option("--external-base-url <url>", "HTTPS origin provided by a managed tunnel")
   .option("--json", "machine-readable output", false)
   .action(async (opts: {
     workspace?: string;
     cloudflareQuickTunnel: boolean;
     openaiSecureTunnel: boolean;
+    codexExecution: boolean;
+    codexBinary?: string;
     externalBaseUrl?: string;
     json: boolean;
   }) => {
@@ -323,6 +365,8 @@ program
             pairingExpiresAt: pairingResult?.expiresAt ?? null,
             trustedTunnelHeader: tokenFile ? TRUSTED_TUNNEL_HEADER : null,
             trustedTunnelTokenFile: tokenFile,
+            codexExecution: info.codexExecution,
+            codexRuntimeDetected: info.codexRuntimeDetected,
             sandboxModified: false,
           })
         );
@@ -372,17 +416,22 @@ program
   .option("-w, --workspace <path>")
   .option("--cloudflare-quick-tunnel", "explicitly expose through a temporary public Cloudflare URL", false)
   .option("--openai-secure-tunnel", "prepare local authentication for OpenAI Secure MCP Tunnel", false)
+  .option("--codex-execution", "enable bounded Codex App Server execution", false)
+  .option("--codex-binary <path>", "absolute installed official Codex executable path")
   .option("--external-base-url <url>", "HTTPS origin provided by a managed tunnel")
   .action(async (opts: {
     workspace?: string;
     cloudflareQuickTunnel: boolean;
     openaiSecureTunnel: boolean;
+    codexExecution: boolean;
+    codexBinary?: string;
     externalBaseUrl?: string;
   }) => {
     const root = resolveWorkspace(opts.workspace);
-    // Validate mutually exclusive transport intent before stopping a healthy
-    // process. A malformed restart request must be non-destructive.
+    // Validate transport and execution intent before stopping a healthy process.
+    // A malformed restart request must be non-destructive.
     selectedTransport(opts);
+    assertCodexExecutionOptions(opts);
     await stopBridge(root);
     await new Promise((resolve) => setTimeout(resolve, 500));
     try {

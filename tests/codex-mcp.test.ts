@@ -1,0 +1,163 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { afterEach, describe, expect, it } from "vitest";
+import { startBridge, type Bridge } from "../src/bridge/server.js";
+import { SUPPORTED_SCOPES, filterScopes, invalidScopes } from "../src/auth/store.js";
+import {
+  ensureTrustedTunnelToken,
+  TRUSTED_TUNNEL_HEADER,
+} from "../src/auth/trusted-tunnel.js";
+import { Workspace } from "../src/workspace/manager.js";
+import { cleanup, isolateStateDir, makeGitRepo, makeTmpDir } from "./helpers.js";
+
+const roots: string[] = [];
+const external: string[] = [];
+const bridges: Bridge[] = [];
+const clients: Client[] = [];
+
+afterEach(async () => {
+  for (const client of clients.splice(0)) await client.close().catch(() => undefined);
+  for (const bridge of bridges.splice(0)) await bridge.close().catch(() => undefined);
+  for (const dir of roots.splice(0)) cleanup(dir);
+  for (const dir of external.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+function makeRoot(name: string): string {
+  const root = makeTmpDir(name);
+  roots.push(root);
+  makeGitRepo(root);
+  return root;
+}
+
+function makeFakeCodex(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-mcp-codex-"));
+  external.push(dir);
+  const binary = path.join(dir, "codex-fake.mjs");
+  fs.writeFileSync(binary, `#!/usr/bin/env node
+let buffer=""; let thread=0; let turn=0;
+const send=(v)=>process.stdout.write(JSON.stringify(v)+"\\n");
+process.stdin.setEncoding("utf8");
+process.stdin.on("data",(chunk)=>{ buffer+=chunk; while(buffer.includes("\\n")){
+ const i=buffer.indexOf("\\n"); const line=buffer.slice(0,i); buffer=buffer.slice(i+1); if(!line.trim()) continue;
+ const m=JSON.parse(line); if(m.method==="initialize") send({id:m.id,result:{userAgent:"fake"}});
+ else if(m.method==="thread/start") send({id:m.id,result:{thread:{id:"t"+(++thread)}}});
+ else if(m.method==="turn/start"){ const id="u"+(++turn); send({id:m.id,result:{turn:{id,status:"inProgress",items:[],error:null}}});
+  const item={type:"agentMessage",id:"m1",text:"done"}; send({method:"item/completed",params:{threadId:m.params.threadId,turnId:id,item}});
+  send({method:"turn/completed",params:{threadId:m.params.threadId,turn:{id,status:"completed",items:[item],error:null}}}); }
+ }});
+`, { mode: 0o700 });
+  return binary;
+}
+
+async function connect(
+  bridge: Bridge,
+  headers: Record<string, string>
+): Promise<Client> {
+  const client = new Client({ name: "codex-mcp-test", version: "1" });
+  const transport = new StreamableHTTPClientTransport(
+    new URL(`${bridge.localBaseUrl()}/mcp`),
+    { requestInit: { headers } }
+  );
+  await client.connect(transport);
+  clients.push(client);
+  return client;
+}
+
+function toolNames(tools: { name: string }[]): string[] {
+  return tools.map((tool) => tool.name).sort();
+}
+
+const DEFAULT_TOOLS = [
+  "execution_summary", "git_diff", "git_status", "list_directory",
+  "read_file", "search_workspace", "test_status", "workspace_info",
+].sort();
+
+describe("Codex MCP execution opt-in", () => {
+  it("keeps the default surface at exactly eight tools", async () => {
+    isolateStateDir();
+    const root = makeRoot("codex-mcp-default");
+    const bridge = await startBridge({
+      workspaceRoot: root,
+      port: 0,
+      persistRuntime: false,
+      authStoreFile: path.join(makeTmpDir("auth"), "default.json"),
+    });
+    bridges.push(bridge);
+    const token = bridge.authStore.issueTokens({
+      clientId: "default-client",
+      scopes: ["workspace.read", "workspace.search", "git.read", "execution.read"],
+    }).accessToken;
+    const client = await connect(bridge, { authorization: `Bearer ${token}` });
+    expect(toolNames((await client.listTools()).tools)).toEqual(DEFAULT_TOOLS);
+  });
+
+  it("adds exactly two tools only for trusted tunnel execution", async () => {
+    isolateStateDir();
+    const root = makeRoot("codex-mcp-exec");
+    const workspace = new Workspace(root);
+    const tokenState = ensureTrustedTunnelToken(workspace.id);
+    const token = fs.readFileSync(tokenState.file, "utf8").trim();
+    const bridge = await startBridge({
+      workspaceRoot: root,
+      port: 0,
+      persistRuntime: false,
+      trustedTunnelTokenFile: tokenState.file,
+      codexExecution: true,
+      codexBinary: makeFakeCodex(),
+      authStoreFile: path.join(makeTmpDir("auth"), "exec.json"),
+    });
+    bridges.push(bridge);
+    const client = await connect(bridge, { [TRUSTED_TUNNEL_HEADER]: token });
+    const names = toolNames((await client.listTools()).tools);
+    expect(names).toEqual([...DEFAULT_TOOLS, "codex_turn_start", "codex_turn_wait"].sort());
+
+    const started = await client.callTool({
+      name: "codex_turn_start",
+      arguments: { task_id: "mcp-task", iteration: 1, instruction: "test" },
+    });
+    expect(started.isError ?? false).toBe(false);
+    const startBody = JSON.parse((started.content as { text: string }[])[0].text) as { run_id: string };
+    const waited = await client.callTool({
+      name: "codex_turn_wait",
+      arguments: { task_id: "mcp-task", run_id: startBody.run_id },
+    });
+    const waitBody = JSON.parse((waited.content as { text: string }[])[0].text) as { state: string };
+    expect(waitBody.state).toBe("completed");
+  });
+
+  it("never grants codex.execute through OAuth", async () => {
+    expect(SUPPORTED_SCOPES).not.toContain("codex.execute" as never);
+    expect(filterScopes("workspace.read codex.execute")).toEqual(["workspace.read"]);
+    expect(invalidScopes("workspace.read codex.execute")).toEqual(["codex.execute"]);
+
+    isolateStateDir();
+    const root = makeRoot("codex-mcp-oauth");
+    const workspace = new Workspace(root);
+    const tunnel = ensureTrustedTunnelToken(workspace.id);
+    const bridge = await startBridge({
+      workspaceRoot: root,
+      port: 0,
+      persistRuntime: false,
+      trustedTunnelTokenFile: tunnel.file,
+      codexExecution: true,
+      codexBinary: makeFakeCodex(),
+      authStoreFile: path.join(makeTmpDir("auth"), "oauth.json"),
+    });
+    bridges.push(bridge);
+    const token = bridge.authStore.issueTokens({
+      clientId: "oauth-client",
+      scopes: ["workspace.read", "workspace.search", "git.read", "execution.read"],
+    }).accessToken;
+    const client = await connect(bridge, { authorization: `Bearer ${token}` });
+    expect(toolNames((await client.listTools()).tools)).toContain("codex_turn_start");
+    const denied = await client.callTool({
+      name: "codex_turn_start",
+      arguments: { task_id: "oauth-task", iteration: 1, instruction: "test" },
+    });
+    expect(denied.isError).toBe(true);
+    expect((denied.content as { text: string }[])[0].text).toContain("INSUFFICIENT_SCOPE");
+  });
+});

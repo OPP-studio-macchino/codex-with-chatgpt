@@ -23,6 +23,9 @@ function daemonEnv(): NodeJS.ProcessEnv {
     "USERPROFILE",
     "LOCALAPPDATA",
     "XDG_STATE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "CODEX_HOME",
     "TMPDIR",
     "TMP",
     "TEMP",
@@ -64,8 +67,20 @@ export interface EnsureBridgeResult {
  */
 export async function ensureBridge(
   workspaceRoot: string,
-  opts: { port?: number; externalBaseUrl?: string; trustedTunnelAuth?: boolean } = {}
+  opts: {
+    port?: number;
+    externalBaseUrl?: string;
+    trustedTunnelAuth?: boolean;
+    codexExecution?: boolean;
+    codexBinary?: string;
+  } = {}
 ): Promise<EnsureBridgeResult> {
+  if (opts.codexExecution && !opts.trustedTunnelAuth) {
+    throw new Error("Codex execution requires OpenAI Secure MCP Tunnel mode.");
+  }
+  if (opts.codexBinary && !opts.codexExecution) {
+    throw new Error("A Codex binary override requires Codex execution mode.");
+  }
   const workspace = new Workspace(workspaceRoot);
   const live = await findLiveBridge(workspace.id);
   if (live) {
@@ -80,6 +95,12 @@ export async function ensureBridge(
       Boolean(live.trustedTunnelAuth) !== opts.trustedTunnelAuth
     ) {
       throw new Error("Bridge is already running with a different authentication mode; stop it first.");
+    }
+    if (opts.codexExecution !== undefined && Boolean(live.codexExecution) !== opts.codexExecution) {
+      throw new Error("Bridge is already running with a different Codex execution mode; stop it first.");
+    }
+    if (opts.codexBinary) {
+      throw new Error("Stop the running bridge before supplying a Codex binary override.");
     }
     if (opts.trustedTunnelAuth) ensureTrustedTunnelToken(workspace.id);
     return { runtime: live, spawned: false };
@@ -113,6 +134,8 @@ export async function ensureBridge(
       ...(opts.port ? ["--port", String(opts.port)] : []),
       ...(opts.externalBaseUrl ? ["--external-base-url", opts.externalBaseUrl] : []),
       ...(trustedTunnel ? ["--trusted-tunnel-token-file", trustedTunnel.file] : []),
+      ...(opts.codexExecution ? ["--codex-execution"] : []),
+      ...(opts.codexBinary ? ["--codex-binary", opts.codexBinary] : []),
     ],
     {
       detached: true,

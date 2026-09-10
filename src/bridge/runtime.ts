@@ -18,6 +18,7 @@ export interface RuntimeState {
   adminToken: string;
   publicUrl: string | null;
   trustedTunnelAuth?: boolean;
+  codexExecution?: boolean;
   startedAt: string;
 }
 
@@ -84,6 +85,7 @@ function validateRuntimeState(value: unknown, workspaceId: string): RuntimeState
     !/^c2c_admin_[A-Za-z0-9_-]{32}$/.test(raw.adminToken) ||
     publicUrl === undefined ||
     (raw.trustedTunnelAuth !== undefined && typeof raw.trustedTunnelAuth !== "boolean") ||
+    (raw.codexExecution !== undefined && typeof raw.codexExecution !== "boolean") ||
     typeof raw.startedAt !== "string" ||
     raw.startedAt.length > 64 ||
     !Number.isFinite(Date.parse(raw.startedAt))
@@ -100,6 +102,7 @@ function validateRuntimeState(value: unknown, workspaceId: string): RuntimeState
     adminToken: raw.adminToken,
     publicUrl,
     trustedTunnelAuth: raw.trustedTunnelAuth as boolean | undefined,
+    codexExecution: raw.codexExecution as boolean | undefined,
     startedAt: raw.startedAt,
   };
 }
