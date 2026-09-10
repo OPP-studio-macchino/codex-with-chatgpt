@@ -4,7 +4,11 @@ import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { Workspace, WorkspaceError } from "../workspace/manager.js";
 import { searchWorkspace } from "../workspace/search.js";
 import { gitDiff, gitStatus, type DiffMode } from "../workspace/git.js";
-import { latestExecutionRecord, readExecutionRecords } from "../execution/records.js";
+import {
+  appendExecutionRecord,
+  latestExecutionRecord,
+  readExecutionRecords,
+} from "../execution/records.js";
 import type { Logger } from "../logger/index.js";
 import { PRODUCT_NAME, VERSION } from "../version.js";
 import { CodexAppServer, CodexAppServerError } from "../codex/app-server.js";
@@ -324,7 +328,28 @@ export function createMcpServer(ctx: McpContext): McpServer {
         const denied = requireScope(extra.authInfo, "codex.execute");
         if (denied) return denied;
         try {
-          return ok(await ctx.codex!.wait(args.task_id, args.run_id));
+          const result = await ctx.codex!.wait(args.task_id, args.run_id);
+          if (
+            result.state !== "running" &&
+            !readExecutionRecords(workspace.id, 100).some((record) => record.runId === result.run_id)
+          ) {
+            appendExecutionRecord(workspace.id, {
+              taskId: result.task_id,
+              iteration: result.iteration,
+              changedFiles: null,
+              tests: null,
+              exitStatus:
+                result.state === "completed"
+                  ? "ok"
+                  : result.state === "blocked"
+                    ? "blocked"
+                    : "failed",
+              runId: result.run_id,
+              timestamp: new Date().toISOString(),
+              notes: result.summary ?? result.reason,
+            });
+          }
+          return ok(result);
         } catch (error) {
           return mapError(error, ctx.logger);
         }
