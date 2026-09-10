@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -265,6 +265,16 @@ describe("gitStatus", () => {
 });
 
 describe.skipIf(process.platform === "win32")("Git object-store containment", () => {
+  let snapshotTemp: string;
+
+  beforeEach(() => {
+    // Keep residue assertions independent of other Vitest workers.
+    snapshotTemp = makeTmpDir("git-snapshots");
+    vi.spyOn(os, "tmpdir").mockReturnValue(snapshotTemp);
+  });
+
+  afterEach(() => cleanup(snapshotTemp));
+
   it("constructs one private object snapshot per gitDiff call", () => {
     const isolated = makeTmpDir("git-diff-one-snapshot");
     makeGitRepo(isolated);
@@ -305,11 +315,11 @@ describe.skipIf(process.platform === "win32")("Git object-store containment", ()
       fs.closeSync(fs.openSync(path.join(entries, String(index)), "wx"));
     }
     const residues = snapshotResidueCount();
-    vi.spyOn(performance, "now").mockReturnValue(0);
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
     expect(gitStatus(fileCap).isRepo).toBe(false);
     expect(snapshotResidueCount()).toBe(residues);
     cleanup(fileCap);
-    vi.restoreAllMocks();
+    clock.mockRestore();
 
     const byteCap = makeTmpDir("git-object-byte-cap");
     makeGitRepo(byteCap);
