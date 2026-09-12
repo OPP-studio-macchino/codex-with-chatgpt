@@ -178,9 +178,16 @@ describe("Codex App Server execution boundary", () => {
     const fake = makeFakeBinary();
     const client = makeClient(workspace, fake.binary);
     try {
+      const runIds: string[] = [];
       for (let i = 1; i <= 100; i++) {
-        await completed(client, `bulk-${i}`, 1, `bulk-${i}`);
+        runIds.push((await completed(client, `bulk-${i}`, 1, `bulk-${i}`)).run_id);
       }
+      await expect(client.wait("bulk-1", runIds[0]!)).rejects.toMatchObject({
+        code: "RUN_NOT_FOUND",
+      } satisfies Partial<CodexAppServerError>);
+      await expect(client.wait("bulk-100", runIds.at(-1)!)).resolves.toMatchObject({
+        state: "completed",
+      });
       const threadStarts = readLog(fake.log).filter((entry) => entry.value.method === "thread/start");
       const perPid = new Map<number, number>();
       for (const entry of threadStarts) {
@@ -219,6 +226,45 @@ describe("Codex App Server execution boundary", () => {
       }
     }
   }, 10_000);
+
+  it("records a terminal result once, retries failed writes, and serializes concurrent waits", async () => {
+    const workspace = makeWorkspace();
+    const fake = makeFakeBinary();
+    const client = makeClient(workspace, fake.binary);
+    try {
+      const first = await client.startTurn("record-retry", 1, "ok");
+      let attempts = 0;
+      await expect(
+        client.waitAndRecordTerminalResult("record-retry", first.run_id, () => {
+          attempts++;
+          throw new Error("injected write failure");
+        })
+      ).rejects.toThrow("injected write failure");
+      expect(attempts).toBe(1);
+
+      await client.waitAndRecordTerminalResult("record-retry", first.run_id, () => {
+        attempts++;
+      });
+      await client.waitAndRecordTerminalResult("record-retry", first.run_id, () => {
+        attempts++;
+      });
+      expect(attempts).toBe(2);
+
+      const second = await client.startTurn("record-concurrent", 1, "ok");
+      let writes = 0;
+      const write = async () => {
+        writes++;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      };
+      await Promise.all([
+        client.waitAndRecordTerminalResult("record-concurrent", second.run_id, write),
+        client.waitAndRecordTerminalResult("record-concurrent", second.run_id, write),
+      ]);
+      expect(writes).toBe(1);
+    } finally {
+      await client.close();
+    }
+  });
 
   it("blocks approvals and unknown server requests without auto-response", async () => {
     const workspace = makeWorkspace();
