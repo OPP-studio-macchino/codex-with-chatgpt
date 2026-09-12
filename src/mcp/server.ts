@@ -4,11 +4,7 @@ import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { Workspace, WorkspaceError } from "../workspace/manager.js";
 import { searchWorkspace } from "../workspace/search.js";
 import { gitDiff, gitStatus, type DiffMode } from "../workspace/git.js";
-import {
-  appendExecutionRecord,
-  latestExecutionRecord,
-  readExecutionRecords,
-} from "../execution/records.js";
+import { appendExecutionRecord, readExecutionRecords } from "../execution/records.js";
 import type { Logger } from "../logger/index.js";
 import { PRODUCT_NAME, VERSION } from "../version.js";
 import { CodexAppServer, CodexAppServerError } from "../codex/app-server.js";
@@ -237,25 +233,49 @@ export function createMcpServer(ctx: McpContext): McpServer {
     {
       title: "Test status",
       description:
-        `Summary of the most recent test run reported by the Codex harness. This does NOT run ` +
-        `tests; it reads the latest execution record. ${UNTRUSTED_NOTE}`,
+        `Summary of the most recent explicit test result for the latest task iteration. This does ` +
+        `NOT run tests or treat a test-unreported Codex completion as a test pass. ${UNTRUSTED_NOTE}`,
       inputSchema: {},
       annotations: { readOnlyHint: true },
     },
     async (_args, extra) => {
       const denied = requireScope(extra.authInfo, "execution.read");
       if (denied) return denied;
-      const latest = latestExecutionRecord(workspace.id);
+      const records = readExecutionRecords(workspace.id, 100);
+      const latest = records.at(-1);
       if (!latest) {
         return ok({ available: false, message: "No execution records yet for this workspace." });
       }
+      let latestTest: (typeof records)[number] | undefined;
+      for (let index = records.length - 1; index >= 0; index--) {
+        const candidate = records[index]!;
+        if (
+          candidate.taskId === latest.taskId &&
+          candidate.iteration === latest.iteration &&
+          candidate.tests !== null
+        ) {
+          latestTest = candidate;
+          break;
+        }
+      }
+      if (!latestTest) {
+        return ok({
+          available: false,
+          taskId: latest.taskId,
+          iteration: latest.iteration,
+          tests: null,
+          exitStatus: null,
+          timestamp: latest.timestamp,
+          message: "No explicit test result was reported for the latest task iteration.",
+        });
+      }
       return ok({
         available: true,
-        taskId: latest.taskId,
-        iteration: latest.iteration,
-        tests: latest.tests,
-        exitStatus: latest.exitStatus,
-        timestamp: latest.timestamp,
+        taskId: latestTest.taskId,
+        iteration: latestTest.iteration,
+        tests: latestTest.tests,
+        exitStatus: latestTest.exitStatus,
+        timestamp: latestTest.timestamp,
       });
     }
   );
@@ -312,13 +332,15 @@ export function createMcpServer(ctx: McpContext): McpServer {
       "codex_turn_wait",
       {
         title: "Wait for Codex turn",
-        description: `Long-poll one local Codex run for up to 20 seconds. ${EXECUTION_NOTE}`,
+        description:
+          `Long-poll one local Codex run for up to 20 seconds. When the run is terminal, ` +
+          `persist exactly one execution record after a successful write. ${EXECUTION_NOTE}`,
         inputSchema: {
           task_id: z.string().regex(/^[A-Za-z0-9_.:-]{1,128}$/),
           run_id: z.string().regex(/^[a-f0-9]{32}$/),
         },
         annotations: {
-          readOnlyHint: true,
+          readOnlyHint: false,
           destructiveHint: false,
           idempotentHint: true,
           openWorldHint: false,
@@ -328,27 +350,27 @@ export function createMcpServer(ctx: McpContext): McpServer {
         const denied = requireScope(extra.authInfo, "codex.execute");
         if (denied) return denied;
         try {
-          const result = await ctx.codex!.wait(args.task_id, args.run_id);
-          if (
-            result.state !== "running" &&
-            !readExecutionRecords(workspace.id, 100).some((record) => record.runId === result.run_id)
-          ) {
-            appendExecutionRecord(workspace.id, {
-              taskId: result.task_id,
-              iteration: result.iteration,
-              changedFiles: null,
-              tests: null,
-              exitStatus:
-                result.state === "completed"
-                  ? "ok"
-                  : result.state === "blocked"
-                    ? "blocked"
-                    : "failed",
-              runId: result.run_id,
-              timestamp: new Date().toISOString(),
-              notes: result.summary ?? result.reason,
-            });
-          }
+          const result = await ctx.codex!.waitAndRecordTerminalResult(
+            args.task_id,
+            args.run_id,
+            (terminal) => {
+              appendExecutionRecord(workspace.id, {
+                taskId: terminal.task_id,
+                iteration: terminal.iteration,
+                changedFiles: null,
+                tests: null,
+                exitStatus:
+                  terminal.state === "completed"
+                    ? "ok"
+                    : terminal.state === "blocked"
+                      ? "blocked"
+                      : "failed",
+                runId: terminal.run_id,
+                timestamp: new Date().toISOString(),
+                notes: terminal.summary ?? terminal.reason,
+              });
+            }
+          );
           return ok(result);
         } catch (error) {
           return mapError(error, ctx.logger);

@@ -47,6 +47,8 @@ interface Run extends CodexRunResult {
   timer?: NodeJS.Timeout;
   waiters: Set<() => void>;
   lastAgentMessage?: string;
+  executionRecordWritten?: boolean;
+  executionRecordWrite?: Promise<void>;
 }
 
 interface Task {
@@ -301,6 +303,32 @@ export class CodexAppServer {
       });
     }
     return this.publicResult(run);
+  }
+
+  async waitAndRecordTerminalResult(
+    taskId: string,
+    runId: string,
+    writeRecord: (result: CodexRunResult) => void | Promise<void>
+  ): Promise<CodexRunResult> {
+    const result = await this.wait(taskId, runId);
+    if (result.state === "running") return result;
+    const run = this.runs.get(runId);
+    if (!run || run.task_id !== taskId) {
+      throw new CodexAppServerError("RUN_NOT_FOUND", "No matching local Codex run was found.");
+    }
+    if (run.executionRecordWritten) return result;
+    if (!run.executionRecordWrite) {
+      run.executionRecordWrite = Promise.resolve()
+        .then(() => writeRecord(result))
+        .then(() => {
+          run.executionRecordWritten = true;
+        })
+        .finally(() => {
+          delete run.executionRecordWrite;
+        });
+    }
+    await run.executionRecordWrite;
+    return result;
   }
 
   async close(): Promise<void> {
