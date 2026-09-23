@@ -1,13 +1,13 @@
 # OpenAI submission architecture question draft
 
-Status: **optional exception/support inquiry draft — not sent**
+Status: **sent to OpenAI Support on 2026-09-24; human Plugin/MCP review confirmation pending**
 
-OpenAI's current public documentation now explicitly states that Secure MCP Tunnel alone
-does not support public Plugin submission or distribution; a stable publicly reachable HTTPS
-MCP endpoint is required for the ordinary review path. Keep this draft only if the product
-decision is to ask OpenAI for a local-MCP exception/support path rather than build a public
-HTTPS proxy/service. It contains no account IDs, credentials, tunnel IDs, local paths, or
-private workspace content.
+OpenAI's current public documentation explicitly states that Secure MCP Tunnel alone does
+not support public Plugin submission or distribution; a stable publicly reachable HTTPS MCP
+endpoint is required for the ordinary review path. Because that requirement would materially
+change C2C's per-user local security model, the architecture question was sent through the
+official Help Center support chat before any proxy/service redesign. No account IDs,
+credentials, tunnel IDs, local paths, or private workspace content are recorded here.
 
 ## English draft
 
@@ -63,3 +63,24 @@ endpointと一致しないため、実装を変える前にOpenAIへ次を確認
 - 個別reviewが必要なら、最終submission前にどの窓口を使うか。
 
 回答が得られるまで、公開用の中央multi-tenant MCPへ勝手に設計変更しません。
+
+
+## Support contact status — 2026-09-24
+
+The inquiry was sent through the authenticated OpenAI Help Center support chat. The
+AI-assisted support response confirmed the published guidance:
+
+- Secure MCP Tunnel is not a documented public Plugins Directory distribution path.
+- The ordinary public path requires a stable, publicly reachable HTTPS MCP endpoint.
+- A public HTTPS proxy is the documented option when the underlying MCP must remain private.
+- The documentation does not currently describe a local-MCP exception, trusted-developer
+  path, or Template URL alternative for this use case.
+
+AI-assisted support then asked whether the target is the universal public Plugins Directory
+or private/workspace distribution. The target is the **universal public Plugins Directory**.
+
+A human Plugin submission / MCP review confirmation is still pending. Do not redesign C2C
+into a hosted multi-tenant service based only on the AI-assisted support reply. The next
+support message should request escalation to the relevant human review/local-MCP contact and
+ask for a definitive answer on whether any exception or trusted path exists before a public
+HTTPS proxy is designed.
