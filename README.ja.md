@@ -1,8 +1,9 @@
 # Codex with ChatGPT — hardened fork
 
-ChatGPT に、選択したローカル作業領域を読み取り専用 MCP 経由で参照させ、
-計画やレビューを補助させるためのブリッジです。編集・コマンド実行・テスト・
-最終判断は Codex 側に残ります。
+ChatGPT に、選択したローカル作業領域を MCP 経由で参照させ、計画やレビューを
+補助させるためのブリッジです。基本の workspace lane は読み取り専用です。
+任意の Codex execution / Desktop Agent mutation lane は別scope・明示設定で分離され、
+無制限の shell や任意UI操作を公開しません。
 
 これは [`XiaoDuoYa/codex-with-chatgpt`](https://github.com/XiaoDuoYa/codex-with-chatgpt)
 の commit `2165dea39017d29fef95b85e8054669ad68541e1` を起点にした、
@@ -93,6 +94,26 @@ Tunnels Read + Use、ChatGPT developer mode、および対象 workspace との�
 c2c setup -w /absolute/path/to/workspace --openai-secure-tunnel --json
 ```
 
+bounded Codex execution は明示的な opt-in です。
+
+```bash
+c2c setup -w /absolute/path/to/workspace --openai-secure-tunnel --codex-execution --json
+```
+
+#### 任意の完了サウンド
+
+`C2C_COMPLETION_SOUND_PATH=/absolute/path/to/sound-file` には、存在する絶対パスの
+ローカル通常ファイルを指定できます。macOS では C2C が `/usr/bin/afplay` で再生し、
+追加の依存関係は不要です。Codex の `turn/completed` が成功したときだけ自動でちょうど
+1 回再生し、失敗または blocked の作業では再生しません。再生は best effort であり、
+再生失敗によって成功した作業結果が失敗になることはありません。
+
+trusted C2C Codex-execution 接続とこのサウンドの両方を設定した場合、C2C は
+`completion_notify` も公開します。ChatGPT Web と ChatGPT macOS app には、要求された
+作業が完全に終わった後、最終回答の直前にある最後の C2C tool call として、これを
+ちょうど 1 回呼ぶよう協調的に指示されます。これは協調的な MCP signaling であり、
+ChatGPT のネイティブ UI 完了イベント検出や Accessibility/browser polling ではありません。
+
 JSON の `localMcpUrl`、`trustedTunnelHeader`、`trustedTunnelTokenFile` を使い、
 公式 `tunnel-client` の通常 MCP と discovery の両方へ同じ `file:` 参照を設定します。
 トークン値自体は表示・コピーしません。
@@ -172,8 +193,9 @@ c2c update-check --json                 # 通知だけ。更新は適用しな�
 ## 現在の保証範囲
 
 このフォークはハードニングと自動テストを実施していますが、形式検証や第三者監査は
-未実施です。「読み取り専用」は MCP が編集・実行ツールを提供しないという意味であり、
-ソース開示、prompt injection、依存関係、外部サービスのリスクをゼロにはしません。
+未実施です。基本の workspace lane は読み取り専用ですが、任意の Desktop Agent /
+Codex lane は別scopeとローカル許可の下で限定的な変更を行えます。ソース開示、
+prompt injection、依存関係、外部サービスのリスクがゼロになるわけではありません。
 
 脆弱性報告は [SECURITY.md](SECURITY.md) に従い、資格情報・非公開ソース・個人情報を
 issue へ貼らないでください。

@@ -17,7 +17,7 @@ describe("runtime state validation", () => {
   it("round-trips a bounded owner state record", () => {
     writeRuntimeState({
       service: "c2c-bridge",
-      version: "0.2.0-hardened.1",
+      version: "0.3.0-next.12",
       workspaceId,
       workspaceRoot: "/private/example/workspace",
       pid: 1234,
@@ -35,7 +35,7 @@ describe("runtime state validation", () => {
       runtimeFile(workspaceId),
       JSON.stringify({
         service: "c2c-bridge",
-        version: "0.2.0-hardened.1",
+        version: "0.3.0-next.12",
         workspaceId,
         workspaceRoot: "/private/example/workspace",
         pid: 1234,
@@ -53,7 +53,7 @@ describe("runtime state validation", () => {
       runtimeFile(workspaceId),
       JSON.stringify({
         service: "c2c-bridge",
-        version: "0.2.0-hardened.1",
+        version: "0.3.0-next.12",
         workspaceId,
         workspaceRoot: "/private/example/workspace",
         pid: 1234,

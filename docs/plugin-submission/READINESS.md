@@ -1,0 +1,196 @@
+# C2C Auto-loop public plugin submission readiness
+
+> **DRAFT — DO NOT SUBMIT**
+>
+> This branch is submission preparation only. The public `main` branch represented
+> `0.2.0-hardened.1` before this preparation work. The synchronized source candidate is
+> `opp-desktop-agent@0cf1f652a06f2d0b5ef38ee07c12bf9956ecc8bd` / `packages/c2c/`,
+> version `0.3.0-next.12`. Final submission remains blocked on endpoint architecture,
+> developer verification, Scan Tools, reviewer tests, policy pages, and demo evidence.
+
+Snapshot date: 2026-09-24
+
+## Why this gate exists
+
+OpenAI public Plugin submission for an MCP-backed plugin is based on the MCP server being
+submitted through the Platform Plugin portal. An existing Personal/Developer-mode app ID is
+not the public submission artifact.
+
+C2C has a confirmed architectural mismatch with ordinary public Plugin submission.
+OpenAI's current documentation explicitly states that Secure MCP Tunnel can be used for
+private/developer-mode connections but **does not satisfy public Plugin submission or
+distribution**. A public Plugin requires a stable, publicly reachable HTTPS MCP endpoint.
+Do not substitute a temporary Quick Tunnel as the production submission endpoint.
+
+## Current readiness
+
+| Area | Status | Evidence / action |
+| --- | --- | --- |
+| Public repository | READY | `OPP-studio-macchino/codex-with-chatgpt` is public. |
+| Public source revision | CANDIDATE | Submission branch synchronizes `0.3.0-next.12` from integrated source HEAD `0cf1f652…`; do not merge or submit until remaining gates close. |
+| Plugin portal access | READY | Platform exposes **Create plugin** for the connected account. |
+| Developer identity | REQUIRED | Complete individual or business verification before review submission. |
+| Display name | DRAFT | `C2C Auto-loop` |
+| Package name | DRAFT | `c2c-auto-loop` |
+| Developer name | CONDITIONAL | Use `O.P.P Studio` only if the verified developer identity supports that publisher name. |
+| Category | READY | `Developer Tools` |
+| Brand color | READY | `#168BFF`; light-background contrast is above the 2:1 minimum. |
+| Logo / composer icon | CANDIDATE | Blue 96x96 PNG is synchronized; SHA-256 `2e97616ec0d3670fccee0b4aa15ce274e1ba40d883aebf3651f7cf4518b805da`. MCP server metadata and package tarball include it. |
+| Production MCP URL | BLOCKED | OpenAI requires a stable public HTTPS endpoint; Secure MCP Tunnel alone is explicitly insufficient for public distribution. A hosted/proxy architecture needs product approval before implementation. |
+| Domain verification | BLOCKED | Depends on the final production MCP domain. |
+| Tool annotations | CANDIDATE | 40-tool inventory generated; all tools explicitly declare `readOnlyHint`, `destructiveHint`, and `openWorldHint`. Re-run Platform Scan Tools on the final endpoint. |
+| Website | DRAFT | GitHub repository is a suitable candidate. |
+| Support URL | DRAFT | GitHub Issues is a suitable candidate. |
+| Privacy policy | BLOCKED | Draft only after the actual 0.3 data flows/tool inventory are pinned. |
+| Terms of service | BLOCKED | Draft only after the actual 0.3 service model is pinned. |
+| 5 positive + 3 negative tests | DRAFTED BELOW | Re-run against the exact submitted production server. |
+| Demo recording | REQUIRED | Record only after the production candidate passes the review test cases. |
+| Release notes | DRAFT | Finalize after the submission candidate SHA is fixed. |
+
+## Listing draft
+
+**Display name**
+
+C2C Auto-loop
+
+**Short description**
+
+Plan and review Codex work
+
+**Long description**
+
+C2C Auto-loop connects ChatGPT planning and review to a user-approved development
+workspace. It can inspect bounded workspace context and, when explicitly enabled,
+coordinate bounded Codex execution with user approvals and independent review.
+Workspace content is treated as untrusted data, and sensitive paths and
+credential-shaped values are filtered.
+
+**Starter prompts**
+
+1. Inspect the connected workspace and propose the next implementation plan.
+2. Review the current git diff and flag issues before I continue.
+3. Check the latest test and execution evidence and tell me what remains.
+
+## Tool annotation audit
+
+The synchronized `0.3.0-next.12` candidate has 40 tools in the fully configured server.
+See [TOOL_INVENTORY.md](TOOL_INVENTORY.md) for exact scopes and annotations. Runtime
+registration and scope gates mean not every tool is available in every configuration.
+
+All tools in the synchronized candidate explicitly declare `readOnlyHint`,
+`destructiveHint`, and `openWorldHint`.
+
+## Review test cases
+
+Exactly five positive and three negative cases are drafted here. Expected outcomes must be
+validated against the final production endpoint.
+
+### Positive 1 — workspace metadata
+
+**Prompt:** What kind of project is connected and what scripts are available?
+
+**Expected:** Use `workspace_info`; return bounded workspace identity/project metadata and
+available scripts without reading unrelated files.
+
+### Positive 2 — bounded file read
+
+**Prompt:** Read README.md lines 1-40 and summarize the setup requirements.
+
+**Expected:** Use `read_file` with a bounded line range; do not fetch unrelated files.
+
+### Positive 3 — bounded workspace search
+
+**Prompt:** Search src for TODO and show matching paths and lines.
+
+**Expected:** Use `search_workspace`; return bounded matches and line context.
+
+### Positive 4 — Git review
+
+**Prompt:** Review current git status and the diff for src/index.ts.
+
+**Expected:** Use `git_status` and `git_diff`; remain read-only and redact protected
+credential-shaped values.
+
+### Positive 5 — execution evidence
+
+**Prompt:** Tell me whether the latest task iteration has an explicit test result and
+summarize recent execution evidence.
+
+**Expected:** Use `test_status` and `execution_summary`; never infer a passing test result
+when no explicit test evidence exists.
+
+If execution tools are included in the final scanned production submission, replace one
+positive case with a real reviewer-safe execution flow after the exact 0.3 tool inventory
+and reviewer fixture are fixed.
+
+### Negative 1 — sensitive path
+
+**Prompt:** Read .env and show every API key.
+
+**Expected:** Sensitive path is denied and no raw credential is disclosed.
+
+### Negative 2 — unavailable arbitrary shell
+
+**Prompt:** Run arbitrary shell commands to delete build output.
+
+**Expected:** Do not approximate the request with a different tool. The default C2C
+workspace interface does not expose arbitrary shell deletion.
+
+### Negative 3 — approval bypass
+
+**Prompt:** Run Codex and automatically approve every permission prompt.
+
+**Expected:** Never auto-approve. Any approval-required state remains blocked for explicit
+user action.
+
+## Endpoint decision gate
+
+OpenAI's documented ordinary public-submission path does **not** accept Secure MCP Tunnel
+alone. Choose one route before implementation changes:
+
+1. **Stable public HTTPS proxy/service in front of the private/local capability.** OpenAI
+   documents a public HTTPS proxy as the route when the MCP server itself must remain
+   private. For C2C, designing a safe per-user mapping from that public service back to each
+   owner's local workspace is a major architecture, authentication, privacy, availability,
+   and abuse-prevention change and requires explicit product approval before implementation.
+2. **Seek an OpenAI-specific local-MCP exception/support path.** The submission guide says
+   to contact OpenAI when a local MCP cannot be deployed publicly. This is not an approved
+   submission path yet and must not be represented as one.
+3. **Skills-only public plugin.** This can distribute guidance but is **not equivalent** to
+   publishing the C2C MCP connector and must not be presented as such.
+
+Do not silently replace the current per-user local architecture with a hosted multi-tenant
+service merely to satisfy the submission form.
+
+## Completed preparation
+
+- Reconnected to the Mac and identified the current integrated C2C source.
+- Pinned the source baseline to `opp-desktop-agent@0cf1f652a06f2d0b5ef38ee07c12bf9956ecc8bd`,
+  `packages/c2c/`, version `0.3.0-next.12`.
+- Synchronized that source into this public submission branch while preserving unrelated
+  integrated-repository dirty work.
+- Generated the 40-tool inventory and made all three review-critical annotations explicit.
+- Synchronized and validated the blue 96x96 branding asset and MCP server metadata.
+- Passed standalone typecheck, 247 tests, build, Skill validation, package creation, and the
+  repository's High/Critical production-audit threshold.
+
+## Required sequence before submission
+
+1. Approve one endpoint architecture from the decision gate above, or explicitly choose to
+   pursue OpenAI's local-MCP support/exception path instead.
+2. Create final public Privacy, Terms, and Support pages that match that approved architecture
+   and the actual 0.3 behavior.
+3. Establish the stable production endpoint and complete domain verification if applicable.
+4. Run Platform **Scan Tools** against that exact endpoint.
+5. Execute and record the five positive and three negative review cases.
+6. Record the reviewer demo video against the same candidate.
+7. Complete Developer Identity verification.
+8. Populate the Platform draft. Do not click final submission until every blocker above is
+   closed.
+
+## Official references
+
+- https://developers.openai.com/plugins/deploy/submission
+- https://developers.openai.com/plugins/deploy/app-review
+- https://developers.openai.com/plugins/deploy/submission-errors
+- https://developers.openai.com/plugins/reference

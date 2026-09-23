@@ -35,6 +35,11 @@ function daemonEnv(): NodeJS.ProcessEnv {
     "C2C_STATE_DIR",
     "C2C_LOG_LEVEL",
     "C2C_DISABLE_RG",
+    "C2C_COMPLETION_SOUND_PATH",
+    "C2C_CODEX_MAX_INSTRUCTION_BYTES",
+    "C2C_CODEX_MAX_SUMMARY_BYTES",
+    "C2C_CODEX_MAX_ITERATIONS",
+    "C2C_CODEX_ECONOMY_MODE",
   ];
   for (const key of allowed) {
     if (process.env[key] !== undefined) env[key] = process.env[key];

@@ -1,8 +1,9 @@
 # Codex with ChatGPT — hardened fork
 
-A consent-driven, read-only MCP bridge that lets ChatGPT inspect a selected
-local workspace for optional planning and review while Codex remains the
-execution authority.
+A consent-driven MCP bridge that lets ChatGPT inspect a selected local
+workspace for planning and review while Codex remains the execution authority.
+The base workspace lane is read-only; optional Codex and Desktop Agent mutation
+lanes are separately gated and require explicit local configuration and scopes.
 
 This repository is a security-focused fork of
 [`XiaoDuoYa/codex-with-chatgpt`](https://github.com/XiaoDuoYa/codex-with-chatgpt),
@@ -14,7 +15,7 @@ by OpenAI or Cloudflare.
 
 ## What it does
 
-The bridge exposes eight bounded, read-only MCP tools:
+The base workspace lane exposes eight bounded, read-only MCP tools:
 
 - workspace metadata;
 - directory listing;
@@ -23,10 +24,17 @@ The bridge exposes eight bounded, read-only MCP tools:
 - Git status and diff;
 - test and execution summaries recorded by Codex.
 
-It does not expose file-write, delete, shell, package-install, commit, push, or
-deployment tools by default. ChatGPT's suggestions remain advisory; Codex must
-validate them against the user's request, repository instructions, and actual
-test results before acting.
+When a local Desktop Agent is configured, C2C conditionally registers bounded
+`desktop_*` tools for approved-root file/Git access, fixed process and app
+profiles, local screenshot metadata, and allowlist-bound Accessibility
+read/action flows. These tools are not arbitrary shell or arbitrary UI
+automation: remote callers cannot provide executables, shell text, absolute
+paths, arbitrary PIDs, arbitrary Accessibility actions, or coordinates. Their
+write/action scopes are granted only on the owner-configured Trusted Tunnel;
+OAuth cannot obtain the Desktop Agent scopes.
+
+ChatGPT's suggestions remain advisory; Codex and Desktop Agent enforce their own
+approval, sandbox, allowlist, digest, and local-owner boundaries.
 
 An optional Codex execution mode adds exactly `codex_turn_start` and
 `codex_turn_wait`. It is available only when **both** `--openai-secure-tunnel`
@@ -166,6 +174,34 @@ threads start read-only, while turns use workspace-write with network disabled,
 `/tmp` and `$TMPDIR` excluded, and no extra writable roots. C2C never approves a
 Codex request on the user's behalf.
 
+#### Economy defaults
+
+C2C prepends a compact execution contract only to the first turn of a task,
+then reuses that task's context. Its default local limits are 8 KiB per
+instruction, 8 KiB per summary, and four iterations. Set
+`C2C_CODEX_MAX_INSTRUCTION_BYTES` (1024–16384),
+`C2C_CODEX_MAX_SUMMARY_BYTES` (1024–32768), or
+`C2C_CODEX_MAX_ITERATIONS` (1–12) to adjust each limit. Set
+`C2C_CODEX_ECONOMY_MODE=0` only to omit the first-turn contract. These
+mechanisms reduce repeated context and bound local output; actual token savings
+vary by task.
+
+#### Optional completion sound
+
+Set `C2C_COMPLETION_SOUND_PATH=/absolute/path/to/sound-file` to an existing
+absolute local regular file. On macOS, C2C plays it with `/usr/bin/afplay`; no
+extra dependency is required. A successful Codex `turn/completed` plays it
+automatically exactly once, while failed or blocked work does not. Playback is
+best effort: a playback failure never changes a successful work result into a
+failure.
+
+When both the trusted C2C Codex-execution connection and this sound are
+configured, C2C also advertises `completion_notify`. ChatGPT Web and the
+ChatGPT macOS app are cooperatively instructed to call it exactly once as their
+last C2C tool call, immediately before the final answer and only after the
+requested work is fully complete. This is cooperative MCP signaling, not
+native ChatGPT UI completion-event detection or Accessibility/browser polling.
+
 The JSON response returns `localMcpUrl`, `trustedTunnelHeader`, and
 `trustedTunnelTokenFile`; it never returns the token value. Pass the token to
 the official client by file reference for both MCP and discovery requests:
@@ -259,7 +295,7 @@ Project layout:
 ```text
 src/auth/       OAuth, fixed-header tunnel auth, token storage
 src/bridge/     loopback server, public/admin boundaries, runtime state
-src/mcp/        eight default read-only tools + two gated Codex execution tools
+src/mcp/        eight base read-only tools + conditional Desktop Agent tools + gated Codex execution/notification tools
 src/codex/      official Codex App Server client and bounded child/task lifecycle
 src/workspace/  containment, ignore policy, search, safe Git inspection
 src/security/   outbound credential-shaped value redaction
@@ -278,8 +314,9 @@ private source, personal data, or raw production evidence in a report.
 ## Status and disclaimer
 
 This fork is hardened and tested, not formally verified. It has not received an
-independent third-party security audit. “Read-only” limits available MCP tools;
-it does not make source disclosure risk zero and does not neutralize every
-prompt-injection or supply-chain risk.
+independent third-party security audit. The base workspace lane is read-only;
+optional Desktop Agent and Codex lanes can mutate only through their separately
+gated capabilities. None of these controls make source disclosure, prompt
+injection, local-host compromise, or supply-chain risk zero.
 
 License: [MIT](LICENSE).
