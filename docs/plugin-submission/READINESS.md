@@ -16,9 +16,10 @@ OpenAI public Plugin submission for an MCP-backed plugin is based on the MCP ser
 submitted through the Platform Plugin portal. An existing Personal/Developer-mode app ID is
 not the public submission artifact.
 
-C2C also has an architectural mismatch that must be resolved deliberately: its preferred
-remote model is a per-user local workspace reached through OpenAI Secure MCP Tunnel, while
-the ordinary public Plugin review path expects a stable production HTTPS MCP endpoint.
+C2C has a confirmed architectural mismatch with ordinary public Plugin submission.
+OpenAI's current documentation explicitly states that Secure MCP Tunnel can be used for
+private/developer-mode connections but **does not satisfy public Plugin submission or
+distribution**. A public Plugin requires a stable, publicly reachable HTTPS MCP endpoint.
 Do not substitute a temporary Quick Tunnel as the production submission endpoint.
 
 ## Current readiness
@@ -35,7 +36,7 @@ Do not substitute a temporary Quick Tunnel as the production submission endpoint
 | Category | READY | `Developer Tools` |
 | Brand color | READY | `#168BFF`; light-background contrast is above the 2:1 minimum. |
 | Logo / composer icon | CANDIDATE | Blue 96x96 PNG is synchronized; SHA-256 `2e97616ec0d3670fccee0b4aa15ce274e1ba40d883aebf3651f7cf4518b805da`. MCP server metadata and package tarball include it. |
-| Production MCP URL | BLOCKED | Stable public HTTPS endpoint strategy is not yet approved. |
+| Production MCP URL | BLOCKED | OpenAI requires a stable public HTTPS endpoint; Secure MCP Tunnel alone is explicitly insufficient for public distribution. A hosted/proxy architecture needs product approval before implementation. |
 | Domain verification | BLOCKED | Depends on the final production MCP domain. |
 | Tool annotations | CANDIDATE | 40-tool inventory generated; all tools explicitly declare `readOnlyHint`, `destructiveHint`, and `openWorldHint`. Re-run Platform Scan Tools on the final endpoint. |
 | Website | DRAFT | GitHub repository is a suitable candidate. |
@@ -144,35 +145,48 @@ user action.
 
 ## Endpoint decision gate
 
-Choose one route before implementation changes:
+OpenAI's documented ordinary public-submission path does **not** accept Secure MCP Tunnel
+alone. Choose one route before implementation changes:
 
-1. **Local/tunnel model with OpenAI support/approval.** Preserve the current per-user local
-   workspace architecture and confirm that OpenAI will accept the required local/tunnel
-   distribution model for public review.
-2. **Stable universal public MCP service.** This is a major multi-tenant architecture and
-   privacy/security change and requires explicit product approval before implementation.
+1. **Stable public HTTPS proxy/service in front of the private/local capability.** OpenAI
+   documents a public HTTPS proxy as the route when the MCP server itself must remain
+   private. For C2C, designing a safe per-user mapping from that public service back to each
+   owner's local workspace is a major architecture, authentication, privacy, availability,
+   and abuse-prevention change and requires explicit product approval before implementation.
+2. **Seek an OpenAI-specific local-MCP exception/support path.** The submission guide says
+   to contact OpenAI when a local MCP cannot be deployed publicly. This is not an approved
+   submission path yet and must not be represented as one.
 3. **Skills-only public plugin.** This can distribute guidance but is **not equivalent** to
    publishing the C2C MCP connector and must not be presented as such.
 
-Do not silently migrate C2C from route 1 to route 2.
+Do not silently replace the current per-user local architecture with a hosted multi-tenant
+service merely to satisfy the submission form.
+
+## Completed preparation
+
+- Reconnected to the Mac and identified the current integrated C2C source.
+- Pinned the source baseline to `opp-desktop-agent@0cf1f652a06f2d0b5ef38ee07c12bf9956ecc8bd`,
+  `packages/c2c/`, version `0.3.0-next.12`.
+- Synchronized that source into this public submission branch while preserving unrelated
+  integrated-repository dirty work.
+- Generated the 40-tool inventory and made all three review-critical annotations explicit.
+- Synchronized and validated the blue 96x96 branding asset and MCP server metadata.
+- Passed standalone typecheck, 247 tests, build, Skill validation, package creation, and the
+  repository's High/Critical production-audit threshold.
 
 ## Required sequence before submission
 
-1. Reconnect to the Mac that contains the current 0.3 source tree.
-2. Pin the exact current candidate revision and complete tool inventory.
-3. Synchronize that candidate with the public submission branch without overwriting
-   unrelated work.
-4. Re-audit every MCP tool and explicitly set `readOnlyHint`, `destructiveHint`, and
-   `openWorldHint`.
-5. Create final public Privacy, Terms, and Support pages that match the actual 0.3 behavior.
-6. Approve one endpoint architecture from the decision gate above.
-7. Establish the stable production endpoint and complete domain verification if applicable.
-8. Run Platform **Scan Tools** against that exact endpoint.
-9. Execute and record the five positive and three negative review cases.
-10. Record the reviewer demo video against the same candidate.
-11. Complete Developer Identity verification.
-12. Populate the Platform draft. Do not click final submission until every blocker above is
-    closed.
+1. Approve one endpoint architecture from the decision gate above, or explicitly choose to
+   pursue OpenAI's local-MCP support/exception path instead.
+2. Create final public Privacy, Terms, and Support pages that match that approved architecture
+   and the actual 0.3 behavior.
+3. Establish the stable production endpoint and complete domain verification if applicable.
+4. Run Platform **Scan Tools** against that exact endpoint.
+5. Execute and record the five positive and three negative review cases.
+6. Record the reviewer demo video against the same candidate.
+7. Complete Developer Identity verification.
+8. Populate the Platform draft. Do not click final submission until every blocker above is
+   closed.
 
 ## Official references
 

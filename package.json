@@ -1,7 +1,7 @@
 {
   "name": "codex-with-chatgpt",
   "version": "0.3.0-next.12",
-  "description": "A consent-driven, read-only MCP bridge between ChatGPT planning and Codex execution.",
+  "description": "A consent-driven MCP bridge for bounded workspace inspection and separately gated Codex and Desktop Agent actions.",
   "type": "module",
   "license": "MIT",
   "repository": {

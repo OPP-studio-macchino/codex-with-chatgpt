@@ -1,10 +1,13 @@
 # OpenAI submission architecture question draft
 
-Status: **draft only — not sent**
+Status: **optional exception/support inquiry draft — not sent**
 
-This note prepares the architecture question that must be resolved before C2C Auto-loop can
-be submitted as a public MCP-backed Plugin. It contains no account IDs, credentials, tunnel
-IDs, local paths, or private workspace content.
+OpenAI's current public documentation now explicitly states that Secure MCP Tunnel alone
+does not support public Plugin submission or distribution; a stable publicly reachable HTTPS
+MCP endpoint is required for the ordinary review path. Keep this draft only if the product
+decision is to ask OpenAI for a local-MCP exception/support path rather than build a public
+HTTPS proxy/service. It contains no account IDs, credentials, tunnel IDs, local paths, or
+private workspace content.
 
 ## English draft
 
