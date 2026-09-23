@@ -34,7 +34,7 @@ Do not substitute a temporary Quick Tunnel as the production submission endpoint
 | Developer name | CONDITIONAL | Use `O.P.P Studio` only if the verified developer identity supports that publisher name. |
 | Category | READY | `Developer Tools` |
 | Brand color | READY | `#168BFF`; light-background contrast is above the 2:1 minimum. |
-| Logo / composer icon | LOCAL CANDIDATE | Existing square 96x96 assets must be synchronized with the final source package. |
+| Logo / composer icon | CANDIDATE | Blue 96x96 PNG is synchronized; SHA-256 `2e97616ec0d3670fccee0b4aa15ce274e1ba40d883aebf3651f7cf4518b805da`. MCP server metadata and package tarball include it. |
 | Production MCP URL | BLOCKED | Stable public HTTPS endpoint strategy is not yet approved. |
 | Domain verification | BLOCKED | Depends on the final production MCP domain. |
 | Tool annotations | CANDIDATE | 40-tool inventory generated; all tools explicitly declare `readOnlyHint`, `destructiveHint`, and `openWorldHint`. Re-run Platform Scan Tools on the final endpoint. |

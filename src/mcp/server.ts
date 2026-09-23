@@ -9,6 +9,7 @@ import type { Logger } from "../logger/index.js";
 import { PRODUCT_NAME, VERSION } from "../version.js";
 import { CodexAppServer, CodexAppServerError } from "../codex/app-server.js";
 import type { CompletionNotifier } from "../notifications/local-sound.js";
+import { SERVER_INFO_ICONS } from "../branding.js";
 import {
   DesktopAgentError,
   type DesktopAgent,
@@ -78,7 +79,13 @@ export interface McpContext {
 export function createMcpServer(ctx: McpContext): McpServer {
   const { workspace } = ctx;
   const server = new McpServer(
-    { name: PRODUCT_NAME, version: VERSION },
+    {
+      name: PRODUCT_NAME,
+      version: VERSION,
+      title: "C2C Auto-loop",
+      description: "A consent-driven MCP bridge for bounded workspace inspection and approved Codex execution.",
+      icons: SERVER_INFO_ICONS,
+    },
     {
       capabilities: { tools: {} },
       instructions: [
