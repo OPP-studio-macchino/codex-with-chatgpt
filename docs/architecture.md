@@ -12,7 +12,8 @@ Codex -------------------------> local workspace
   v
 ChatGPT
   |
-  | read-only MCP calls
+  | bounded MCP calls
+  | (base read-only; optional gated mutation lanes)
   v
 OpenAI Secure MCP Tunnel  --preferred--> tunnel-client --> loopback C2C bridge
         or
@@ -24,16 +25,20 @@ explicit external HTTPS / Cloudflare --> loopback C2C bridge
 
 ChatGPT plans and reviews. Codex retains execution authority and independently
 validates every recommendation. Repository content is untrusted in both layers.
-By default the bridge remains read-only. When the user explicitly selects both
-OpenAI Secure MCP Tunnel and Codex execution, C2C exposes two additional MCP
-tools that drive the installed official `codex app-server` over JSONL stdio.
+The base workspace lane remains read-only. When a local Desktop Agent is
+configured, C2C conditionally registers bounded `desktop_*` tools; mutation
+scopes are granted only through the owner-configured Trusted Tunnel and remain
+subject to Desktop Agent allowlists, digest checks and local approval boundaries.
+When the user explicitly selects both OpenAI Secure MCP Tunnel and Codex
+execution, C2C also exposes two tools that drive the installed official
+`codex app-server` over JSONL stdio.
 
 ## Components
 
 | Module | Responsibility |
 | --- | --- |
 | `bridge/` | Express assembly, loopback-only listener, bounded request handling, minimal public health, protected admin routes, runtime state |
-| `mcp/` | Stateless Streamable HTTP handling, eight default read-only tools, and two Codex execution tools gated by `codex.execute` |
+| `mcp/` | Stateless Streamable HTTP handling, eight base read-only tools, conditional Desktop Agent tools with separate scopes, and Codex execution/notification tools gated by `codex.execute` |
 | `codex/` | Direct official App Server child, JSONL validation, policy floor, bounded run/task retention, and child-epoch rollover |
 | `auth/` | OAuth/PKCE flow for external HTTPS mode, hashed token store, and fixed-header auth for OpenAI Secure MCP Tunnel |
 | `pairing/` | One-time code generation, TTL, authorization-request-bound attempt limits, and request-rate limits |

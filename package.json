@@ -1,6 +1,6 @@
 {
   "name": "codex-with-chatgpt",
-  "version": "0.2.0-hardened.1",
+  "version": "0.3.0-next.12",
   "description": "A consent-driven, read-only MCP bridge between ChatGPT planning and Codex execution.",
   "type": "module",
   "license": "MIT",

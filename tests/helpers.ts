@@ -6,12 +6,20 @@ import { fileURLToPath } from "node:url";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
+function testTmpRoot(): string {
+  const configured = process.env.C2C_TEST_TMP_ROOT;
+  const root = configured ? path.resolve(configured) : path.join(projectRoot, ".tooling", "test-tmp");
+  fs.mkdirSync(root, { recursive: true });
+  return fs.realpathSync.native(root);
+}
+
 /**
- * Temp dirs live inside the repo (.tooling/test-tmp) so tests also run in
- * sandboxed environments where the system temp dir is not writable.
+ * Temp dirs default to the repo (.tooling/test-tmp) for sandbox compatibility.
+ * C2C_TEST_TMP_ROOT may point tests at another writable filesystem when the
+ * workspace itself adds metadata sidecars (for example macOS AppleDouble).
  */
 export function makeTmpDir(name: string): string {
-  const dir = path.join(projectRoot, ".tooling", "test-tmp", `${name}-${randomBytes(4).toString("hex")}`);
+  const dir = path.join(testTmpRoot(), `${name}-${randomBytes(4).toString("hex")}`);
   fs.mkdirSync(dir, { recursive: true });
   return fs.realpathSync.native(dir);
 }

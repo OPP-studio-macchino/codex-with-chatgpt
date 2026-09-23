@@ -2,10 +2,11 @@
 
 > **DRAFT — DO NOT SUBMIT**
 >
-> This branch is submission preparation only. The public `main` branch currently represents
-> `0.2.0-hardened.1`, while a newer local/live C2C candidate was observed as
-> `0.3.0-next.1`. The newer implementation must be synchronized, pinned to an exact
-> source revision, and re-audited before any public Plugin submission.
+> This branch is submission preparation only. The public `main` branch represented
+> `0.2.0-hardened.1` before this preparation work. The synchronized source candidate is
+> `opp-desktop-agent@0cf1f652a06f2d0b5ef38ee07c12bf9956ecc8bd` / `packages/c2c/`,
+> version `0.3.0-next.12`. Final submission remains blocked on endpoint architecture,
+> developer verification, Scan Tools, reviewer tests, policy pages, and demo evidence.
 
 Snapshot date: 2026-09-24
 
@@ -25,7 +26,7 @@ Do not substitute a temporary Quick Tunnel as the production submission endpoint
 | Area | Status | Evidence / action |
 | --- | --- | --- |
 | Public repository | READY | `OPP-studio-macchino/codex-with-chatgpt` is public. |
-| Public source revision | BLOCKED | Public `main` is `0.2.0-hardened.1`; synchronize the current 0.3 candidate first. |
+| Public source revision | CANDIDATE | Submission branch synchronizes `0.3.0-next.12` from integrated source HEAD `0cf1f652…`; do not merge or submit until remaining gates close. |
 | Plugin portal access | READY | Platform exposes **Create plugin** for the connected account. |
 | Developer identity | REQUIRED | Complete individual or business verification before review submission. |
 | Display name | DRAFT | `C2C Auto-loop` |
@@ -36,7 +37,7 @@ Do not substitute a temporary Quick Tunnel as the production submission endpoint
 | Logo / composer icon | LOCAL CANDIDATE | Existing square 96x96 assets must be synchronized with the final source package. |
 | Production MCP URL | BLOCKED | Stable public HTTPS endpoint strategy is not yet approved. |
 | Domain verification | BLOCKED | Depends on the final production MCP domain. |
-| Tool annotations | PARTIAL | Public 0.2 main must not be treated as the 0.3 final tool inventory. |
+| Tool annotations | CANDIDATE | 40-tool inventory generated; all tools explicitly declare `readOnlyHint`, `destructiveHint`, and `openWorldHint`. Re-run Platform Scan Tools on the final endpoint. |
 | Website | DRAFT | GitHub repository is a suitable candidate. |
 | Support URL | DRAFT | GitHub Issues is a suitable candidate. |
 | Privacy policy | BLOCKED | Draft only after the actual 0.3 data flows/tool inventory are pinned. |
@@ -69,27 +70,14 @@ credential-shaped values are filtered.
 2. Review the current git diff and flag issues before I continue.
 3. Check the latest test and execution evidence and tell me what remains.
 
-## Tool annotation audit — public 0.2 main reference only
+## Tool annotation audit
 
-The table below is **not** the final submission inventory. Rebuild it from the synchronized
-0.3 candidate before Scan Tools.
+The synchronized `0.3.0-next.12` candidate has 40 tools in the fully configured server.
+See [TOOL_INVENTORY.md](TOOL_INVENTORY.md) for exact scopes and annotations. Runtime
+registration and scope gates mean not every tool is available in every configuration.
 
-| Tool | readOnlyHint | destructiveHint | openWorldHint | Rationale |
-| --- | --- | --- | --- | --- |
-| `workspace_info` | true | false | false | Reads bounded metadata from the selected workspace. |
-| `list_directory` | true | false | false | Lists bounded paths in the selected workspace. |
-| `read_file` | true | false | false | Reads bounded text from the selected workspace. |
-| `search_workspace` | true | false | false | Searches bounded workspace content; no external network action. |
-| `git_status` | true | false | false | Reads local repository status only. |
-| `git_diff` | true | false | false | Reads local repository diffs only. |
-| `test_status` | true | false | false | Reads persisted test evidence; does not run tests. |
-| `execution_summary` | true | false | false | Reads persisted execution evidence. |
-| `codex_turn_start` | false | true | false | Can initiate a bounded Codex turn that may modify the approved workspace; network is disabled. |
-| `codex_turn_wait` | false | false | false | Waits for a local run and may persist one execution record; it does not itself perform an open-world action. |
-
-Public 0.2 main currently supplies only `readOnlyHint: true` on the eight default read
-tools. The final submitted server must explicitly supply all required submission
-annotations for every tool in the **actual** candidate inventory.
+All tools in the synchronized candidate explicitly declare `readOnlyHint`,
+`destructiveHint`, and `openWorldHint`.
 
 ## Review test cases
 

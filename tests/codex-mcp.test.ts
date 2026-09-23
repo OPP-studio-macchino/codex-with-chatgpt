@@ -188,6 +188,34 @@ describe("Codex MCP execution opt-in", () => {
     expect(repeatedRecords.records.filter((record) => record.runId === startBody.run_id)).toHaveLength(1);
   });
 
+  it("lets the trusted tunnel request a configured completion notification", async () => {
+    isolateStateDir();
+    const root = makeRoot("codex-mcp-notify");
+    const workspace = new Workspace(root);
+    const tokenState = ensureTrustedTunnelToken(workspace.id);
+    const token = fs.readFileSync(tokenState.file, "utf8").trim();
+    let notifications = 0;
+    const bridge = await startBridge({
+      workspaceRoot: root,
+      port: 0,
+      persistRuntime: false,
+      trustedTunnelTokenFile: tokenState.file,
+      codexExecution: true,
+      codexBinary: makeFakeCodex(),
+      completionNotifier: () => { notifications++; },
+      authStoreFile: path.join(makeTmpDir("auth"), "notify.json"),
+    });
+    bridges.push(bridge);
+    const client = await connect(bridge, { [TRUSTED_TUNNEL_HEADER]: token });
+    expect(toolNames((await client.listTools()).tools)).toEqual(
+      [...DEFAULT_TOOLS, "codex_turn_start", "codex_turn_wait", "completion_notify"].sort()
+    );
+    const result = await client.callTool({ name: "completion_notify", arguments: {} });
+    expect(result.isError ?? false).toBe(false);
+    expect(JSON.parse((result.content as { text: string }[])[0].text)).toEqual({ notification: "requested" });
+    expect(notifications).toBe(1);
+  });
+
   it("does not re-record a retained run after its record rotates out", async () => {
     const { bridge, client } = await makeExecutionBridge("codex-mcp-rotation");
     const started = await client.callTool({
@@ -328,6 +356,7 @@ describe("Codex MCP execution opt-in", () => {
     const root = makeRoot("codex-mcp-oauth");
     const workspace = new Workspace(root);
     const tunnel = ensureTrustedTunnelToken(workspace.id);
+    let notifications = 0;
     const bridge = await startBridge({
       workspaceRoot: root,
       port: 0,
@@ -335,6 +364,7 @@ describe("Codex MCP execution opt-in", () => {
       trustedTunnelTokenFile: tunnel.file,
       codexExecution: true,
       codexBinary: makeFakeCodex(),
+      completionNotifier: () => { notifications++; },
       authStoreFile: path.join(makeTmpDir("auth"), "oauth.json"),
     });
     bridges.push(bridge);
@@ -343,12 +373,18 @@ describe("Codex MCP execution opt-in", () => {
       scopes: ["workspace.read", "workspace.search", "git.read", "execution.read"],
     }).accessToken;
     const client = await connect(bridge, { authorization: `Bearer ${token}` });
-    expect(toolNames((await client.listTools()).tools)).toContain("codex_turn_start");
+    expect(toolNames((await client.listTools()).tools)).toEqual(
+      [...DEFAULT_TOOLS, "codex_turn_start", "codex_turn_wait", "completion_notify"].sort()
+    );
     const denied = await client.callTool({
       name: "codex_turn_start",
       arguments: { task_id: "oauth-task", iteration: 1, instruction: "test" },
     });
     expect(denied.isError).toBe(true);
     expect((denied.content as { text: string }[])[0].text).toContain("INSUFFICIENT_SCOPE");
+    const notifyDenied = await client.callTool({ name: "completion_notify", arguments: {} });
+    expect(notifyDenied.isError).toBe(true);
+    expect((notifyDenied.content as { text: string }[])[0].text).toContain("INSUFFICIENT_SCOPE");
+    expect(notifications).toBe(0);
   });
 });

@@ -4,14 +4,17 @@ import fs from "node:fs";
 import path from "node:path";
 import { redactAndTruncate } from "../security/redaction.js";
 import type { Logger } from "../logger/index.js";
+import type { CompletionNotifier } from "../notifications/local-sound.js";
 
 const REQUEST_TIMEOUT_MS = 10_000;
 const TURN_TIMEOUT_MS = 20 * 60_000;
 const WAIT_TIMEOUT_MS = 20_000;
 const CHILD_STOP_TIMEOUT_MS = 1_000;
 const MAX_LINE_BYTES = 10 * 1024 * 1024;
-const MAX_INSTRUCTION_BYTES = 16 * 1024;
-const MAX_SUMMARY_BYTES = 32 * 1024;
+const DEFAULT_MAX_INSTRUCTION_BYTES = 8 * 1024;
+const DEFAULT_MAX_SUMMARY_BYTES = 8 * 1024;
+const DEFAULT_MAX_ITERATIONS = 4;
+const MAX_ITERATIONS = 12;
 const MAX_THREADS_PER_CHILD = 8;
 const MAX_RUNS = 96;
 const MAX_EXPIRED_TASKS = 96;
@@ -30,6 +33,40 @@ const USER_INPUT_METHODS = new Set([
 
 type JsonObject = Record<string, unknown>;
 export type CodexRunState = "running" | "completed" | "blocked" | "failed";
+
+const ECONOMY_CONTRACT =
+  "Execution contract: inspect only relevant paths; reuse settled context; no subagents unless explicitly requested; narrow-to-broad validation; compact closeout.";
+
+interface CodexLimits {
+  maxInstructionBytes: number;
+  maxSummaryBytes: number;
+  maxIterations: number;
+  economyMode: boolean;
+}
+
+function envInteger(name: string, fallback: number, min: number, max: number): number | null {
+  const value = process.env[name];
+  if (value === undefined || value === "") return fallback;
+  if (!/^\d+$/.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= min && parsed <= max ? parsed : null;
+}
+
+function readLimits(logger: Logger): CodexLimits {
+  const instruction = envInteger("C2C_CODEX_MAX_INSTRUCTION_BYTES", DEFAULT_MAX_INSTRUCTION_BYTES, 1024, 16 * 1024);
+  const summary = envInteger("C2C_CODEX_MAX_SUMMARY_BYTES", DEFAULT_MAX_SUMMARY_BYTES, 1024, 32 * 1024);
+  const iterations = envInteger("C2C_CODEX_MAX_ITERATIONS", DEFAULT_MAX_ITERATIONS, 1, MAX_ITERATIONS);
+  const economy = process.env.C2C_CODEX_ECONOMY_MODE;
+  if (instruction === null || summary === null || iterations === null || (economy !== undefined && economy !== "0" && economy !== "1")) {
+    logger.warn("Invalid C2C Codex economy configuration; safe defaults applied.");
+  }
+  return {
+    maxInstructionBytes: instruction ?? DEFAULT_MAX_INSTRUCTION_BYTES,
+    maxSummaryBytes: summary ?? DEFAULT_MAX_SUMMARY_BYTES,
+    maxIterations: iterations ?? DEFAULT_MAX_ITERATIONS,
+    economyMode: economy !== "0",
+  };
+}
 
 export interface CodexRunResult {
   task_id: string;
@@ -67,6 +104,7 @@ export interface CodexAppServerOptions {
   workspaceRoot: string;
   binary?: string;
   logger: Logger;
+  completionNotifier?: CompletionNotifier;
 }
 
 export class CodexAppServerError extends Error {
@@ -174,20 +212,32 @@ export class CodexAppServer {
   private active: Run | null = null;
   private starting = false;
   private closed = false;
+  private readonly limits: CodexLimits;
 
   constructor(private readonly opts: CodexAppServerOptions) {
     this.binary = resolveCodexBinary(opts.workspaceRoot, opts.binary);
+    this.limits = readLimits(opts.logger);
   }
 
   async startTurn(taskId: string, iteration: number, instruction: string): Promise<CodexRunResult> {
     if (!/^[A-Za-z0-9_.:-]{1,128}$/.test(taskId)) {
       throw new CodexAppServerError("INVALID_TASK_ID", "task_id has an invalid format.");
     }
-    if (!Number.isInteger(iteration) || iteration < 1 || iteration > 12) {
-      throw new CodexAppServerError("INVALID_ITERATION", "iteration must be an integer from 1 to 12.");
+    if (!Number.isInteger(iteration) || iteration < 1 || iteration > this.limits.maxIterations) {
+      throw new CodexAppServerError(
+        "INVALID_ITERATION",
+        `iteration must be an integer from 1 to ${this.limits.maxIterations}.`
+      );
     }
-    if (!instruction || Buffer.byteLength(instruction, "utf8") > MAX_INSTRUCTION_BYTES) {
-      throw new CodexAppServerError("INVALID_INSTRUCTION", "instruction must be 1 to 16384 UTF-8 bytes.");
+    const newTask = !this.tasks.has(taskId);
+    const turnInstruction = newTask && this.limits.economyMode
+      ? `${ECONOMY_CONTRACT}\n\n${instruction}`
+      : instruction;
+    if (!instruction || Buffer.byteLength(turnInstruction, "utf8") > this.limits.maxInstructionBytes) {
+      throw new CodexAppServerError(
+        "INVALID_INSTRUCTION",
+        `instruction exceeds the local ${this.limits.maxInstructionBytes}-byte limit.`
+      );
     }
 
     const retained = [...this.runs.values()].find(
@@ -250,7 +300,11 @@ export class CodexAppServer {
       try {
         const response = await this.request("turn/start", {
           threadId: currentTask.threadId,
-          input: [{ type: "text", text: instruction, text_elements: [] }],
+          input: [{
+            type: "text",
+            text: turnInstruction,
+            text_elements: [],
+          }],
           cwd: this.opts.workspaceRoot,
           approvalPolicy: "on-request",
           approvalsReviewer: "user",
@@ -559,7 +613,12 @@ export class CodexAppServer {
     run.state = state;
     if (reason) run.reason = reason;
     if (state === "completed") {
-      run.summary = redactAndTruncate(run.lastAgentMessage ?? "", MAX_SUMMARY_BYTES).text;
+      run.summary = redactAndTruncate(run.lastAgentMessage ?? "", this.limits.maxSummaryBytes).text;
+      try {
+        this.opts.completionNotifier?.();
+      } catch {
+        this.opts.logger.warn("Completion notification failed.");
+      }
     }
     if (this.active === run) this.active = null;
     for (const waiter of run.waiters) waiter();

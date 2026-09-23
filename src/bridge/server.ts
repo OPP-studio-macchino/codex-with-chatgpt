@@ -23,6 +23,8 @@ import { normalizeExternalBaseUrl } from "../config/transport.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 import { writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
 import { CodexAppServer } from "../codex/app-server.js";
+import { createLocalSoundNotifier, type CompletionNotifier } from "../notifications/local-sound.js";
+import type { DesktopAgent } from "../desktop/client.js";
 
 export interface BridgeOptions {
   workspaceRoot: string;
@@ -43,6 +45,10 @@ export interface BridgeOptions {
   codexExecution?: boolean;
   /** Optional explicit installed official Codex executable path. */
   codexBinary?: string;
+  /** Test-only injection; production uses C2C_COMPLETION_SOUND_PATH. */
+  completionNotifier?: CompletionNotifier;
+  /** Optional Desktop Agent injection. Undefined auto-detects the installed local agent; null disables it. */
+  desktopAgent?: DesktopAgent | null;
 }
 
 export interface Bridge {
@@ -85,6 +91,11 @@ function listen(app: express.Express, host: string, preferredPort: number): Prom
 export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const logger = opts.logger ?? nullLogger;
   const workspace = new Workspace(opts.workspaceRoot);
+  const completionNotifier = opts.completionNotifier ?? createLocalSoundNotifier({
+    soundPath: process.env.C2C_COMPLETION_SOUND_PATH,
+    logger,
+  });
+  const desktopAgent = opts.desktopAgent ?? undefined;
   const host = opts.host ?? DEFAULT_HOST;
   if (host !== "127.0.0.1" && host !== "::1" && host !== "localhost") {
     throw new Error("The bridge only binds to loopback addresses. Public exposure goes through the tunnel.");
@@ -107,7 +118,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     throw new Error("A Codex binary override requires Codex execution mode.");
   }
   const codex = opts.codexExecution
-    ? new CodexAppServer({ workspaceRoot: workspace.root, binary: opts.codexBinary, logger })
+    ? new CodexAppServer({ workspaceRoot: workspace.root, binary: opts.codexBinary, logger, completionNotifier })
     : undefined;
 
   let publicBaseUrl: string | null = null;
@@ -156,7 +167,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   // ---- MCP endpoint (bearer-protected) --------------------------------------
 
   const mcpHandler = createMcpHttpHandler(
-    () => createMcpServer({ workspace, logger, codex }),
+    () => createMcpServer({ workspace, logger, codex, completionNotifier, desktopAgent }),
     logger
   );
   let activeMcpRequests = 0;
@@ -185,6 +196,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       logger,
       trustedTunnelTokenFile: opts.trustedTunnelTokenFile,
       trustedTunnelCodexExecution: Boolean(opts.codexExecution),
+      trustedTunnelDesktopAccess: Boolean(desktopAgent),
     }),
     admitMcpRequest,
     express.json({ limit: "1mb", strict: true }),

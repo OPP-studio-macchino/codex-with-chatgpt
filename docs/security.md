@@ -27,11 +27,19 @@ audit or formal verification.
 
 ## Exposed capabilities
 
-By default the MCP server registers only eight read-oriented tools: workspace
+The base workspace lane registers eight read-oriented tools: workspace
 information, directory listing, file reading, search, Git status, Git diff, test
-status, and execution summaries. There is no default MCP tool for writing or
-deleting files, executing commands, installing packages, committing, pushing,
-deploying, or sending messages.
+status, and execution summaries. That lane has no workspace write/delete,
+arbitrary shell, package-install, commit, push, deploy, or message-send tool.
+
+When `ctx.desktopAgent` is configured, C2C conditionally registers bounded
+Desktop Agent tools. Approved-root writes/removes, fixed process/app profiles,
+local screenshot capture/removal, and allowlist-bound Accessibility actions use
+separate `desktop.*` scopes. Those scopes are granted only when the owner
+Trusted Tunnel is configured for Desktop Agent access; OAuth does not obtain
+them. Remote callers cannot provide shell text, executables, arbitrary PIDs,
+absolute target paths, arbitrary Accessibility actions, coordinates, text entry,
+or mouse/keyboard injection.
 
 Only `--openai-secure-tunnel --codex-execution` adds two execution tools:
 `codex_turn_start` and `codex_turn_wait`. They drive the installed official

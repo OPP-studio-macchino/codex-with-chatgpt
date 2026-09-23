@@ -1,7 +1,8 @@
 # Codex with ChatGPT — 加固分支
 
-这是一个需要明确授权的只读 MCP 桥：ChatGPT 可以按需检查指定的本地工作区，
-辅助规划和审查；Codex 仍负责执行、测试和最终判断。
+这是一个需要明确授权的 MCP 桥：基础工作区通道为只读，ChatGPT 可按需检查指定
+的本地工作区以辅助规划和审查。可选的 Codex execution 与 Desktop Agent mutation
+通道使用独立 scope 和本地授权，不提供任意 shell 或任意 UI 自动化。
 
 本仓库基于
 [`XiaoDuoYa/codex-with-chatgpt`](https://github.com/XiaoDuoYa/codex-with-chatgpt)
@@ -86,6 +87,24 @@ ChatGPT 权限彼此独立。
 c2c setup -w /absolute/path/to/workspace --openai-secure-tunnel --json
 ```
 
+受限的 Codex execution 需要显式 opt-in。
+
+```bash
+c2c setup -w /absolute/path/to/workspace --openai-secure-tunnel --codex-execution --json
+```
+
+#### 可选完成提示音
+
+可设置 `C2C_COMPLETION_SOUND_PATH=/absolute/path/to/sound-file`，其值必须是存在的绝对
+本地普通文件路径。在 macOS 上，C2C 使用 `/usr/bin/afplay` 播放，无需额外依赖。仅当
+Codex 的 `turn/completed` 成功时自动恰好播放一次；失败或 blocked 的工作不会播放。
+播放为尽力而为：播放失败绝不会将成功的工作结果变为失败。
+
+同时配置受信任的 C2C Codex-execution 连接和该提示音时，C2C 还会公开
+`completion_notify`。ChatGPT Web 和 ChatGPT macOS app 会被协作性地指示：仅在请求的
+工作完全完成后、最终回答之前，将其作为最后一次 C2C tool call 恰好调用一次。这是协作式
+MCP 信号，不是原生 ChatGPT UI 完成事件检测，也不是 Accessibility/browser polling。
+
 JSON 会返回 `localMcpUrl`、`trustedTunnelHeader` 和
 `trustedTunnelTokenFile`，不会返回令牌值。为普通 MCP 与 discovery 请求同时配置
 `file:` 引用：
@@ -155,9 +174,9 @@ c2c update-check --json                 # 只提示，不安装
 
 ## 状态与免责声明
 
-本分支经过加固和自动测试，但未做形式化验证，也没有独立第三方安全审计。“只读”表示
-MCP 不提供写入或执行工具，不代表源码泄露、prompt injection、依赖供应链和外部服务
-风险为零。
+本分支经过加固和自动测试，但未做形式化验证，也没有独立第三方安全审计。基础工作区
+通道为只读；可选 Desktop Agent / Codex 通道仅在独立 scope 和本地授权下执行有限变更。
+这些控制并不意味着源码泄露、prompt injection、主机或供应链风险为零。
 
 报告安全问题请遵循 [SECURITY.md](SECURITY.md)，不要在 issue 中放入真实凭据、私有
 源码、个人信息或原始生产证据。

@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .tooling/
+.local/
 .pnpm-store/
 *.log
 .DS_Store
