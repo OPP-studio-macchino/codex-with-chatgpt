@@ -1,5 +1,7 @@
 name: Preview release
 
+# This publication entry is intentionally limited to the explicitly approved preview.
+# No default-branch merge, local deployment or credential configuration is performed.
 on:
   push:
     branches: [feat/product-ux-no-mention-20260930]
@@ -12,8 +14,49 @@ concurrency:
   group: preview-dev6-publication
   cancel-in-progress: false
 
+env:
+  PREVIEW_VERSION: 0.4.0-dev.6
+  PREVIEW_TAG: v0.4.0-dev.6
+
 jobs:
-  prepare-security-lock:
+  validate:
+    if: github.repository == 'OPP-studio-macchino/codex-with-chatgpt' && github.ref == 'refs/heads/feat/product-ux-no-mention-20260930'
+    name: Preview Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 10.34.5
+          run_install: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - name: Install exact committed dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Production dependency audit - no known findings allowed
+        run: pnpm audit --prod --audit-level=low
+      - name: Typecheck, full regression suite, build and consent validation
+        run: |
+          set -euo pipefail
+          test "$(node -p "require('./package.json').version")" = "$PREVIEW_VERSION"
+          pnpm typecheck
+          pnpm test
+          pnpm build
+          pnpm validate:skill
+          test "$(node bin/c2c.js --version)" = "$PREVIEW_VERSION"
+          git diff --exit-code
+
+  publish:
+    needs: validate
     if: github.repository == 'OPP-studio-macchino/codex-with-chatgpt' && github.ref == 'refs/heads/feat/product-ux-no-mention-20260930'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -23,6 +66,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
         with:
           version: 10.34.5
@@ -30,45 +74,103 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 24
-      - name: Limit repair to the reviewed candidate and three affected packages
+      - name: Build the already validated commit without dependency lifecycle scripts
         run: |
           set -euo pipefail
           git merge-base --is-ancestor c6633c1714411279405f038642a2e03f2d304829 HEAD
-          test "$(node -p "require('./package.json').version")" = '0.4.0-dev.6'
-          test -z "$(git tag --list v0.4.0-dev.6)"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(node -p "require('./package.json').version")" = "$PREVIEW_VERSION"
+          pnpm install --frozen-lockfile --ignore-scripts
+          pnpm build
+          pnpm validate:skill
+          mkdir release-output
+          pnpm audit --prod --json > release-output/production-audit.json
+          git diff --exit-code
+      - name: Package only public tracked source, built JavaScript and evidence summaries
+        run: |
           python3 - <<'PY'
           from pathlib import Path
-          p = Path('pnpm-workspace.yaml')
-          text = p.read_text()
-          assert 'overrides:' not in text, 'Inspect existing overrides rather than replace them'
-          text += "\n# Patched transitive versions from the production audit; keep existing supply-chain controls.\noverrides:\n  'fast-uri@>=3.0.0 <3.1.8': 3.1.8\n  'qs@>=6.0.0 <6.16.0': 6.16.0\n  'ip-address@>=10.0.0 <10.7.1': 10.7.1\n"
-          p.write_text(text)
-          PY
-          pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile
-          pnpm audit --prod --json > /tmp/c2c-production-audit.json
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-          report = json.loads(Path('/tmp/c2c-production-audit.json').read_text())
+          import gzip, hashlib, io, json, os, subprocess, tarfile
+          root = Path.cwd()
+          out = root / 'release-output'
+          version = os.environ['PREVIEW_VERSION']
+          commit = os.environ['GITHUB_SHA']
+          report = json.loads((out / 'production-audit.json').read_text())
           counts = report['metadata']['vulnerabilities']
           assert not any(counts.values()), counts
-          print('Production audit:', counts)
+          entries = {}
+          modes = {}
+          raw = subprocess.check_output(['git', 'ls-tree', '-rz', 'HEAD']).split(b'\0')
+          for row in raw:
+              if not row:
+                  continue
+              header, name = row.split(b'\t', 1)
+              name = name.decode()
+              mode = header.split()[0]
+              assert mode in (b'100644', b'100755'), name
+              path = Path(name)
+              assert not path.is_absolute() and '..' not in path.parts
+              assert not any(p in {'.git', '.local', '.tooling', 'node_modules', 'release-output'} for p in path.parts), name
+              assert not path.name.startswith('._') and name != 'assets/completion-sound.wav', name
+              entries[name] = (root / path).read_bytes()
+              modes[name] = 0o755 if mode == b'100755' else 0o644
+          for path in (root / 'dist').rglob('*'):
+              if path.is_file():
+                  assert not path.is_symlink() and not path.name.startswith('._'), path
+                  entries[str(path.relative_to(root))] = path.read_bytes()
+          digest = lambda data: hashlib.sha256(data).hexdigest()
+          manifest = {
+              'version': version, 'tag': os.environ['PREVIEW_TAG'], 'commit': commit,
+              'sourceTree': subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip(),
+              'prerelease': True, 'liveApplied': False, 'mainMerged': False,
+              'validation': {'nodeVersions': [20, 22, 24], 'productionAudit': counts,
+                             'typecheck': True, 'fullTests': True, 'build': True, 'skill': True},
+              'files': {name: digest(data) for name, data in sorted(entries.items())},
+              'containsOwnerConfiguration': False, 'containsDependencies': False, 'containsPersonalAudio': False,
+          }
+          manifest_bytes = (json.dumps(manifest, indent=2) + '\n').encode()
+          (out / 'release-build.json').write_bytes(manifest_bytes)
+          entries['release-build.json'] = manifest_bytes
+          entries['production-audit.json'] = (out / 'production-audit.json').read_bytes()
+          archive = out / ('c2c-auto-loop-' + version + '.tar.gz')
+          stamp = int(subprocess.check_output(['git', 'show', '-s', '--format=%ct', 'HEAD'], text=True))
+          with archive.open('wb') as raw:
+              with gzip.GzipFile(filename='', fileobj=raw, mode='wb', mtime=stamp) as compressed:
+                  with tarfile.open(fileobj=compressed, mode='w') as bundle:
+                      for name, data in sorted(entries.items()):
+                          info = tarfile.TarInfo('c2c-auto-loop-' + version + '/' + name)
+                          info.size = len(data)
+                          info.mode = modes.get(name, 0o644)
+                          info.mtime = stamp
+                          info.uid = info.gid = 0
+                          info.uname = info.gname = ''
+                          bundle.addfile(info, io.BytesIO(data))
+          artifacts = [archive, out / 'release-build.json', out / 'production-audit.json']
+          (out / 'SHA256SUMS').write_text(''.join(digest(p.read_bytes()) + '  ' + p.name + '\n' for p in artifacts))
+          notes = (root / 'docs/releases/v0.4.0-dev.6.md').read_text()
+          notes += '\n## Final published validation\n\nCommit: `' + commit + '`\n\n'
+          notes += 'The committed lockfile includes fast-uri 3.1.8, qs 6.16.0 and ip-address 10.7.1 security updates.\n'
+          notes += 'Production dependency audit: **zero reported vulnerabilities** at publication.\n'
+          notes += 'Node 20, 22 and 24 passed typecheck, the full test suite, build and Skill validation on this exact commit.\n'
+          notes += 'Workflow: ' + os.environ['GITHUB_SERVER_URL'] + '/' + os.environ['GITHUB_REPOSITORY'] + '/actions/runs/' + os.environ['GITHUB_RUN_ID'] + '\n'
+          notes += '\nThe author\'s Mac checkout and running bridge are not automatically updated by this publication.\n'
+          (out / 'NOTES.md').write_text(notes)
+          print('ARTIFACT_SHA256=' + digest(archive.read_bytes()))
+          print('PRODUCTION_AUDIT=' + json.dumps(counts))
           PY
-      - name: Commit only the reviewed dependency configuration and lock
+      - name: Publish exact tag as a prerelease without overwriting any existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          git diff --exit-code -- package.json src tests scripts
-          python3 - <<'PY'
-          import subprocess
-          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
-          assert changed == {'pnpm-workspace.yaml', 'pnpm-lock.yaml'}, changed
-          PY
-          git diff --check
-          git fetch origin feat/product-ux-no-mention-20260930
-          test "$(git rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -- pnpm-workspace.yaml pnpm-lock.yaml
-          git commit -m 'fix: update vulnerable transitive packages before dev.6 release'
-          git push origin HEAD:refs/heads/feat/product-ux-no-mention-20260930
-          echo 'Dependency lock repaired; full validation and publication are a separate gated step.' >> "$GITHUB_STEP_SUMMARY"
+          REPO='OPP-studio-macchino/codex-with-chatgpt'
+          test "$(gh api "repos/$REPO/branches/feat/product-ux-no-mention-20260930" --jq '.commit.sha')" = "$GITHUB_SHA"
+          if gh api "repos/$REPO/git/ref/tags/$PREVIEW_TAG" >/dev/null 2>&1; then
+            echo 'Tag already exists. Refusing to replace or silently reuse it.' >&2
+            exit 1
+          fi
+          TAG_OBJECT=$(gh api --method POST "repos/$REPO/git/tags" -f tag="$PREVIEW_TAG" -f message='C2C audit refactor technical preview; validated on Node 20/22/24; no live rollout' -f object="$GITHUB_SHA" -f type=commit --jq '.sha')
+          gh api --method POST "repos/$REPO/git/refs" -f ref="refs/tags/$PREVIEW_TAG" -f sha="$TAG_OBJECT" >/dev/null
+          gh release create "$PREVIEW_TAG" release-output/c2c-auto-loop-0.4.0-dev.6.tar.gz release-output/SHA256SUMS release-output/release-build.json release-output/production-audit.json --repo "$REPO" --target "$GITHUB_SHA" --verify-tag --prerelease --latest=false --title 'C2C Auto-loop 0.4.0-dev.6 — Audit refactor preview' --notes-file release-output/NOTES.md
+          gh api "repos/$REPO/releases/tags/$PREVIEW_TAG" --jq '{tag_name,prerelease,draft,html_url,assets:[.assets[].name]}'
+          echo "Published $PREVIEW_TAG from $GITHUB_SHA as a prerelease. No local service was changed." >> "$GITHUB_STEP_SUMMARY"
