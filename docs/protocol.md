@@ -14,6 +14,22 @@ ChatGPT's `PLAN` and `DONE` states are advisory. Codex remains responsible for
 checking the plan against user intent and repository rules, executing approved
 work, and validating the result with local evidence.
 
+Remote approvals fail closed unless they match the owner's narrow network
+exception. A selected workspace profile may contain `codexNetworkHosts` with
+exact public DNS names. When Codex emits
+`item/commandExecution/requestApproval` with a matching
+`networkApprovalContext` over HTTPS, C2C may answer `accept` for that
+destination-scoped request only, up to three times in one turn. Command/cwd
+presentation metadata does not broaden that grant. Session-wide acceptance,
+network-policy persistence, HTTP, wildcard/IP/local targets, bundled filesystem
+permission requests, and all unrelated approval methods remain BLOCKED.
+If the installed Codex build emits a generic command approval without
+`networkApprovalContext`, C2C does not guess that the command is
+network-only. For owner-approved image acquisition, ChatGPT can call
+`network_fetch_image` through the trusted tunnel instead; that bounded tool
+does one in-memory HTTPS image GET to the selected profile's exact allowlist
+without granting the Codex shell broader authority.
+
 ## States
 
 ```
@@ -170,8 +186,8 @@ Independently review iteration 4 via git_diff and reply PLAN or DONE.
 Remote Codex execution is hard-capped at 12 iterations per task. The execution
 tools do not accept a higher iteration value, and configuration cannot raise
 that ceiling. Only one Codex turn may be active at a time. `codex_turn_wait`
-long-polls a retained local run for at most 20 seconds per call; a Codex turn is
-bounded to 20 minutes.
+short-polls a retained local run for 1 second by default, configurable from
+250 ms up to a hard maximum of 3 seconds; a Codex turn is bounded to 20 minutes.
 
 A completed/blocked/failed result for the same `task_id` and iteration is
 idempotently returned while retained. If a child recycle or failure has erased

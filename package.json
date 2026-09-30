@@ -1,7 +1,7 @@
 {
   "name": "codex-with-chatgpt",
-  "version": "0.2.0-hardened.1",
-  "description": "A consent-driven, read-only MCP bridge between ChatGPT planning and Codex execution.",
+  "version": "0.4.0-dev.6",
+  "description": "Consent-driven local development bridge: bounded Codex execution, workspace binding and recoverable task history.",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -26,7 +26,14 @@
     "README.zh-CN.md",
     "SECURITY.md",
     "scripts/validate-skill.mjs",
-    "LICENSE"
+    "scripts/wait-for-bridge-and-connect.py",
+    "LICENSE",
+    "scripts/check-startup-consistency.py",
+    "scripts/prepare-startup-bundle.py",
+    "assets/icon.png",
+    "assets/README.md",
+    "src/",
+    "pnpm-lock.yaml"
   ],
   "engines": {
     "node": ">=20"

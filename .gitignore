@@ -9,3 +9,7 @@ dist/
 .env.*
 !.env.example
 coverage/
+
+# Owner-specific state, release work area and personal completion audio
+.local/
+assets/completion-sound.wav

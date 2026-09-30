@@ -11,6 +11,7 @@ export interface BearerAuthDeps {
   logger: Logger;
   trustedTunnelTokenFile?: string;
   trustedTunnelCodexExecution?: boolean;
+  trustedTunnelDesktopAccess?: boolean;
 }
 
 /**
@@ -34,6 +35,17 @@ export function bearerAuth(deps: BearerAuthDeps) {
           "git.read",
           "execution.read",
           ...(deps.trustedTunnelCodexExecution ? ["codex.execute"] : []),
+          ...(deps.trustedTunnelDesktopAccess
+            ? [
+                "desktop.read",
+                "desktop.write",
+                "desktop.process",
+                "desktop.app",
+                "desktop.screen",
+                "desktop.accessibility.read",
+                "desktop.accessibility.action",
+              ]
+            : []),
         ],
       };
       (req as Request & { auth?: AuthInfo }).auth = authInfo;

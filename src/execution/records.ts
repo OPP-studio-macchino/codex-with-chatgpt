@@ -109,6 +109,14 @@ export function appendExecutionRecord(workspaceId: string, record: ExecutionReco
   writeSecureText(file, [...existing, safeRecord].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
 }
 
+/** Idempotent projection into the legacy bounded history; journal is authoritative. */
+export function appendExecutionRecordOnce(workspaceId: string, record: ExecutionRecord): void {
+  if (record.runId && readExecutionRecords(workspaceId, 100).some(existing =>
+    existing.runId === record.runId && existing.taskId === record.taskId && existing.iteration === record.iteration
+  )) return;
+  appendExecutionRecord(workspaceId, record);
+}
+
 export function readExecutionRecords(workspaceId: string, limit = 10): ExecutionRecord[] {
   const file = recordsFile(workspaceId);
   if (!fs.existsSync(file)) return [];

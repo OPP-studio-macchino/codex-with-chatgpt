@@ -46,6 +46,9 @@ process.stdin.on("data",(chunk)=>{ buffer+=chunk; while(buffer.includes("\\n")){
  const m=JSON.parse(line); if(m.method==="initialize") send({id:m.id,result:{userAgent:"fake"}});
  else if(m.method==="thread/start") send({id:m.id,result:{thread:{id:"t"+(++thread)}}});
  else if(m.method==="turn/start"){ const id="u"+(++turn); send({id:m.id,result:{turn:{id,status:"inProgress",items:[],error:null}}});
+  const text=m.params.input?.[0]?.text ?? "";
+  if(text.endsWith("APPROVAL")){ send({id:"approval-1",method:"item/commandExecution/requestApproval",params:{}}); continue; }
+  if(text.endsWith("EXIT")) process.exit(0);
   const item={type:"agentMessage",id:"m1",text:"done"}; send({method:"item/completed",params:{threadId:m.params.threadId,turnId:id,item}});
   send({method:"turn/completed",params:{threadId:m.params.threadId,turn:{id,status:"completed",items:[item],error:null}}}); }
  }});
@@ -114,7 +117,7 @@ describe("Codex MCP execution opt-in", () => {
     expect(toolNames((await client.listTools()).tools)).toEqual(DEFAULT_TOOLS);
   });
 
-  it("adds exactly two tools only for trusted tunnel execution", async () => {
+  it("adds the two execution tools and two read-only recovery tools with execution opt-in", async () => {
     isolateStateDir();
     const root = makeRoot("codex-mcp-exec");
     const workspace = new Workspace(root);
@@ -132,7 +135,7 @@ describe("Codex MCP execution opt-in", () => {
     bridges.push(bridge);
     const client = await connect(bridge, { [TRUSTED_TUNNEL_HEADER]: token });
     const names = toolNames((await client.listTools()).tools);
-    expect(names).toEqual([...DEFAULT_TOOLS, "codex_turn_start", "codex_turn_wait"].sort());
+    expect(names).toEqual([...DEFAULT_TOOLS, "codex_turn_start", "codex_turn_wait", "task_status", "task_resume_context", "task_reconcile_start", "task_reconcile_status"].sort());
 
     const started = await client.callTool({
       name: "codex_turn_start",
@@ -186,6 +189,55 @@ describe("Codex MCP execution opt-in", () => {
       (repeatedSummary.content as { text: string }[])[0].text
     ) as { records: Array<{ runId?: string }> };
     expect(repeatedRecords.records.filter((record) => record.runId === startBody.run_id)).toHaveLength(1);
+  });
+
+  it("notifies only on explicit completion_notify, never on turns or repeated polling", async () => {
+    isolateStateDir();
+    const root = makeRoot("codex-mcp-notify");
+    const workspace = new Workspace(root);
+    const tokenState = ensureTrustedTunnelToken(workspace.id);
+    const token = fs.readFileSync(tokenState.file, "utf8").trim();
+    let notifications = 0;
+    const bridge = await startBridge({
+      workspaceRoot: root,
+      port: 0,
+      persistRuntime: false,
+      trustedTunnelTokenFile: tokenState.file,
+      codexExecution: true,
+      codexBinary: makeFakeCodex(),
+      completionNotifier: () => { notifications++; },
+      authStoreFile: path.join(makeTmpDir("auth"), "notify.json"),
+    });
+    bridges.push(bridge);
+    const client = await connect(bridge, { [TRUSTED_TUNNEL_HEADER]: token });
+    expect(toolNames((await client.listTools()).tools)).toEqual(
+      [...DEFAULT_TOOLS, "codex_turn_start", "codex_turn_wait", "task_status", "task_resume_context", "task_reconcile_start", "task_reconcile_status", "completion_notify"].sort()
+    );
+    for (const [taskId, instruction, state] of [
+      ["notify-complete", "ok", "completed"],
+      ["notify-blocked", "APPROVAL", "blocked"],
+      ["notify-failed", "EXIT", "failed"],
+    ]) {
+      const started = await client.callTool({
+        name: "codex_turn_start",
+        arguments: { task_id: taskId, iteration: 1, instruction },
+      });
+      expect(started.isError ?? false).toBe(false);
+      const { run_id } = JSON.parse((started.content as { text: string }[])[0].text) as { run_id: string };
+      for (let poll = 0; poll < 2; poll++) {
+        const waited = await client.callTool({
+          name: "codex_turn_wait",
+          arguments: { task_id: taskId, run_id },
+        });
+        expect(waited.isError ?? false).toBe(false);
+        expect(JSON.parse((waited.content as { text: string }[])[0].text).state).toBe(state);
+        expect(notifications).toBe(0);
+      }
+    }
+    const result = await client.callTool({ name: "completion_notify", arguments: {} });
+    expect(result.isError ?? false).toBe(false);
+    expect(JSON.parse((result.content as { text: string }[])[0].text)).toEqual({ notification: "requested" });
+    expect(notifications).toBe(1);
   });
 
   it("does not re-record a retained run after its record rotates out", async () => {
@@ -328,6 +380,7 @@ describe("Codex MCP execution opt-in", () => {
     const root = makeRoot("codex-mcp-oauth");
     const workspace = new Workspace(root);
     const tunnel = ensureTrustedTunnelToken(workspace.id);
+    let notifications = 0;
     const bridge = await startBridge({
       workspaceRoot: root,
       port: 0,
@@ -335,6 +388,7 @@ describe("Codex MCP execution opt-in", () => {
       trustedTunnelTokenFile: tunnel.file,
       codexExecution: true,
       codexBinary: makeFakeCodex(),
+      completionNotifier: () => { notifications++; },
       authStoreFile: path.join(makeTmpDir("auth"), "oauth.json"),
     });
     bridges.push(bridge);
@@ -343,12 +397,18 @@ describe("Codex MCP execution opt-in", () => {
       scopes: ["workspace.read", "workspace.search", "git.read", "execution.read"],
     }).accessToken;
     const client = await connect(bridge, { authorization: `Bearer ${token}` });
-    expect(toolNames((await client.listTools()).tools)).toContain("codex_turn_start");
+    expect(toolNames((await client.listTools()).tools)).toEqual(
+      [...DEFAULT_TOOLS, "codex_turn_start", "codex_turn_wait", "task_status", "task_resume_context", "task_reconcile_start", "task_reconcile_status", "completion_notify"].sort()
+    );
     const denied = await client.callTool({
       name: "codex_turn_start",
       arguments: { task_id: "oauth-task", iteration: 1, instruction: "test" },
     });
     expect(denied.isError).toBe(true);
     expect((denied.content as { text: string }[])[0].text).toContain("INSUFFICIENT_SCOPE");
+    const notifyDenied = await client.callTool({ name: "completion_notify", arguments: {} });
+    expect(notifyDenied.isError).toBe(true);
+    expect((notifyDenied.content as { text: string }[])[0].text).toContain("INSUFFICIENT_SCOPE");
+    expect(notifications).toBe(0);
   });
 });

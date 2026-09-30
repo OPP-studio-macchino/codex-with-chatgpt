@@ -39,7 +39,16 @@ Codex App Server; OAuth cannot receive `codex.execute`. C2C forces remote
 threads to `read-only` and every remote turn to `on-request`,
 `approvalsReviewer=user`, workspace-write with network disabled, `/tmp` and
 `$TMPDIR` excluded, and no extra writable roots. Approval or user-input requests
-block the turn; C2C never auto-approves them. Unknown server requests fail
+block the turn by default. The sole automatic-approval exception is an exact
+HTTPS host listed by the local owner in that workspace profile's
+`codexNetworkHosts`: C2C accepts only
+`item/commandExecution/requestApproval` carrying the matching
+`networkApprovalContext`, with no bundled filesystem permission. Command/cwd
+presentation metadata may be present because it does not broaden the
+destination-scoped network grant. C2C sends `accept` only, never
+`acceptForSession` or a policy amendment, and caps this at three approvals per
+turn. Wildcards, IP literals, localhost/`.local` names, HTTP, and every other
+approval or user-input request still fail closed. Unknown server requests fail
 closed.
 
 ## Path and content controls
@@ -119,6 +128,36 @@ Cloudflare Quick Tunnel or a caller-managed HTTPS origin uses C2C's OAuth flow:
 
 A user must still inspect the pairing page. OAuth does not make a mistakenly
 approved malicious redirect safe.
+
+## Owner-scoped Codex network allowlist
+
+Workspace profiles are an owner-only `0600` configuration boundary. A profile
+may optionally add exact public DNS hosts for bounded Codex network approval:
+
+```json
+{
+  "id": "taxi-pit-backend",
+  "path": "/absolute/owner/path/to/backend",
+  "codexNetworkHosts": ["ttc.taxi-inf.jp"]
+}
+```
+
+The allowlist is not a global network switch. It is attached to the selected
+workspace profile and is read when the bridge starts. The Codex sandbox still
+starts every turn with `networkAccess: false`; only a matching HTTPS
+destination-scoped network approval may receive one `accept` response.
+
+Some Codex builds emit a generic command approval without
+`networkApprovalContext` when a shell command attempts network access. C2C
+does **not** auto-approve that generic command, because doing so would grant the
+whole command outside the sandbox. For the narrow image-acquisition case, the
+trusted tunnel instead exposes `network_fetch_image`: it performs one HTTPS
+GET to an exact `codexNetworkHosts` host, follows no redirects, accepts only
+JPEG/PNG/WebP, caps the body at 4 MiB, writes no file, and returns the image from
+memory as MCP image content. OAuth callers cannot use this tool.
+
+Changing the owner profile file requires restarting the bridge before the new
+allowlist is used.
 
 ## Codex execution lifecycle
 

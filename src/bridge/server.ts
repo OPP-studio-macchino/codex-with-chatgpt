@@ -3,6 +3,9 @@ import type { Server } from "node:http";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { Workspace } from "../workspace/manager.js";
+import { WorkspaceProfiles } from "../workspace/profiles.js";
+import { WorkspaceRegistration, type FolderOwner } from "../workspace/registration.js";
+import { createNativeFolderOwner } from "../workspace/registration-native.js";
 import { AuthStore } from "../auth/store.js";
 import { safeEqual } from "../auth/store.js";
 import { createOAuthRouter } from "../auth/oauth.js";
@@ -13,7 +16,7 @@ import {
   trustedTunnelTokenFile,
 } from "../auth/trusted-tunnel.js";
 import { PairingManager } from "../pairing/manager.js";
-import { createMcpServer } from "../mcp/server.js";
+import { createMcpServer, resolveWorkspaceTarget, type WorkspaceTarget } from "../mcp/server.js";
 import { createMcpHttpHandler } from "../mcp/http.js";
 import { CloudflaredQuickTunnel } from "../tunnel/cloudflared.js";
 import type { TunnelProvider } from "../tunnel/provider.js";
@@ -23,9 +26,18 @@ import { normalizeExternalBaseUrl } from "../config/transport.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 import { writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
 import { CodexAppServer } from "../codex/app-server.js";
+import { TaskJournal, inspectTaskJournalLayout } from "../execution/task-journal.js";
+import { TaskReconciler, type ReconciliationOptions } from "../execution/task-reconciler.js";
+import { inspectForReconciliation } from "../execution/reconciliation-evidence.js";
+import { createNativeRecoveryApproval } from "../execution/reconciliation-approval.js";
+import { appendExecutionRecordOnce } from "../execution/records.js";
+import { createLocalSoundNotifier, type CompletionNotifier } from "../notifications/local-sound.js";
+import type { DesktopAgent } from "../desktop/client.js";
 
 export interface BridgeOptions {
   workspaceRoot: string;
+  /** Optional owner-only workspace profile config; defaults to C2C_WORKSPACE_PROFILES_FILE. */
+  workspaceProfilesFile?: string;
   port?: number;
   host?: string;
   logger?: Logger;
@@ -43,6 +55,15 @@ export interface BridgeOptions {
   codexExecution?: boolean;
   /** Optional explicit installed official Codex executable path. */
   codexBinary?: string;
+  /** Test-only injection; production uses C2C_COMPLETION_SOUND_PATH. */
+  completionNotifier?: CompletionNotifier;
+  /** Optional Desktop Agent injection. Undefined auto-detects the installed local agent; null disables it. */
+  desktopAgent?: DesktopAgent | null;
+  /** Trusted in-process test seams only; never configurable through MCP or environment. */
+  reconciliationInspect?: ReconciliationOptions["inspect"];
+  reconciliationApprove?: ReconciliationOptions["approve"];
+  /** Trusted in-process fixture only; never an MCP/env supplied approval. */
+  folderOwner?: FolderOwner;
 }
 
 export interface Bridge {
@@ -83,8 +104,15 @@ function listen(app: express.Express, host: string, preferredPort: number): Prom
 }
 
 export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
+  // Check upgrade compatibility before creating identities, tokens, listeners or children.
+  if (opts.codexExecution) inspectTaskJournalLayout();
   const logger = opts.logger ?? nullLogger;
   const workspace = new Workspace(opts.workspaceRoot);
+  const completionNotifier = opts.completionNotifier ?? createLocalSoundNotifier({
+    soundPath: process.env.C2C_COMPLETION_SOUND_PATH,
+    logger,
+  });
+  const desktopAgent = opts.desktopAgent ?? undefined;
   const host = opts.host ?? DEFAULT_HOST;
   if (host !== "127.0.0.1" && host !== "::1" && host !== "localhost") {
     throw new Error("The bridge only binds to loopback addresses. Public exposure goes through the tunnel.");
@@ -106,9 +134,68 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   if (opts.codexBinary && !opts.codexExecution) {
     throw new Error("A Codex binary override requires Codex execution mode.");
   }
-  const codex = opts.codexExecution
-    ? new CodexAppServer({ workspaceRoot: workspace.root, binary: opts.codexBinary, logger })
+  const workspaceProfiles = WorkspaceProfiles.load(
+    workspace,
+    opts.workspaceProfilesFile ?? process.env.C2C_WORKSPACE_PROFILES_FILE
+  );
+  const codexByProfile = new Map<string, CodexAppServer>();
+  const currentWorkspaceProfile = (): {
+    id: string;
+    workspace: Workspace;
+    codexNetworkHosts: readonly string[];
+  } =>
+    workspaceProfiles?.current() ?? { id: "default", workspace, codexNetworkHosts: [] };
+  const taskWorkspaces = new Map<string, string>();
+  const tasksByWorkspace = new Map<string, { journal: TaskJournal; reconciler: TaskReconciler }>();
+  const tasksFor = (target: WorkspaceTarget) => {
+    const id = target.workspace.id;
+    let tasks = tasksByWorkspace.get(id);
+    if (!tasks) {
+      const journal = new TaskJournal(id);
+      const reconciler = new TaskReconciler({ journal,
+        inspect: opts.reconciliationInspect ?? inspectForReconciliation,
+        approve: opts.reconciliationApprove ?? createNativeRecoveryApproval(),
+        isBusy: workspaceId => codexByProfile.get(workspaceId)?.hasBlockingRun() ?? false,
+      });
+      tasks = { journal, reconciler };
+      tasksByWorkspace.set(id, tasks);
+    }
+    return tasks;
+  };
+  const workspaceRegistration = opts.codexExecution && workspaceProfiles
+    ? new WorkspaceRegistration(workspaceProfiles, opts.folderOwner ?? createNativeFolderOwner())
     : undefined;
+  const resolveWorkspace = (id?: string) => resolveWorkspaceTarget({ workspace, workspaceProfiles }, id);
+  const getCodex = (current: WorkspaceTarget): CodexAppServer | undefined => {
+    if (!opts.codexExecution) return undefined;
+    let client = codexByProfile.get(current.workspace.id);
+    if (!client) {
+      client = new CodexAppServer({
+        workspaceRoot: current.workspace.root,
+        binary: opts.codexBinary,
+        logger,
+        allowedNetworkHosts: current.codexNetworkHosts,
+        onRunStarting: (run, instruction) => tasksFor(current).journal.begin(current.workspace.id, run, instruction),
+        onRunTerminal: (run) => {
+          tasksFor(current).journal.complete(current.workspace.id, run);
+          // Durable history does not depend on a later MCP wait call.
+          try {
+            appendExecutionRecordOnce(current.workspace.id, {
+              taskId: run.task_id, iteration: run.iteration, runId: run.run_id,
+              changedFiles: null, tests: null,
+              exitStatus: run.state === "completed" ? "ok" : run.state === "blocked" ? "blocked" : "failed",
+              timestamp: new Date().toISOString(), notes: run.summary ?? run.reason,
+            });
+          } catch {
+            logger.warn("Legacy execution projection unavailable; use durable task status.");
+          }
+        },
+      });
+      codexByProfile.set(current.workspace.id, client);
+    }
+    return client;
+  };
+  const initialCodex = getCodex(currentWorkspaceProfile());
 
   let publicBaseUrl: string | null = null;
   const managedExternalUrl = Boolean(opts.externalBaseUrl);
@@ -156,7 +243,23 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   // ---- MCP endpoint (bearer-protected) --------------------------------------
 
   const mcpHandler = createMcpHttpHandler(
-    () => createMcpServer({ workspace, logger, codex }),
+    () => {
+      const current = currentWorkspaceProfile();
+      return createMcpServer({
+        workspace: current.workspace,
+        workspaceProfiles,
+        resolveWorkspace,
+        getCodex,
+        taskWorkspaces,
+        getTaskJournal: opts.codexExecution ? target => tasksFor(target).journal : undefined,
+        getTaskReconciler: opts.codexExecution ? target => tasksFor(target).reconciler : undefined,
+        workspaceRegistration,
+        logger,
+        codex: getCodex(current),
+        completionNotifier,
+        desktopAgent,
+      });
+    },
     logger
   );
   let activeMcpRequests = 0;
@@ -185,6 +288,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       logger,
       trustedTunnelTokenFile: opts.trustedTunnelTokenFile,
       trustedTunnelCodexExecution: Boolean(opts.codexExecution),
+      trustedTunnelDesktopAccess: Boolean(desktopAgent),
     }),
     admitMcpRequest,
     express.json({ limit: "1mb", strict: true }),
@@ -219,12 +323,18 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   });
 
   app.get("/admin/info", adminGuard, (_req, res) => {
+    const active = currentWorkspaceProfile();
     res.json({
       service: SERVICE_NAME,
       version: VERSION,
       workspaceId: workspace.id,
       workspaceName: workspace.name,
       workspaceRoot: workspace.root,
+      workspaceProfilesConfigured: Boolean(workspaceProfiles),
+      activeWorkspaceProfileId: active.id,
+      activeWorkspaceId: active.workspace.id,
+      activeWorkspaceName: active.workspace.name,
+      activeWorkspaceRoot: active.workspace.root,
       port,
       publicUrl: managedExternalUrl ? publicBaseUrl : tunnel.getPublicUrl(),
       tunnel: tunnel.status(),
@@ -234,7 +344,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       trustedTunnelTokenPresent:
         Boolean(opts.trustedTunnelTokenFile) && hasValidTrustedTunnelToken(workspace.id),
       codexExecution: Boolean(opts.codexExecution),
-      codexRuntimeDetected: Boolean(codex),
+      codexRuntimeDetected: Boolean(initialCodex),
       pid: process.pid,
       startedAt,
     });
@@ -277,6 +387,8 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   });
 
   app.post("/admin/revoke-all", adminGuard, (_req, res) => {
+    for (const { reconciler } of tasksByWorkspace.values()) reconciler.cancelPending();
+    workspaceRegistration?.cancelPending();
     const count = authStore.revokeAll();
     pairing.invalidateAll();
     const trustedTunnelRevoked = removeTrustedTunnelToken(workspace.id);
@@ -291,7 +403,16 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     }, 100);
   });
 
-  const { server, port } = await listen(app, host, opts.port ?? DEFAULT_PORT);
+  const { server, port } = await (async () => {
+    try {
+      return await listen(app, host, opts.port ?? DEFAULT_PORT);
+    } catch (error) {
+      for (const { reconciler } of tasksByWorkspace.values()) reconciler.close();
+      workspaceRegistration?.close();
+      for (const { journal } of tasksByWorkspace.values()) journal.close();
+      throw error;
+    }
+  })();
   server.requestTimeout = 30_000;
   server.headersTimeout = 10_000;
   server.keepAliveTimeout = 5_000;
@@ -317,18 +438,27 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     };
     writeRuntimeState(state);
   };
-  persistRuntime();
 
   let closed = false;
   const shutdown = async (): Promise<void> => {
     if (closed) return;
     closed = true;
-    await codex?.close().catch(() => undefined);
+    for (const { reconciler } of tasksByWorkspace.values()) reconciler.close();
+    workspaceRegistration?.close();
+    await Promise.all(
+      [...codexByProfile.values()].map((client) => client.close().catch(() => undefined))
+    );
     await tunnel.stop().catch(() => undefined);
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    try { for (const { journal } of tasksByWorkspace.values()) journal.close(); } catch { logger.warn("Task journal lock needs owner inspection."); }
     if (opts.persistRuntime !== false) clearRuntimeState(workspace.id);
     logger.info("Bridge stopped");
   };
+
+  try { persistRuntime(); } catch (error) {
+    await shutdown();
+    throw error;
+  }
 
   app.use((_error: unknown, _req: Request, res: Response, _next: NextFunction) => {
     if (!res.headersSent) res.status(400).json({ error: "invalid_request" });

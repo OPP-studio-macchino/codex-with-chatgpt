@@ -1,8 +1,11 @@
-# Codex with ChatGPT — hardened fork
+# C2C Auto-loop — Codex with ChatGPT
 
-A consent-driven, read-only MCP bridge that lets ChatGPT inspect a selected
-local workspace for optional planning and review while Codex remains the
-execution authority.
+A consent-driven MCP bridge for local repository inspection, bounded Codex implementation,
+review, owner-approved project registration and recoverable task history. Read-only is the default;
+execution and Desktop operations require their existing explicit permissions.
+
+**Technical preview `v0.4.0-dev.6` — not a stable release.** See [release notes](docs/releases/v0.4.0-dev.6.md)
+and the [integration status](docs/refactor/integration-candidate.md). Publishing this tag does not upgrade a running bridge.
 
 This repository is a security-focused fork of
 [`XiaoDuoYa/codex-with-chatgpt`](https://github.com/XiaoDuoYa/codex-with-chatgpt),
@@ -14,7 +17,7 @@ by OpenAI or Cloudflare.
 
 ## What it does
 
-The bridge exposes eight bounded, read-only MCP tools:
+The default bridge exposes bounded, read-only MCP tools:
 
 - workspace metadata;
 - directory listing;
@@ -28,8 +31,8 @@ deployment tools by default. ChatGPT's suggestions remain advisory; Codex must
 validate them against the user's request, repository instructions, and actual
 test results before acting.
 
-An optional Codex execution mode adds exactly `codex_turn_start` and
-`codex_turn_wait`. It is available only when **both** `--openai-secure-tunnel`
+Optional Codex execution adds `codex_turn_start` / `codex_turn_wait`, durable task inspection
+and the permission-gated recovery and project-registration flows described in the release notes. It is available only when **both** `--openai-secure-tunnel`
 and `--codex-execution` are explicitly selected; OAuth never receives the
 `codex.execute` scope. C2C starts the installed official `codex app-server`
 directly, never through a shell. Task threads are ephemeral, one child admits at
@@ -165,6 +168,34 @@ Execution turns force `on-request` approval with `approvalsReviewer=user`;
 threads start read-only, while turns use workspace-write with network disabled,
 `/tmp` and `$TMPDIR` excluded, and no extra writable roots. C2C never approves a
 Codex request on the user's behalf.
+
+#### Economy defaults
+
+C2C prepends a compact execution contract only to the first turn of a task,
+then reuses that task's context. Its default local limits are 8 KiB per
+instruction, 8 KiB per summary, and four iterations. Set
+`C2C_CODEX_MAX_INSTRUCTION_BYTES` (1024–16384),
+`C2C_CODEX_MAX_SUMMARY_BYTES` (1024–32768), or
+`C2C_CODEX_MAX_ITERATIONS` (1–12) to adjust each limit. Set
+`C2C_CODEX_ECONOMY_MODE=0` only to omit the first-turn contract. These
+mechanisms reduce repeated context and bound local output; actual token savings
+vary by task.
+
+#### Optional completion sound
+
+Set `C2C_COMPLETION_SOUND_PATH=/absolute/path/to/sound-file` to an existing
+absolute local regular file. On macOS, C2C plays it with `/usr/bin/afplay`; no
+extra dependency is required. A successful Codex `turn/completed` plays it
+automatically exactly once, while failed or blocked work does not. Playback is
+best effort: a playback failure never changes a successful work result into a
+failure.
+
+When both the trusted C2C Codex-execution connection and this sound are
+configured, C2C also advertises `completion_notify`. ChatGPT Web and the
+ChatGPT macOS app are cooperatively instructed to call it exactly once as their
+last C2C tool call, immediately before the final answer and only after the
+requested work is fully complete. This is cooperative MCP signaling, not
+native ChatGPT UI completion-event detection or Accessibility/browser polling.
 
 The JSON response returns `localMcpUrl`, `trustedTunnelHeader`, and
 `trustedTunnelTokenFile`; it never returns the token value. Pass the token to

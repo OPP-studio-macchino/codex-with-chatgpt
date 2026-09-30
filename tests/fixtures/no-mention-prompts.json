@@ -1,0 +1,101 @@
+{
+  "kind": "host-routing-evaluation-spec-not-a-router",
+  "cases": [
+    {
+      "id": "new-ja",
+      "category": "indirect",
+      "context": "新しいチャット・接続済み",
+      "prompt": "completion-soundのローカルrepoの状態を確認して。",
+      "expectedBehavior": "Resolve the named owner-approved repo, inspect only; no mention request.",
+      "actualStatus": "NOT_RUN"
+    },
+    {
+      "id": "new-en",
+      "category": "indirect",
+      "context": "Fresh chat; tools available",
+      "prompt": "Inspect the local frontend repository and explain why its test is failing.",
+      "expectedBehavior": "Inspect the named owner-approved local repo; do not edit without request.",
+      "actualStatus": "NOT_RUN"
+    },
+    {
+      "id": "fix-ja",
+      "category": "indirect",
+      "context": "接続済み・対象repo明確",
+      "prompt": "このローカルプロジェクトの不具合を直して。",
+      "expectedBehavior": "Verify target and use bounded implementation; preserve approvals.",
+      "actualStatus": "NOT_RUN"
+    },
+    {
+      "id": "followup",
+      "category": "indirect",
+      "context": "同一会話・対象確認済み",
+      "prompt": "その修正をテストして。",
+      "expectedBehavior": "Recheck target, test without a product-name or connected-message requirement.",
+      "actualStatus": "NOT_RUN"
+    },
+    {
+      "id": "review",
+      "category": "indirect",
+      "context": "接続済み・対象repo明確",
+      "prompt": "変更差分をレビューして。",
+      "expectedBehavior": "Read-only review; no automatic editing or execution.",
+      "actualStatus": "NOT_RUN"
+    },
+    {
+      "id": "resume",
+      "category": "indirect",
+      "context": "中断後・run IDが文脈にある",
+      "prompt": "さっきの作業がどこまで終わったか確認して。",
+      "expectedBehavior": "Retrieve known run status, never blindly re-execute; disclose restart limits.",
+      "actualStatus": "NOT_RUN"
+    },
+    {
+      "id": "direct",
+      "category": "direct",
+      "context": "接続済み",
+      "prompt": "C2Cでローカルrepoを確認して。",
+      "expectedBehavior": "Explicit naming remains supported but optional.",
+      "actualStatus": "NOT_RUN"
+    },
+    {
+      "id": "weather",
+      "category": "negative",
+      "context": "通常の会話",
+      "prompt": "今日の天気を教えて。",
+      "expectedBehavior": "Use the weather tool, not local C2C.",
+      "actualStatus": "NOT_RUN"
+    },
+    {
+      "id": "email",
+      "category": "negative",
+      "context": "Gmail接続済み",
+      "prompt": "メールの返信を確認して。",
+      "expectedBehavior": "Use the mail connector, not local C2C.",
+      "actualStatus": "NOT_RUN"
+    },
+    {
+      "id": "ambiguous",
+      "category": "ambiguous",
+      "context": "複数repo・対象不明",
+      "prompt": "この不具合を直して。",
+      "expectedBehavior": "List approved candidates where useful and clarify only the project; no silent global selection.",
+      "actualStatus": "NOT_RUN"
+    },
+    {
+      "id": "rdc",
+      "category": "explicit-alternative",
+      "context": "RDCが利用可能",
+      "prompt": "RDCを使ってローカルファイルを確認して。",
+      "expectedBehavior": "Respect the explicitly selected tool.",
+      "actualStatus": "NOT_RUN"
+    },
+    {
+      "id": "absent",
+      "category": "host-unavailable",
+      "context": "C2Cツールがホストから提供されていない",
+      "prompt": "ローカルrepoを調べて。",
+      "expectedBehavior": "Report actual availability; do not invent tool calls or loop through mentions/reconnection.",
+      "actualStatus": "NOT_RUN"
+    }
+  ]
+}

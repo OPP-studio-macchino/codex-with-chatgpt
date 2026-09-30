@@ -153,6 +153,19 @@ describe("gitInfo", () => {
 });
 
 describe("gitStatus", () => {
+  it("ignores AppleDouble sidecars in the private Git object snapshot", () => {
+    const packDir = path.join(repo, ".git", "objects", "pack");
+    fs.mkdirSync(packDir, { recursive: true });
+    const sidecar = path.join(packDir, "._pack-deadbeef.idx");
+    fs.writeFileSync(sidecar, Buffer.from("not-a-git-index\n"));
+    try {
+      expect(gitStatus(repo).isRepo).toBe(true);
+      expect(gitInfo(repo)).toMatchObject({ isRepo: true, branch: "main" });
+    } finally {
+      fs.rmSync(sidecar, { force: true });
+    }
+  });
+
   it("categorizes staged, unstaged and untracked files", () => {
     write(repo, "hello.txt", "modified content\n");
     write(repo, "staged.txt", "new staged file\n");
@@ -162,6 +175,7 @@ describe("gitStatus", () => {
     const status = gitStatus(repo);
     expect(status.isRepo).toBe(true);
     expect(status.branch).toBe("main");
+    expect(status.head).toMatch(/^[a-f0-9]{40,64}$/);
     expect(status.unstaged.map((entry) => entry.path)).toContain("hello.txt");
     expect(status.staged.map((entry) => entry.path)).toContain("staged.txt");
     expect(status.untracked).toContain("untracked.txt");

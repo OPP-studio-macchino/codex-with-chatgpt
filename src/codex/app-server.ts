@@ -3,18 +3,23 @@ import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { redactAndTruncate } from "../security/redaction.js";
+import { normalizeCodexNetworkHost, normalizeCodexNetworkHosts } from "./network-policy.js";
 import type { Logger } from "../logger/index.js";
 
 const REQUEST_TIMEOUT_MS = 10_000;
 const TURN_TIMEOUT_MS = 20 * 60_000;
-const WAIT_TIMEOUT_MS = 20_000;
+const DEFAULT_WAIT_TIMEOUT_MS = 1_000;
+const MAX_WAIT_TIMEOUT_MS = 3_000;
 const CHILD_STOP_TIMEOUT_MS = 1_000;
 const MAX_LINE_BYTES = 10 * 1024 * 1024;
-const MAX_INSTRUCTION_BYTES = 16 * 1024;
-const MAX_SUMMARY_BYTES = 32 * 1024;
+const DEFAULT_MAX_INSTRUCTION_BYTES = 8 * 1024;
+const DEFAULT_MAX_SUMMARY_BYTES = 8 * 1024;
+const DEFAULT_MAX_ITERATIONS = 4;
+const MAX_ITERATIONS = 12;
 const MAX_THREADS_PER_CHILD = 8;
 const MAX_RUNS = 96;
 const MAX_EXPIRED_TASKS = 96;
+const MAX_AUTO_NETWORK_APPROVALS_PER_TURN = 3;
 
 const APPROVAL_METHODS = new Set([
   "item/commandExecution/requestApproval",
@@ -30,6 +35,49 @@ const USER_INPUT_METHODS = new Set([
 
 type JsonObject = Record<string, unknown>;
 export type CodexRunState = "running" | "completed" | "blocked" | "failed";
+
+const ECONOMY_CONTRACT =
+  "Execution contract: inspect only relevant paths; reuse settled context; no subagents unless explicitly requested; narrow-to-broad validation; compact closeout.";
+
+interface CodexLimits {
+  maxInstructionBytes: number;
+  maxSummaryBytes: number;
+  maxIterations: number;
+  waitTimeoutMs: number;
+  economyMode: boolean;
+}
+
+function envInteger(name: string, fallback: number, min: number, max: number): number | null {
+  const value = process.env[name];
+  if (value === undefined || value === "") return fallback;
+  if (!/^\d+$/.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= min && parsed <= max ? parsed : null;
+}
+
+function readLimits(logger: Logger): CodexLimits {
+  const instruction = envInteger("C2C_CODEX_MAX_INSTRUCTION_BYTES", DEFAULT_MAX_INSTRUCTION_BYTES, 1024, 16 * 1024);
+  const summary = envInteger("C2C_CODEX_MAX_SUMMARY_BYTES", DEFAULT_MAX_SUMMARY_BYTES, 1024, 32 * 1024);
+  const iterations = envInteger("C2C_CODEX_MAX_ITERATIONS", DEFAULT_MAX_ITERATIONS, 1, MAX_ITERATIONS);
+  const waitTimeout = envInteger("C2C_CODEX_WAIT_TIMEOUT_MS", DEFAULT_WAIT_TIMEOUT_MS, 250, MAX_WAIT_TIMEOUT_MS);
+  const economy = process.env.C2C_CODEX_ECONOMY_MODE;
+  if (
+    instruction === null ||
+    summary === null ||
+    iterations === null ||
+    waitTimeout === null ||
+    (economy !== undefined && economy !== "0" && economy !== "1")
+  ) {
+    logger.warn("Invalid C2C Codex economy configuration; safe defaults applied.");
+  }
+  return {
+    maxInstructionBytes: instruction ?? DEFAULT_MAX_INSTRUCTION_BYTES,
+    maxSummaryBytes: summary ?? DEFAULT_MAX_SUMMARY_BYTES,
+    maxIterations: iterations ?? DEFAULT_MAX_ITERATIONS,
+    waitTimeoutMs: waitTimeout ?? DEFAULT_WAIT_TIMEOUT_MS,
+    economyMode: economy !== "0",
+  };
+}
 
 export interface CodexRunResult {
   task_id: string;
@@ -49,6 +97,7 @@ interface Run extends CodexRunResult {
   lastAgentMessage?: string;
   executionRecordWritten?: boolean;
   executionRecordWrite?: Promise<void>;
+  networkApprovals: number;
 }
 
 interface Task {
@@ -67,6 +116,12 @@ export interface CodexAppServerOptions {
   workspaceRoot: string;
   binary?: string;
   logger: Logger;
+  /** Exact owner-approved HTTPS hosts eligible for one-request network approval. */
+  allowedNetworkHosts?: readonly string[];
+  /** Synchronous write-ahead hook: failure prevents child/turn startup. */
+  onRunStarting?: (run: CodexRunResult, instruction: string) => void;
+  /** Synchronous durable terminal hook, independent of MCP wait. */
+  onRunTerminal?: (run: CodexRunResult) => void;
 }
 
 export class CodexAppServerError extends Error {
@@ -77,6 +132,16 @@ export class CodexAppServerError extends Error {
 
 function isObject(value: unknown): value is JsonObject {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isNetworkOnlyAdditionalPermissions(value: unknown): boolean {
+  if (value === undefined || value === null) return true;
+  if (!isObject(value)) return false;
+  const keys = Object.keys(value);
+  if (keys.some((key) => key !== "network")) return false;
+  const network = value.network;
+  if (!isObject(network) || network.enabled !== true) return false;
+  return Object.keys(network).every((key) => key === "enabled");
 }
 
 function isInside(parent: string, child: string): boolean {
@@ -174,22 +239,40 @@ export class CodexAppServer {
   private active: Run | null = null;
   private starting = false;
   private closed = false;
+  private persistenceFailed = false;
+  private readonly limits: CodexLimits;
+  private readonly allowedNetworkHosts: ReadonlySet<string>;
 
   constructor(private readonly opts: CodexAppServerOptions) {
     this.binary = resolveCodexBinary(opts.workspaceRoot, opts.binary);
+    this.limits = readLimits(opts.logger);
+    this.allowedNetworkHosts = new Set(normalizeCodexNetworkHosts(opts.allowedNetworkHosts ?? []));
   }
 
   async startTurn(taskId: string, iteration: number, instruction: string): Promise<CodexRunResult> {
     if (!/^[A-Za-z0-9_.:-]{1,128}$/.test(taskId)) {
       throw new CodexAppServerError("INVALID_TASK_ID", "task_id has an invalid format.");
     }
-    if (!Number.isInteger(iteration) || iteration < 1 || iteration > 12) {
-      throw new CodexAppServerError("INVALID_ITERATION", "iteration must be an integer from 1 to 12.");
+    if (!Number.isInteger(iteration) || iteration < 1 || iteration > this.limits.maxIterations) {
+      throw new CodexAppServerError(
+        "INVALID_ITERATION",
+        `iteration must be an integer from 1 to ${this.limits.maxIterations}.`
+      );
     }
-    if (!instruction || Buffer.byteLength(instruction, "utf8") > MAX_INSTRUCTION_BYTES) {
-      throw new CodexAppServerError("INVALID_INSTRUCTION", "instruction must be 1 to 16384 UTF-8 bytes.");
+    const newTask = !this.tasks.has(taskId);
+    const turnInstruction = newTask && this.limits.economyMode
+      ? `${ECONOMY_CONTRACT}\n\n${instruction}`
+      : instruction;
+    if (!instruction || Buffer.byteLength(turnInstruction, "utf8") > this.limits.maxInstructionBytes) {
+      throw new CodexAppServerError(
+        "INVALID_INSTRUCTION",
+        `instruction exceeds the local ${this.limits.maxInstructionBytes}-byte limit.`
+      );
     }
 
+    if (this.persistenceFailed) {
+      throw new CodexAppServerError("TASK_JOURNAL_UNAVAILABLE", "Durable task recording failed; execution is stopped for reconciliation.");
+    }
     const retained = [...this.runs.values()].find(
       (run) => run.task_id === taskId && run.iteration === iteration
     );
@@ -211,7 +294,20 @@ export class CodexAppServer {
     }
 
     this.starting = true;
+    const run: Run = {
+      task_id: taskId, iteration, state: "running",
+      run_id: randomBytes(16).toString("hex"), threadId: "", epoch: 0,
+      waiters: new Set(), networkApprovals: 0,
+    };
+    let admitted = false;
     try {
+      try {
+        this.opts.onRunStarting?.(this.publicResult(run), instruction);
+      } catch {
+        this.persistenceFailed = true;
+        throw new CodexAppServerError("TASK_JOURNAL_UNAVAILABLE", "Task start could not be recorded; no child or turn was started.");
+      }
+      admitted = true;
       if (!task && this.tasks.size >= MAX_THREADS_PER_CHILD) await this.recycleChild();
       await this.ensureInitialized();
 
@@ -234,15 +330,8 @@ export class CodexAppServer {
         this.tasks.set(taskId, currentTask);
       }
 
-      const run: Run = {
-        task_id: taskId,
-        iteration,
-        state: "running",
-        run_id: randomBytes(16).toString("hex"),
-        threadId: currentTask.threadId,
-        epoch: this.activeEpoch,
-        waiters: new Set(),
-      };
+      run.threadId = currentTask.threadId;
+      run.epoch = this.activeEpoch;
       this.retainRun(run);
       this.active = run;
       currentTask.lastIteration = iteration;
@@ -250,7 +339,11 @@ export class CodexAppServer {
       try {
         const response = await this.request("turn/start", {
           threadId: currentTask.threadId,
-          input: [{ type: "text", text: instruction, text_elements: [] }],
+          input: [{
+            type: "text",
+            text: turnInstruction,
+            text_elements: [],
+          }],
           cwd: this.opts.workspaceRoot,
           approvalPolicy: "on-request",
           approvalsReviewer: "user",
@@ -279,9 +372,17 @@ export class CodexAppServer {
         throw error;
       }
       return this.publicResult(run);
+    } catch (error) {
+      if (admitted && run.state === "running") this.finish(run, "failed", "turn_start_failed");
+      throw error;
     } finally {
       this.starting = false;
     }
+  }
+
+  hasBlockingRun(): boolean {
+    if (this.starting) return true;
+    return [...this.runs.values()].some((run) => run.state === "running");
   }
 
   async wait(taskId: string, runId: string): Promise<CodexRunResult> {
@@ -297,7 +398,7 @@ export class CodexAppServer {
           run.waiters.delete(done);
           resolve();
         };
-        timer = setTimeout(done, WAIT_TIMEOUT_MS);
+        timer = setTimeout(done, this.limits.waitTimeoutMs);
         timer.unref();
         run.waiters.add(done);
       });
@@ -459,16 +560,95 @@ export class CodexAppServer {
     }
   }
 
+  private tryAutoApproveNetworkRequest(value: JsonObject, epoch: number): boolean {
+    if (value.method !== "item/commandExecution/requestApproval" || value.id === undefined) return false;
+    const run = this.active;
+    if (!run || run.state !== "running" || run.epoch !== epoch) return false;
+    if (run.networkApprovals >= MAX_AUTO_NETWORK_APPROVALS_PER_TURN) return false;
+    if (!isObject(value.params)) return false;
+
+    const params = value.params;
+    if (
+      params.threadId !== run.threadId ||
+      typeof params.turnId !== "string" ||
+      (run.turnId !== undefined && params.turnId !== run.turnId) ||
+      typeof params.itemId !== "string"
+    ) {
+      return false;
+    }
+
+    if (!isObject(params.networkApprovalContext)) return false;
+    const rawHost = params.networkApprovalContext.host;
+    const rawProtocol = params.networkApprovalContext.protocol;
+    if (
+      typeof rawHost !== "string" ||
+      typeof rawProtocol !== "string" ||
+      rawProtocol.toLowerCase() !== "https"
+    ) return false;
+
+    let host: string;
+    try {
+      host = normalizeCodexNetworkHost(rawHost);
+    } catch {
+      return false;
+    }
+    if (!this.allowedNetworkHosts.has(host)) return false;
+
+    // The managed-network request may include command/cwd display metadata,
+    // but the approval itself remains destination-scoped. Refuse any bundled
+    // permission escalation other than network=true.
+    if (!isNetworkOnlyAdditionalPermissions(params.additionalPermissions)) return false;
+
+    // Always choose allow-once. Never persist command or network policy
+    // amendments, even when Codex proposes them.
+    if (params.availableDecisions != null) {
+      if (
+        !Array.isArray(params.availableDecisions) ||
+        !params.availableDecisions.includes("accept")
+      ) {
+        return false;
+      }
+    }
+
+    run.networkApprovals++;
+    this.write({ id: value.id, result: { decision: "accept" } }, epoch);
+    this.opts.logger.info("Approved one owner-allowlisted Codex HTTPS network request", {
+      host,
+      taskId: run.task_id,
+      iteration: run.iteration,
+      count: run.networkApprovals,
+    });
+    return true;
+  }
+
   private onMessage(value: unknown, epoch: number): void {
     if (this.activeEpoch !== epoch) return;
     if (!isObject(value)) return this.failChild("malformed_protocol", epoch);
     if (typeof value.method === "string") {
       if (value.id !== undefined) {
+        if (this.tryAutoApproveNetworkRequest(value, epoch)) return;
         const reason = APPROVAL_METHODS.has(value.method)
           ? "approval_required"
           : USER_INPUT_METHODS.has(value.method)
             ? "user_input_required"
             : "unknown_server_request";
+        const params = isObject(value.params) ? value.params : undefined;
+        const networkContext = params && isObject(params.networkApprovalContext)
+          ? params.networkApprovalContext
+          : undefined;
+        this.opts.logger.info("Blocked Codex server request", {
+          method: value.method,
+          reason,
+          paramKeys: params ? Object.keys(params).sort() : [],
+          networkHost: typeof networkContext?.host === "string" ? networkContext.host : undefined,
+          networkProtocol: typeof networkContext?.protocol === "string" ? networkContext.protocol : undefined,
+          permissionKeys: params && isObject(params.permissions)
+            ? Object.keys(params.permissions).sort()
+            : [],
+          hasCommandPresentation: Boolean(
+            params && (params.command != null || params.cwd != null || params.commandActions != null)
+          ),
+        });
         if (this.active?.state === "running" && this.active.epoch === epoch) {
           this.finish(this.active, "blocked", reason);
         }
@@ -559,7 +739,16 @@ export class CodexAppServer {
     run.state = state;
     if (reason) run.reason = reason;
     if (state === "completed") {
-      run.summary = redactAndTruncate(run.lastAgentMessage ?? "", MAX_SUMMARY_BYTES).text;
+      run.summary = redactAndTruncate(run.lastAgentMessage ?? "", this.limits.maxSummaryBytes).text;
+    }
+    try {
+      this.opts.onRunTerminal?.(this.publicResult(run));
+    } catch {
+      this.persistenceFailed = true;
+      run.state = "failed";
+      run.reason = "task_journal_write_failed";
+      delete run.summary;
+      this.opts.logger.warn("Durable terminal recording failed; further execution is blocked.");
     }
     if (this.active === run) this.active = null;
     for (const waiter of run.waiters) waiter();

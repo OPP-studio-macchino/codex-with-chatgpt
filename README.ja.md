@@ -1,4 +1,11 @@
-# Codex with ChatGPT — hardened fork
+# C2C Auto-loop — Codex with ChatGPT
+
+**技術プレビュー `v0.4.0-dev.6`。安定版ではありません。**
+[リリースノート](docs/releases/v0.4.0-dev.6.md)と[監査対応の統合状態](docs/refactor/integration-candidate.md)を参照してください。
+
+フォルダ選択・本人承認・Codex読取・隔離bridge再起動後の結果取得は実機確認済みです。
+新規ChatGPTチャットでの `@c2c` なし利用、実運用環境への切替、初回setupは別途検証が必要です。
+このリリースの公開だけで、稼働中のC2Cが更新されることはありません。
 
 ChatGPT に、選択したローカル作業領域を読み取り専用 MCP 経由で参照させ、
 計画やレビューを補助させるためのブリッジです。編集・コマンド実行・テスト・
@@ -93,6 +100,26 @@ Tunnels Read + Use、ChatGPT developer mode、および対象 workspace との�
 c2c setup -w /absolute/path/to/workspace --openai-secure-tunnel --json
 ```
 
+bounded Codex execution は明示的な opt-in です。
+
+```bash
+c2c setup -w /absolute/path/to/workspace --openai-secure-tunnel --codex-execution --json
+```
+
+#### 任意の完了サウンド
+
+`C2C_COMPLETION_SOUND_PATH=/absolute/path/to/sound-file` には、存在する絶対パスの
+ローカル通常ファイルを指定できます。macOS では C2C が `/usr/bin/afplay` で再生し、
+追加の依存関係は不要です。Codex の `turn/completed` が成功したときだけ自動でちょうど
+1 回再生し、失敗または blocked の作業では再生しません。再生は best effort であり、
+再生失敗によって成功した作業結果が失敗になることはありません。
+
+trusted C2C Codex-execution 接続とこのサウンドの両方を設定した場合、C2C は
+`completion_notify` も公開します。ChatGPT Web と ChatGPT macOS app には、要求された
+作業が完全に終わった後、最終回答の直前にある最後の C2C tool call として、これを
+ちょうど 1 回呼ぶよう協調的に指示されます。これは協調的な MCP signaling であり、
+ChatGPT のネイティブ UI 完了イベント検出や Accessibility/browser polling ではありません。
+
 JSON の `localMcpUrl`、`trustedTunnelHeader`、`trustedTunnelTokenFile` を使い、
 公式 `tunnel-client` の通常 MCP と discovery の両方へ同じ `file:` 参照を設定します。
 トークン値自体は表示・コピーしません。
@@ -179,3 +206,8 @@ c2c update-check --json                 # 通知だけ。更新は適用しな�
 issue へ貼らないでください。
 
 License: [MIT](LICENSE).
+
+## 開発候補の作業復旧（Phase 03）
+
+[中断後の状況確認と引継ぎ](docs/refactor/task-recovery.md)を追加しています。稼働環境には未反映です。
+「続けて」から状況確認できることを目指し、結果不明の操作は自動で再実行しません。

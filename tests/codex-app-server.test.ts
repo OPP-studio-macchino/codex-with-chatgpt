@@ -62,16 +62,17 @@ process.stdin.on("data", (chunk) => {
       send({ id: message.id, result: { turn: { id: turnId, status: "inProgress", items: [], error: null } } });
       const threadId = message.params.threadId;
       const text = message.params.input?.[0]?.text ?? "";
-      if (text === "APPROVAL") {
+      if (text.endsWith("APPROVAL")) {
         send({ id: "approval-1", method: "item/commandExecution/requestApproval", params: {} });
         continue;
       }
-      if (text === "UNKNOWN") {
+      if (text.endsWith("UNKNOWN")) {
         send({ id: "unknown-1", method: "server/unknown", params: {} });
         continue;
       }
-      if (text === "EXIT") process.exit(0);
-      const item = { type: "agentMessage", id: "msg-1", text: "done:" + text };
+      if (text.endsWith("EXIT")) process.exit(0);
+      if (text.endsWith("HANG")) continue;
+      const item = { type: "agentMessage", id: "msg-1", text: text.endsWith("LONG_SUMMARY") ? "x".repeat(40 * 1024) : "done:" + text };
       send({ method: "item/completed", params: { threadId, turnId, item } });
       send({ method: "turn/completed", params: {
         threadId,
@@ -98,6 +99,22 @@ function makeClient(workspace: string, binary: string): CodexAppServer {
   return new CodexAppServer({ workspaceRoot: workspace, binary, logger: nullLogger });
 }
 
+async function withEnv(values: Record<string, string | undefined>, action: () => Promise<void>): Promise<void> {
+  const previous = Object.fromEntries(Object.keys(values).map((key) => [key, process.env[key]]));
+  try {
+    for (const [key, value] of Object.entries(values)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await action();
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
 async function completed(
   client: CodexAppServer,
   task: string,
@@ -111,13 +128,127 @@ async function completed(
 }
 
 describe("Codex App Server execution boundary", () => {
+  it("uses economy defaults for local limits and summaries", async () => {
+    await withEnv({
+      C2C_CODEX_MAX_INSTRUCTION_BYTES: undefined,
+      C2C_CODEX_MAX_SUMMARY_BYTES: undefined,
+      C2C_CODEX_MAX_ITERATIONS: undefined,
+      C2C_CODEX_WAIT_TIMEOUT_MS: undefined,
+      C2C_CODEX_ECONOMY_MODE: undefined,
+    }, async () => {
+      const workspace = makeWorkspace();
+      const fake = makeFakeBinary();
+      const client = makeClient(workspace, fake.binary);
+      try {
+        await expect(client.startTurn("default-iterations", 5, "nope")).rejects.toMatchObject({
+          code: "INVALID_ITERATION",
+        } satisfies Partial<CodexAppServerError>);
+        await expect(client.startTurn("default-bytes", 1, "x".repeat(8 * 1024 + 1))).rejects.toMatchObject({
+          code: "INVALID_INSTRUCTION",
+        } satisfies Partial<CodexAppServerError>);
+        expect((await completed(client, "default-summary", 1, "LONG_SUMMARY")).summary).toHaveLength(8 * 1024);
+      } finally {
+        await client.close();
+      }
+    });
+  });
+
+  it("short-polls a running turn instead of holding a long response open", async () => {
+    await withEnv({ C2C_CODEX_WAIT_TIMEOUT_MS: "250" }, async () => {
+      const workspace = makeWorkspace();
+      const fake = makeFakeBinary();
+      const client = makeClient(workspace, fake.binary);
+      try {
+        const started = await client.startTurn("short-poll", 1, "HANG");
+        const startedAt = Date.now();
+        const result = await client.wait("short-poll", started.run_id);
+        const elapsedMs = Date.now() - startedAt;
+
+        expect(result.state).toBe("running");
+        expect(elapsedMs).toBeGreaterThanOrEqual(150);
+        expect(elapsedMs).toBeLessThan(1500);
+      } finally {
+        await client.close();
+      }
+    });
+  });
+
+  it("accepts valid local overrides and rejects invalid ones with one redacted warning", async () => {
+    await withEnv({
+      C2C_CODEX_MAX_INSTRUCTION_BYTES: "1024",
+      C2C_CODEX_MAX_SUMMARY_BYTES: "1024",
+      C2C_CODEX_MAX_ITERATIONS: "5",
+      C2C_CODEX_WAIT_TIMEOUT_MS: "250",
+    }, async () => {
+      const workspace = makeWorkspace();
+      const fake = makeFakeBinary();
+      const client = makeClient(workspace, fake.binary);
+      try {
+        expect((await completed(client, "override", 1, "x".repeat(800))).summary).toContain("x");
+        for (let iteration = 2; iteration <= 5; iteration++) {
+          await completed(client, "override", iteration, "next");
+        }
+      } finally {
+        await client.close();
+      }
+    });
+
+    await withEnv({ C2C_CODEX_MAX_ITERATIONS: "invalid", C2C_CODEX_ECONOMY_MODE: "invalid" }, async () => {
+      const workspace = makeWorkspace();
+      const fake = makeFakeBinary();
+      const warnings: string[] = [];
+      const client = new CodexAppServer({
+        workspaceRoot: workspace,
+        binary: fake.binary,
+        logger: { warn: (message: string) => warnings.push(message) } as unknown as typeof nullLogger,
+      });
+      try {
+        await expect(client.startTurn("invalid", 5, "nope")).rejects.toMatchObject({
+          code: "INVALID_ITERATION",
+        } satisfies Partial<CodexAppServerError>);
+        expect(warnings).toEqual(["Invalid C2C Codex economy configuration; safe defaults applied."]);
+      } finally {
+        await client.close();
+      }
+    });
+  });
+
+  it("prepends the economy contract only for a new task and permits opting out", async () => {
+    const workspace = makeWorkspace();
+    const fake = makeFakeBinary();
+    const client = makeClient(workspace, fake.binary);
+    try {
+      await completed(client, "economy", 1, "first");
+      await completed(client, "economy", 2, "second");
+      const starts = readLog(fake.log).filter((entry) => entry.value.method === "turn/start");
+      expect((starts[0]!.value.params as any).input[0].text).toContain("Execution contract:");
+      expect((starts[1]!.value.params as any).input[0].text).toBe("second");
+    } finally {
+      await client.close();
+    }
+
+    await withEnv({ C2C_CODEX_ECONOMY_MODE: "0" }, async () => {
+      const optOutWorkspace = makeWorkspace();
+      const optOutFake = makeFakeBinary();
+      const optOutClient = makeClient(optOutWorkspace, optOutFake.binary);
+      try {
+        await completed(optOutClient, "opt-out", 1, "first");
+        const start = readLog(optOutFake.log).find((entry) => entry.value.method === "turn/start")!;
+        expect((start.value.params as any).input[0].text).toBe("first");
+      } finally {
+        await optOutClient.close();
+      }
+    });
+  });
+
   it("enforces the remote thread and turn policy floor", async () => {
     const workspace = makeWorkspace();
     const fake = makeFakeBinary();
     const client = makeClient(workspace, fake.binary);
     try {
       const result = await completed(client, "task-policy", 1, "hello");
-      expect(result.summary).toBe("done:hello");
+      expect(result.summary).toContain("done:Execution contract:");
+      expect(result.summary).toContain("hello");
       const messages = readLog(fake.log).map((entry) => entry.value);
       const thread = messages.find((value) => value.method === "thread/start") as any;
       const turn = messages.find((value) => value.method === "turn/start") as any;
@@ -288,6 +419,40 @@ describe("Codex App Server execution boundary", () => {
     }
   });
 
+  it("does not spawn a child when the write-ahead hook fails", async () => {
+    const workspace = makeWorkspace();
+    const fake = makeFakeBinary();
+    const startedFile = fake.log + ".started";
+    const source = fs.readFileSync(fake.binary, "utf8");
+    fs.writeFileSync(fake.binary, source.replace('const here =', `fs.writeFileSync(${JSON.stringify(startedFile)}, 'spawned');\nconst here =`));
+    const client = new CodexAppServer({ workspaceRoot: workspace, binary: fake.binary, logger: nullLogger,
+      onRunStarting: () => { throw new Error("disk unavailable"); },
+    });
+    try {
+      await expect(client.startTurn("durable-deny", 1, "ok")).rejects.toMatchObject({ code: "TASK_JOURNAL_UNAVAILABLE" });
+      expect(fs.existsSync(startedFile)).toBe(false);
+      expect(readLog(fake.log)).toEqual([]);
+    } finally { await client.close(); }
+  });
+
+  it("does not report durable success when its terminal hook fails", async () => {
+    const workspace = makeWorkspace();
+    const fake = makeFakeBinary();
+    let starts = 0, terminals = 0;
+    const client = new CodexAppServer({ workspaceRoot: workspace, binary: fake.binary, logger: nullLogger,
+      onRunStarting: () => { starts++; },
+      onRunTerminal: () => { terminals++; throw new Error("terminal disk failure"); },
+    });
+    try {
+      const run = await client.startTurn("durable-fail", 1, "ok");
+      const result = await client.wait("durable-fail", run.run_id);
+      expect(result).toMatchObject({ state: "failed", reason: "task_journal_write_failed" });
+      expect(result.summary).toBeUndefined();
+      expect(starts).toBe(1); expect(terminals).toBe(1);
+      await expect(client.startTurn("after-durable-fail", 1, "ok")).rejects.toMatchObject({ code: "TASK_JOURNAL_UNAVAILABLE" });
+    } finally { await client.close(); }
+  });
+
   it("survives an early child exit and can start a fresh task", async () => {
     const workspace = makeWorkspace();
     const fake = makeFakeBinary();
@@ -296,7 +461,8 @@ describe("Codex App Server execution boundary", () => {
       await expect(client.startTurn("exit-task", 1, "EXIT")).resolves.toMatchObject({ state: "running" });
       await new Promise((resolve) => setTimeout(resolve, 50));
       const next = await completed(client, "after-exit", 1, "ok");
-      expect(next.summary).toBe("done:ok");
+      expect(next.summary).toContain("done:Execution contract:");
+      expect(next.summary).toContain("ok");
     } finally {
       await client.close();
     }

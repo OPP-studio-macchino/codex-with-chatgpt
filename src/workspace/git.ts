@@ -64,7 +64,19 @@ const MAX_SHARED_INDEX_FILES = 8;
 // ponytail: bounded full snapshot; replace with a descriptor-bound selective snapshot if this cap blocks normal repositories.
 const MAX_GIT_OBJECT_FILES = 20_000;
 const MAX_GIT_OBJECT_BYTES = 512 * 1024 * 1024;
-const MAX_GIT_SNAPSHOT_MS = 250;
+const DEFAULT_MAX_GIT_SNAPSHOT_MS = 250;
+const MAX_CONFIGURED_GIT_SNAPSHOT_MS = 10_000;
+
+function gitSnapshotTimeBudgetMs(): number {
+  const raw = process.env.C2C_GIT_SNAPSHOT_MS;
+  if (!raw || !/^\d+$/.test(raw)) return DEFAULT_MAX_GIT_SNAPSHOT_MS;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) &&
+    value >= DEFAULT_MAX_GIT_SNAPSHOT_MS &&
+    value <= MAX_CONFIGURED_GIT_SNAPSHOT_MS
+    ? value
+    : DEFAULT_MAX_GIT_SNAPSHOT_MS;
+}
 const GIT_COPY_BUFFER_BYTES = 64 * 1024;
 
 function gitBinary(): string | null {
@@ -385,6 +397,10 @@ function copyVerifiedObjectStore(source: string, destination: string, deadline: 
       fs.mkdirSync(to, { mode: 0o700 });
       for (const entry of fs.readdirSync(from)) {
         if (!withinDeadline(deadline)) return false;
+        // macOS/network filesystems can add AppleDouble sidecars beside real
+        // Git objects. They are not valid object-store entries. Exclude them
+        // only from the private read-only snapshot; never mutate the repo.
+        if (entry.startsWith("._")) continue;
         const childRelative = relative ? `${relative}/${entry}` : entry;
         if (childRelative === "info/alternates") return false;
         const childFrom = path.join(from, entry);
@@ -433,7 +449,7 @@ function createGitSnapshot(root: string): GitSnapshot | null {
       { mode: 0o600, flag: "wx" }
     );
     const snapshotObjects = path.join(temp, "objects");
-    const deadline = performance.now() + MAX_GIT_SNAPSHOT_MS;
+    const deadline = performance.now() + gitSnapshotTimeBudgetMs();
     if (!copyVerifiedObjectStore(layout.objectDir, snapshotObjects, deadline)) throw new Error("unsafe object store");
 
     const sourceIndex = path.join(layout.gitDir, "index");
@@ -606,6 +622,7 @@ export function gitInfo(root: string): GitInfo {
 export interface GitStatusResult {
   isRepo: boolean;
   branch: string | null;
+  head: string | null;
   upstream: string | null;
   ahead: number;
   behind: number;
@@ -621,6 +638,7 @@ function emptyStatus(): GitStatusResult {
   return {
     isRepo: false,
     branch: null,
+    head: null,
     upstream: null,
     ahead: 0,
     behind: 0,
@@ -651,6 +669,12 @@ export function gitStatus(root: string): GitStatusResult {
   if (!result.ok) return out;
 
   out.isRepo = true;
+  const layout = validatedGitDirectory(root);
+  const resolvedHead = layout ? resolveHead(layout) : null;
+  out.head =
+    resolvedHead?.oid && /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i.test(resolvedHead.oid)
+      ? resolvedHead.oid
+      : null;
   const policy = new IgnoreRules(root);
   const include = (filePath: string): boolean => {
     if (!policy.isSensitive(filePath)) return true;

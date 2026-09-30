@@ -43,6 +43,7 @@ import {
   type LastEndpoint,
 } from "../config/endpoint.js";
 import { PRODUCT_NAME, VERSION } from "../version.js";
+import { createInstalledDesktopAgent } from "../desktop/client.js";
 
 const program = new Command();
 
@@ -231,6 +232,7 @@ program
       trustedTunnelTokenFile: opts.trustedTunnelTokenFile,
       codexExecution: opts.codexExecution,
       codexBinary: opts.codexBinary,
+      desktopAgent: createInstalledDesktopAgent(logger),
       logger,
     });
     const shutdown = (): void => {

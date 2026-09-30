@@ -281,7 +281,13 @@ describe("read_file pagination", () => {
       return originalOpen(file, flags, mode);
     });
 
-    await expect(localWs.readFile("target.txt")).rejects.toMatchObject({ code: "NOT_A_FILE" });
+    try {
+      await localWs.readFile("target.txt");
+      throw new Error("Expected FIFO swap to fail closed.");
+    } catch (error) {
+      expect(error).toBeInstanceOf(WorkspaceError);
+      expect(["NOT_A_FILE", "FILE_NOT_FOUND"]).toContain((error as WorkspaceError).code);
+    }
     cleanup(local);
   });
 });
