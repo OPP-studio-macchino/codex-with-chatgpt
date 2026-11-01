@@ -64,12 +64,20 @@ jobs:
           # Five excluded suites test macOS-specific native approval, Git publish
           # and ps/lsof process identity; macOS RC2 testing covers all 102 files.
           # Do not claim those suites were run on Ubuntu.
+          # These two worker-fixture tests require node:module.registerHooks,
+          # which Node 20 does not provide; they remain required on Node 22/24.
+          node_major="$(node -p 'process.versions.node.split(".")[0]')"
+          declare -a node20_hook_exclusions=()
+          if [[ "$node_major" == "20" ]]; then
+            node20_hook_exclusions=(--exclude tests/git-read-cleanup.test.ts --exclude tests/reconciliation-worker-real.test.ts)
+          fi
           pnpm exec vitest run --maxWorkers=2 \
             --exclude tests/codex-approval-scope.test.ts \
             --exclude tests/git-publish.test.ts \
             --exclude tests/git-push-recovery.test.ts \
             --exclude tests/local-approval.test.ts \
-            --exclude tests/reconciliation-processes.test.ts
+            --exclude tests/reconciliation-processes.test.ts \
+            "${node20_hook_exclusions[@]}"
 
       - name: Validate Skill consent boundaries
         run: pnpm validate:skill
