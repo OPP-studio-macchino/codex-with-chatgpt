@@ -65,9 +65,8 @@ export function readSavedSession(file: string): SavedSession | null {
       (typeof raw.taskId !== "string" || !/^[A-Za-z0-9_.:-]{1,128}$/.test(raw.taskId))) ||
     (raw.iteration !== undefined &&
       (typeof raw.iteration !== "number" ||
-        !Number.isInteger(raw.iteration) ||
-        raw.iteration < 0 ||
-        raw.iteration > 10_000)) ||
+        !Number.isSafeInteger(raw.iteration) ||
+        raw.iteration < 0)) ||
     (raw.lastState !== undefined &&
       (typeof raw.lastState !== "string" || !/^[A-Z_]{2,32}$/.test(raw.lastState)))
   ) {

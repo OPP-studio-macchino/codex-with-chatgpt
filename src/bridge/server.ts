@@ -1,4 +1,5 @@
 import express, { type Request, type Response, type NextFunction } from "express";
+import { recordCommandObservation } from "../execution/command-evidence.js";
 import type { Server } from "node:http";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
@@ -17,6 +18,7 @@ import {
 } from "../auth/trusted-tunnel.js";
 import { PairingManager } from "../pairing/manager.js";
 import { createMcpServer, resolveWorkspaceTarget, type WorkspaceTarget } from "../mcp/server.js";
+import { TemporaryReadCoordinator } from "../desktop/temporary-read.js";
 import { createMcpHttpHandler } from "../mcp/http.js";
 import { CloudflaredQuickTunnel } from "../tunnel/cloudflared.js";
 import type { TunnelProvider } from "../tunnel/provider.js";
@@ -26,12 +28,12 @@ import { normalizeExternalBaseUrl } from "../config/transport.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 import { writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
 import { CodexAppServer } from "../codex/app-server.js";
-import { TaskJournal, inspectTaskJournalLayout } from "../execution/task-journal.js";
+import { TaskJournal, inspectTaskJournalLayout, workspaceUnregistrationSafety } from "../execution/task-journal.js";
 import { TaskReconciler, type ReconciliationOptions } from "../execution/task-reconciler.js";
 import { inspectForReconciliation } from "../execution/reconciliation-evidence.js";
 import { createNativeRecoveryApproval } from "../execution/reconciliation-approval.js";
 import { appendExecutionRecordOnce } from "../execution/records.js";
-import { createLocalSoundNotifier, type CompletionNotifier } from "../notifications/local-sound.js";
+import { createLocalSoundNotifier, startRunNotifications, type RunNotifier, type CompletionNotifier } from "../notifications/local-sound.js";
 import type { DesktopAgent } from "../desktop/client.js";
 
 export interface BridgeOptions {
@@ -57,6 +59,8 @@ export interface BridgeOptions {
   codexBinary?: string;
   /** Test-only injection; production uses C2C_COMPLETION_SOUND_PATH. */
   completionNotifier?: CompletionNotifier;
+  /** Trusted fixture seam; production uses the fixed local native notice channel. */
+  runNotifier?: RunNotifier;
   /** Optional Desktop Agent injection. Undefined auto-detects the installed local agent; null disables it. */
   desktopAgent?: DesktopAgent | null;
   /** Trusted in-process test seams only; never configurable through MCP or environment. */
@@ -113,6 +117,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     logger,
   });
   const desktopAgent = opts.desktopAgent ?? undefined;
+  const temporaryReads = desktopAgent ? new TemporaryReadCoordinator(desktopAgent) : undefined;
   const host = opts.host ?? DEFAULT_HOST;
   if (host !== "127.0.0.1" && host !== "::1" && host !== "localhost") {
     throw new Error("The bridge only binds to loopback addresses. Public exposure goes through the tunnel.");
@@ -146,7 +151,9 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   } =>
     workspaceProfiles?.current() ?? { id: "default", workspace, codexNetworkHosts: [] };
   const taskWorkspaces = new Map<string, string>();
-  const tasksByWorkspace = new Map<string, { journal: TaskJournal; reconciler: TaskReconciler }>();
+  let notificationsEnabled = false;
+  const tasksByWorkspace = new Map<string, { journal: TaskJournal; reconciler: TaskReconciler;
+    notifications?: ReturnType<typeof startRunNotifications> }>();
   const tasksFor = (target: WorkspaceTarget) => {
     const id = target.workspace.id;
     let tasks = tasksByWorkspace.get(id);
@@ -156,14 +163,23 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
         inspect: opts.reconciliationInspect ?? inspectForReconciliation,
         approve: opts.reconciliationApprove ?? createNativeRecoveryApproval(),
         isBusy: workspaceId => codexByProfile.get(workspaceId)?.hasBlockingRun() ?? false,
+        identity: workspaceId => {
+          const fresh = resolveWorkspaceTarget({ workspace, workspaceProfiles }, workspaceId);
+          return JSON.stringify({ workspaceId: fresh.workspace.id, root: fresh.workspace.root, profileId: fresh.id,
+            profiles: workspaceProfiles?.recoveryIdentity(), networkHosts: fresh.codexNetworkHosts,
+            codexExecution: opts.codexExecution === true, desktopRead: opts.desktopAgent !== undefined,
+            desktopWrite: opts.desktopAgent !== undefined });
+        },
       });
       tasks = { journal, reconciler };
       tasksByWorkspace.set(id, tasks);
     }
+    if (notificationsEnabled && !tasks.notifications) tasks.notifications = startRunNotifications(tasks.journal, id, logger, opts.runNotifier, completionNotifier);
     return tasks;
   };
   const workspaceRegistration = opts.codexExecution && workspaceProfiles
-    ? new WorkspaceRegistration(workspaceProfiles, opts.folderOwner ?? createNativeFolderOwner())
+    ? new WorkspaceRegistration(workspaceProfiles, opts.folderOwner ?? createNativeFolderOwner(), workspaceId =>
+      codexByProfile.get(workspaceId)?.hasBlockingRun() ? "blocking" : workspaceUnregistrationSafety(workspaceId))
     : undefined;
   const resolveWorkspace = (id?: string) => resolveWorkspaceTarget({ workspace, workspaceProfiles }, id);
   const getCodex = (current: WorkspaceTarget): CodexAppServer | undefined => {
@@ -176,6 +192,11 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
         logger,
         allowedNetworkHosts: current.codexNetworkHosts,
         onRunStarting: (run, instruction) => tasksFor(current).journal.begin(current.workspace.id, run, instruction),
+        onCommandObservation: (run, item) => recordCommandObservation(current.workspace.id, current.workspace.root, run, item),
+        onElicitation: (run, event) => tasksFor(current).journal.recordElicitation(current.workspace.id, run, event),
+        onRunNotification: (run, eventId) => {
+          tasksFor(current).notifications?.dispatch(run, eventId);
+        },
         onRunTerminal: (run) => {
           tasksFor(current).journal.complete(current.workspace.id, run);
           // Durable history does not depend on a later MCP wait call.
@@ -183,6 +204,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
             appendExecutionRecordOnce(current.workspace.id, {
               taskId: run.task_id, iteration: run.iteration, runId: run.run_id,
               changedFiles: null, tests: null,
+              ...(run.approval_diagnostic ? { approval_diagnostic: run.approval_diagnostic } : {}),
               exitStatus: run.state === "completed" ? "ok" : run.state === "blocked" ? "blocked" : "failed",
               timestamp: new Date().toISOString(), notes: run.summary ?? run.reason,
             });
@@ -258,6 +280,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
         codex: getCodex(current),
         completionNotifier,
         desktopAgent,
+        temporaryReads,
       });
     },
     logger
@@ -387,6 +410,10 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   });
 
   app.post("/admin/revoke-all", adminGuard, (_req, res) => {
+    temporaryReads?.cancelAll();
+    for (const client of codexByProfile.values()) {
+      void client.close().catch(() => logger.warn("Codex shutdown after revocation failed."));
+    }
     for (const { reconciler } of tasksByWorkspace.values()) reconciler.cancelPending();
     workspaceRegistration?.cancelPending();
     const count = authStore.revokeAll();
@@ -443,6 +470,9 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const shutdown = async (): Promise<void> => {
     if (closed) return;
     closed = true;
+    notificationsEnabled = false;
+    temporaryReads?.close();
+    await Promise.all([...tasksByWorkspace.values()].map(tasks => tasks.notifications?.close()));
     for (const { reconciler } of tasksByWorkspace.values()) reconciler.close();
     workspaceRegistration?.close();
     await Promise.all(
@@ -458,6 +488,16 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   try { persistRuntime(); } catch (error) {
     await shutdown();
     throw error;
+  }
+
+  // Open only approved profile journals. No selection change or Codex invocation.
+  if (opts.codexExecution) {
+    notificationsEnabled = true;
+    const ids = workspaceProfiles?.list().map(profile => profile.workspaceId) ?? [workspace.id];
+    for (const id of ids) {
+      try { tasksFor(resolveWorkspace(id)); }
+      catch { logger.warn("Profile notice recovery unavailable; inspect task_status."); }
+    }
   }
 
   app.use((_error: unknown, _req: Request, res: Response, _next: NextFunction) => {

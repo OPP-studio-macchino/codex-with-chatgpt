@@ -332,7 +332,7 @@ describe("workspace identity", () => {
     write(named, ".c2c.json", JSON.stringify({ name: "Remi", maxIterations: 12 }));
     const namedWs = new Workspace(named);
     expect(namedWs.name).toBe("Remi");
-    expect(namedWs.projectConfig.maxIterations).toBe(12);
+    expect(namedWs.projectConfig).not.toHaveProperty("maxIterations");
     cleanup(named);
   });
 
@@ -373,6 +373,21 @@ describe("workspace identity", () => {
     cleanup(outsideManifest);
   });
 
+  it("recognizes a Django backend even when package.json is also present", async () => {
+    const mixed = makeTmpDir("django-with-node-helper");
+    write(mixed, "package.json", JSON.stringify({ scripts: { assets: "echo assets" } }));
+    write(mixed, "package-lock.json", "{}");
+    write(mixed, "requirements-prod.lock", "Django==5.2\\n");
+    write(mixed, "manage.py", "import os\\nos.environ.setdefault('DJANGO_SETTINGS_MODULE', 'app.settings')\\n");
+    const mixedWs = new Workspace(mixed);
+    const project = await mixedWs.detectProject();
+    expect(project).toMatchObject({ projectType: "python", packageManager: "npm" });
+    expect(project.languages).toEqual(expect.arrayContaining(["JavaScript", "Python"]));
+    expect(project.frameworks).toContain("Django");
+    expect(project.scriptNames).toContain("assets");
+    cleanup(mixed);
+  });
+
   it("fails closed when project metadata is swapped before descriptor open", async () => {
     const local = makeTmpDir("project-metadata-swap");
     const external = makeTmpDir("project-metadata-outside");
@@ -407,7 +422,7 @@ describe("workspace identity", () => {
     const configuredWs = new Workspace(configured);
     expect(configuredWs.name).not.toContain("\u0000");
     expect(configuredWs.name).not.toContain("\u202e");
-    expect(configuredWs.projectConfig.maxIterations).toBeUndefined();
+    expect(configuredWs.projectConfig).not.toHaveProperty("maxIterations");
     cleanup(configured);
   });
 });

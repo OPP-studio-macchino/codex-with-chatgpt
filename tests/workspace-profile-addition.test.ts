@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { Workspace } from "../src/workspace/manager.js";
 import { WorkspaceProfiles } from "../src/workspace/profiles.js";
+import { makeTmpDir } from "./helpers.js";
 
 let base: string;
 let file: string;
@@ -21,8 +22,8 @@ function config(extra: Array<Record<string, unknown>> = []) {
 const load = () => WorkspaceProfiles.load(new Workspace(root), file)!;
 beforeEach(() => {
   previous = process.env.C2C_STATE_DIR;
-  // Canonical OS temp storage, independent of the checkout filesystem (including exFAT).
-  base = fs.realpathSync.native(fs.mkdtempSync(path.join(process.platform === "darwin" ? "/private/tmp" : os.tmpdir(), "profile-add-")));
+  // Use the runner's owned fixture root; retain the real filesystem mode checks.
+  base = makeTmpDir("profile-add");
   process.env.C2C_STATE_DIR = mkdir(path.join(base, "state"));
   root = mkdir(path.join(base, "repos", "alpha"));
   target = mkdir(path.join(base, "repos", "new project"));
@@ -108,10 +109,11 @@ it("rejects forged, foreign and reused candidates", () => {
 });
 it("failed persistence leaves memory and config unchanged", () => {
   const p = load(); const token = p.prepareAddition(target); const bytes = fs.readFileSync(file);
+  const entries = fs.readdirSync(path.dirname(file)).sort();
   vi.spyOn(fs, "renameSync").mockImplementation(() => { throw new Error("write failed"); });
   expect(() => p.commitApprovedAddition(token)).toThrow(/write failed/);
   expect(p.count).toBe(1); expect(fs.readFileSync(file)).toEqual(bytes);
-  expect(fs.readdirSync(path.dirname(file))).toEqual(["profiles.json"]);
+  expect(fs.readdirSync(path.dirname(file)).sort()).toEqual(entries);
 });
 it("unknown durability disables further registration without adding to memory", () => {
   const p = load(); const token = p.prepareAddition(target); const sync = fs.fsyncSync;
@@ -133,14 +135,35 @@ it("rejects config symlinks, parent symlinks, hard links and permissive modes", 
   const alias = path.join(base, "alias"); fs.symlinkSync(path.dirname(file), alias);
   expect(() => WorkspaceProfiles.load(new Workspace(root), path.join(alias, path.basename(file)))).toThrow(/Symlink/);
 });
-it("enforces the limit and resolves deterministic ID collisions without overwriting", () => {
+it("accepts more than sixteen profiles and resolves deterministic ID collisions without overwriting", () => {
   let p = load(); const id = p.prepareAddition(target).profileId;
   config([{ id, path: mkdir(path.join(base, "other")) }]); p = load();
   const token = p.prepareAddition(target); expect(token.profileId).not.toBe(id); expect(token.profileId.length).toBeLessThanOrEqual(64);
   p.commitApprovedAddition(token); expect(p.get(id).workspace.root).toBe(path.join(base, "other"));
-  config(Array.from({ length: 15 }, (_, i) => ({ id: `p${i}`, path: mkdir(path.join(base, `repo${i}`)) })));
-  p = load(); expect(() => p.prepareAddition(target)).toThrow(/limit/);
+  config(Array.from({ length: 16 }, (_, i) => ({ id: `p${i}`, path: mkdir(path.join(base, `repo${i}`)) })));
+  p = load(); expect(p.count).toBe(17);
+  p.commitApprovedAddition(p.prepareAddition(target)); expect(p.count).toBe(18);
   expect(p.prepareAddition(root).alreadyRegistered).toBe(true);
+});
+it("removes only a non-default, non-selected registration and preserves project data", () => {
+  const beta = mkdir(path.join(base, "repos", "beta")); fs.writeFileSync(path.join(beta, "keep.txt"), "keep");
+  config([{ id: "beta", path: beta }]); const p = load(); const before = fs.readFileSync(file);
+  const candidate = p.prepareRemoval("beta"); const removed = p.commitApprovedRemoval(candidate);
+  expect(removed).toMatchObject({ id: "beta", selected: false }); expect(p.count).toBe(1);
+  expect(() => p.get("beta")).toThrow(/not owner-approved/);
+  expect(fs.readFileSync(path.join(beta, "keep.txt"), "utf8")).toBe("keep");
+  expect(fs.existsSync(path.join(process.env.C2C_STATE_DIR!, "task-journal"))).toBe(false);
+  expect(JSON.parse(fs.readFileSync(file, "utf8")).profiles).toEqual([{ id: "alpha", path: root, codexNetworkHosts: ["EXAMPLE.COM"], custom: 42 }]);
+  expect(fs.readFileSync(file)).not.toEqual(before);
+  expect(() => p.commitApprovedRemoval(candidate)).toThrow(/consumed/);
+});
+it("refuses default, selected, forged, and changed removal candidates", () => {
+  const beta = mkdir(path.join(base, "repos", "beta")); config([{ id: "beta", path: beta }]); const p = load();
+  expect(() => p.prepareRemoval("alpha")).toThrow(/default anchor/);
+  p.select("beta"); expect(() => p.prepareRemoval("beta")).toThrow(/Select another/);
+  p.select("alpha"); const candidate = p.prepareRemoval("beta");
+  expect(() => p.commitApprovedRemoval({ ...candidate })).toThrow(/Unknown/);
+  fs.appendFileSync(file, " "); expect(() => p.commitApprovedRemoval(candidate)).toThrow(/reload/);
 });
 it("refuses existing locks, including symlinks, without deleting them", () => {
   const p = load(); const bytes = fs.readFileSync(file);

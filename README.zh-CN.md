@@ -12,6 +12,18 @@
 
 English: [README.md](README.md) · 日本語: [README.ja.md](README.ja.md)
 
+
+## 项目注册与注销（RC2 候选版本）
+
+在已认证且经过 Mac 所有者批准的连接中，通过 workspace_register_start 请求注册项目，使用 workspace_register_status 查询结果。文件夹必须由 Mac 所有者亲自选择并单独确认；远程调用方不能指定任意路径或提交批准标志。
+
+注销前从 workspace_profiles 获取已注册的 profile ID，仅在所有者明确提出注销时调用 workspace_unregister_start，并通过 workspace_unregister_status 查询结果。Mac 会显示独立、默认拒绝的确认窗口。注销只会删除 C2C 中的项目注册记录，**不会删除项目目录、源文件、Journal 或执行历史**。默认项目、当前选中项目、存在运行中任务或状态不明确的项目不得注销。
+
+原有固定的 16 项目限制已移除，但所有者配置文件仍设有 64 KiB 容量上限；超过 100 条的项目列表使用分页。每个 Mac 原生确认窗口最长等待 45 分钟，无响应则拒绝。
+
+**注意：以上描述的是 RC2 源码候选版本，不代表当前运行的 Bridge 或 ChatGPT 插件已经更新。** 正式部署与实际设备验收另行执行。
+
+
 ## 真实的数据边界
 
 ChatGPT 调用 MCP 工具时，请求到的源码片段、搜索结果、diff、路径和执行摘要会离开

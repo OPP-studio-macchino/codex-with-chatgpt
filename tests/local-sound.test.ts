@@ -2,13 +2,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { ChildProcess } from "node:child_process";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { nullLogger } from "../src/logger/index.js";
-import { createLocalSoundNotifier } from "../src/notifications/local-sound.js";
+import { createLocalSoundNotifier, notifyLocalRun } from "../src/notifications/local-sound.js";
 
 const dirs: string[] = [];
 
 afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllEnvs();
   for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -59,4 +61,16 @@ describe("local completion sound", () => {
 
     expect(() => notifier?.()).not.toThrow();
   });
+});
+
+const notice = { notification_id: "c".repeat(64), category: "completed" as const, workspace_id: "a".repeat(24), task_id: "task", run_id: "b".repeat(32), state: "completed" as const };
+it("contains native helper errors without exposing raw text and never runs off macOS", async () => {
+  const logger = { ...nullLogger, warn: vi.fn() };
+  const state = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-notice-state-")); dirs.push(state); vi.stubEnv("C2C_STATE_DIR", state);
+  const execute = vi.fn(async () => { throw new Error("nonce=secret proof=secret"); });
+  expect(await notifyLocalRun(notice, logger, "darwin", execute)).toEqual({ outcome: "process_error" });
+  const calls = execute.mock.calls.length;
+  expect(await notifyLocalRun(notice, logger, "linux", execute)).toEqual({ outcome: "unavailable" });
+  expect(execute).toHaveBeenCalledTimes(calls);
+  expect(JSON.stringify(logger.warn.mock.calls)).not.toMatch(/nonce=|proof=/);
 });

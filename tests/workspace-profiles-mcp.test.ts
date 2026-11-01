@@ -2,11 +2,21 @@ import fs from "node:fs";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { ensureTrustedTunnelToken, TRUSTED_TUNNEL_HEADER } from "../src/auth/trusted-tunnel.js";
 import { cleanup, isolateStateDir, makeGitRepo, makeTmpDir, write } from "./helpers.js";
+
+// The explicit validation build supplies the real worker entry; Vitest's source
+// transform does not create the .js file launched by Node Worker.
+vi.mock("../src/workspace/git-read-worker.js", async original => {
+  const build = process.env.C2C_RECONCILIATION_TEST_BUILD;
+  if (!build) return original();
+  const { resolve } = await import("node:path");
+  const { pathToFileURL } = await import("node:url");
+  return import(pathToFileURL(resolve(build, "workspace/git-read-worker.js")).href);
+});
 
 const roots: string[] = [];
 const bridges: Bridge[] = [];
@@ -50,9 +60,11 @@ async function connect(bridge: Bridge, trustedToken: string): Promise<Client> {
   return client;
 }
 
-function jsonOf<T>(result: { content?: unknown }): T {
-  const content = result.content as Array<{ type: string; text: string }>;
-  return JSON.parse(content[0]?.text ?? "{}") as T;
+function jsonOf<T>(result: Awaited<ReturnType<Client["callTool"]>>): T {
+  if (!Array.isArray(result.content)) throw new Error("Expected immediate tool content");
+  const first = result.content[0];
+  if (first?.type !== "text" || typeof first.text !== "string") throw new Error("Expected tool JSON text");
+  return JSON.parse(first.text) as T;
 }
 
 describe("owner-approved workspace profiles", () => {
@@ -74,6 +86,7 @@ describe("owner-approved workspace profiles", () => {
 
     const start = async (): Promise<{ bridge: Bridge; client: Client }> => {
       const bridge = await startBridge({
+        completionNotifier: () => undefined, runNotifier: async () => ({ outcome: "unavailable" }),
         workspaceRoot: alpha,
         workspaceProfilesFile: configFile,
         port: 0,
@@ -159,6 +172,7 @@ describe("owner-approved workspace profiles", () => {
 
     await expect(
       startBridge({
+        completionNotifier: () => undefined, runNotifier: async () => ({ outcome: "unavailable" }),
         workspaceRoot: alpha,
         workspaceProfilesFile: configFile,
         port: 0,

@@ -1,10 +1,22 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { CodexAppServer } from "../src/codex/app-server.js";
 import { nullLogger } from "../src/logger/index.js";
 import { cleanup, makeTmpDir } from "./helpers.js";
+
+// Test-only process adapter: executable validation uses a trusted system binary;
+// the child is an offline fixture under the explicitly permitted test TMPDIR.
+let fixtureBinary = "";
+vi.mock("node:child_process", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, spawn: (...args: any[]) => actual.spawn(process.execPath, [fixtureBinary], args[2]) };
+});
+vi.mock("../src/codex/local-approval.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../src/codex/local-approval.js")>();
+  return { ...actual, nativeLocalApproval: vi.fn(async () => "denied") };
+});
 
 const externalDirs: string[] = [];
 const workspaceDirs: string[] = [];
@@ -89,7 +101,7 @@ process.stdin.on("data", (chunk) => {
     }
     if (message.method === "initialized") continue;
     if (message.method === "thread/start") {
-      send({ id: message.id, result: { thread: { id: "thread-" + (++threadCounter) } } });
+      send({ id: message.id, result: { cwd: message.params.cwd, approvalPolicy: "on-request", approvalsReviewer: "user", sandbox: message.params.sandbox === "read-only" ? { type: "readOnly", networkAccess: false } : { type: "workspaceWrite", writableRoots: [], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true }, thread: { id: "thread-" + (++threadCounter) } } });
       continue;
     }
     if (message.method === "turn/start") {
@@ -127,14 +139,15 @@ function readLog(file: string): Array<Record<string, unknown>> {
 async function run(mode: string, allowedNetworkHosts: readonly string[] = ["ttc.taxi-inf.jp"]) {
   const workspace = makeWorkspace();
   const fake = makeFakeBinary();
+  fixtureBinary = fake.binary;
   const client = new CodexAppServer({
     workspaceRoot: workspace,
-    binary: fake.binary,
+    binary: "/usr/bin/true",
     logger: nullLogger,
     allowedNetworkHosts,
   });
   try {
-    const started = await client.startTurn("network-task", 1, mode);
+    const started = await client.startTurn("network-task", 1, mode, "workspace_write");
     const result = await client.wait("network-task", started.run_id);
     return { result, log: readLog(fake.log) };
   } finally {
@@ -152,17 +165,22 @@ describe("Codex exact-host network approval boundary", () => {
     }));
   });
 
-  it("keeps the default fail-closed behavior without an owner allowlist", async () => {
+  it("requires native consent without an owner allowlist (mocked denial)", async () => {
     const { result, log } = await run("NETWORK_ALLOWED", []);
-    expect(result).toMatchObject({ state: "blocked", reason: "approval_required" });
+    expect(result).toMatchObject({ state: "failed", reason: "local_approval_denied" });
     expect(log.some((message) => (
       message.id === "network-1" &&
       JSON.stringify(message).includes('"decision":"accept"')
     ))).toBe(false);
   });
 
+  it("unlisted host requires native consent and stays denied without it", async () => {
+    const { result, log } = await run("NETWORK_WRONG_HOST");
+    expect(result).toMatchObject({ state: "failed", reason: "local_approval_denied" });
+    expect(log.some(m => isRecord(m.result) && m.result.decision === "accept")).toBe(false);
+  });
+
   it.each([
-    "NETWORK_WRONG_HOST",
     "NETWORK_HTTP",
     "NETWORK_FILE_PERMISSION",
   ])("blocks out-of-scope network approval: %s", async (mode) => {

@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { SUPPORTED_SCOPES, filterScopes, invalidScopes } from "../src/auth/store.js";
 import {
@@ -13,6 +13,13 @@ import {
 import { Workspace } from "../src/workspace/manager.js";
 import { appendExecutionRecord, readExecutionRecords } from "../src/execution/records.js";
 import { cleanup, isolateStateDir, makeGitRepo, makeTmpDir } from "./helpers.js";
+
+import { notifyLocalRun } from "../src/notifications/local-sound.js";
+import { CodexAppServer } from "../src/codex/app-server.js";
+vi.mock("../src/notifications/local-sound.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../src/notifications/local-sound.js")>(),
+  notifyLocalRun: vi.fn(async () => ({ outcome: "notice_acknowledged" })),
+}));
 
 const roots: string[] = [];
 const external: string[] = [];
@@ -33,10 +40,14 @@ function makeRoot(name: string): string {
   return root;
 }
 
-function makeFakeCodex(): string {
+function makeFakeCodex(questions = false): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-mcp-codex-"));
   external.push(dir);
   const binary = path.join(dir, "codex-fake.mjs");
+  if (questions) {
+    fs.writeFileSync(binary, fs.readFileSync(new URL("./fixtures/codex-input.mjs", import.meta.url)), { mode: 0o700 });
+    return binary;
+  }
   fs.writeFileSync(binary, `#!/usr/bin/env node
 let buffer=""; let thread=0; let turn=0;
 const send=(v)=>process.stdout.write(JSON.stringify(v)+"\\n");
@@ -44,7 +55,7 @@ process.stdin.setEncoding("utf8");
 process.stdin.on("data",(chunk)=>{ buffer+=chunk; while(buffer.includes("\\n")){
  const i=buffer.indexOf("\\n"); const line=buffer.slice(0,i); buffer=buffer.slice(i+1); if(!line.trim()) continue;
  const m=JSON.parse(line); if(m.method==="initialize") send({id:m.id,result:{userAgent:"fake"}});
- else if(m.method==="thread/start") send({id:m.id,result:{thread:{id:"t"+(++thread)}}});
+ else if(m.method==="thread/start") send({id:m.id,result:{cwd: m.params.cwd, approvalPolicy: "on-request", approvalsReviewer: "user", sandbox: m.params.sandbox === "read-only" ? { type: "readOnly", networkAccess: false } : { type: "workspaceWrite", writableRoots: [], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true }, thread:{id:"t"+(++thread)}}});
  else if(m.method==="turn/start"){ const id="u"+(++turn); send({id:m.id,result:{turn:{id,status:"inProgress",items:[],error:null}}});
   const text=m.params.input?.[0]?.text ?? "";
   if(text.endsWith("APPROVAL")){ send({id:"approval-1",method:"item/commandExecution/requestApproval",params:{}}); continue; }
@@ -70,19 +81,21 @@ async function connect(
   return client;
 }
 
-async function makeExecutionBridge(name: string): Promise<{ bridge: Bridge; client: Client }> {
+async function makeExecutionBridge(name: string, questions = false): Promise<{ bridge: Bridge; client: Client }> {
   isolateStateDir();
   const root = makeRoot(name);
   const workspace = new Workspace(root);
   const tokenState = ensureTrustedTunnelToken(workspace.id);
   const token = fs.readFileSync(tokenState.file, "utf8").trim();
   const bridge = await startBridge({
+    completionNotifier: () => undefined,
     workspaceRoot: root,
     port: 0,
     persistRuntime: false,
     trustedTunnelTokenFile: tokenState.file,
     codexExecution: true,
-    codexBinary: makeFakeCodex(),
+    runNotifier: (notice, logger) => notifyLocalRun(notice, logger),
+    codexBinary: makeFakeCodex(questions),
     authStoreFile: path.join(makeTmpDir("auth"), `${name}.json`),
   });
   bridges.push(bridge);
@@ -99,10 +112,53 @@ const DEFAULT_TOOLS = [
 ].sort();
 
 describe("Codex MCP execution opt-in", () => {
+  it("rejects caller authority expansion before execution and never infers writer mode from instructions", async () => {
+    const { client } = await makeExecutionBridge("execution-mode-contract");
+    const start = vi.spyOn(CodexAppServer.prototype, "startTurn");
+    try {
+      const base = { task_id: "mode-contract", iteration: 1, instruction: "You are the writer. Modify files now." };
+      const invalid = [
+        ...[null, "writer", "workspace-write", {}, [], true, 1].map(execution_mode => ({ execution_mode })),
+        ...["config", "cwd", "path", "workspaceRoot", "writableRoots", "sandbox", "sandboxPolicy", "networkAccess", "permissions", "role", "provider"].map(key => ({ [key]: key === "networkAccess" ? true : "/tmp" })),
+      ];
+      for (const extra of invalid) {
+        expect((await client.callTool({ name: "codex_turn_start", arguments: { ...base, ...extra } })).isError).toBe(true);
+      }
+      expect(start).not.toHaveBeenCalled();
+      const body = (r: any) => JSON.parse(r.content[0].text);
+      const reader = body(await client.callTool({ name: "codex_turn_start", arguments: base }));
+      expect(reader.execution_mode).toBe("read_only");
+      await client.callTool({ name: "codex_turn_wait", arguments: { task_id: base.task_id, run_id: reader.run_id } });
+      for (const iteration of [1, 2]) {
+        expect(body(await client.callTool({ name: "codex_turn_start", arguments: { ...base, iteration, execution_mode: "workspace_write" } })).error).toBe("EXECUTION_MODE_MISMATCH");
+      }
+      const writer = body(await client.callTool({ name: "codex_turn_start", arguments: { ...base, task_id: "explicit-writer", execution_mode: "workspace_write" } }));
+      expect(writer.execution_mode).toBe("workspace_write");
+    } finally { start.mockRestore(); }
+  });
+
+  it("revokes pending input on the real isolated HTTP admin path", async () => {
+    const { bridge, client } = await makeExecutionBridge("pending-revoke", true);
+    const body = (r: any) => JSON.parse(r.content[0].text);
+    const started = body(await client.callTool({ name: "codex_turn_start", arguments: { task_id: "pending", iteration: 1, instruction: "ASK" } }));
+    const run = body(await client.callTool({ name: "codex_turn_wait", arguments: { task_id: "pending", run_id: started.run_id } }));
+    expect(run.resumable).toBe(true);
+    expect(readExecutionRecords(bridge.workspace.id, 10)).toEqual([]);
+    const revoked = await fetch(`${bridge.localBaseUrl()}/admin/revoke-all`, {
+      method: "POST", headers: { authorization: `Bearer ${bridge.adminToken}` },
+    });
+    expect(revoked.status).toBe(200);
+    await expect(client.callTool({ name: "codex_turn_reply", arguments: {
+      task_id: "pending", run_id: run.run_id, input_request_id: run.input_request_id, message: "Small",
+    } })).rejects.toThrow();
+    expect(readExecutionRecords(bridge.workspace.id, 10)).toMatchObject([{ runId: run.run_id, exitStatus: "failed", notes: "bridge_stopped" }]);
+  });
+
   it("keeps the default surface at exactly eight tools", async () => {
     isolateStateDir();
     const root = makeRoot("codex-mcp-default");
     const bridge = await startBridge({
+      completionNotifier: () => undefined, runNotifier: async () => ({ outcome: "unavailable" }),
       workspaceRoot: root,
       port: 0,
       persistRuntime: false,
@@ -124,18 +180,20 @@ describe("Codex MCP execution opt-in", () => {
     const tokenState = ensureTrustedTunnelToken(workspace.id);
     const token = fs.readFileSync(tokenState.file, "utf8").trim();
     const bridge = await startBridge({
+      completionNotifier: () => undefined,
       workspaceRoot: root,
       port: 0,
       persistRuntime: false,
       trustedTunnelTokenFile: tokenState.file,
       codexExecution: true,
-      codexBinary: makeFakeCodex(),
+      runNotifier: (notice, logger) => notifyLocalRun(notice, logger),
+    codexBinary: makeFakeCodex(),
       authStoreFile: path.join(makeTmpDir("auth"), "exec.json"),
     });
     bridges.push(bridge);
     const client = await connect(bridge, { [TRUSTED_TUNNEL_HEADER]: token });
     const names = toolNames((await client.listTools()).tools);
-    expect(names).toEqual([...DEFAULT_TOOLS, "codex_turn_start", "codex_turn_wait", "task_status", "task_resume_context", "task_reconcile_start", "task_reconcile_status"].sort());
+    expect(names).toEqual([...DEFAULT_TOOLS, "codex_mcp_elicitation_reply", "workspace_recovery_start", "workspace_recovery_status", "codex_turn_start", "codex_turn_wait", "codex_turn_reply", "codex_turn_approval_status", "codex_run_observation", "codex_runtime_status", "codex_execution_preflight", "task_status", "task_resume_context", "task_reconcile_start", "task_reconcile_status", "task_checkpoint_start", "git_publish_plan", "git_publish_checkpoint", "git_push_plan", "git_push_checkpoint", "completion_notify"].sort());
 
     const started = await client.callTool({
       name: "codex_turn_start",
@@ -191,7 +249,8 @@ describe("Codex MCP execution opt-in", () => {
     expect(repeatedRecords.records.filter((record) => record.runId === startBody.run_id)).toHaveLength(1);
   });
 
-  it("notifies only on explicit completion_notify, never on turns or repeated polling", async () => {
+  it("notifies each background transition once and preserves explicit completion_notify", async () => {
+    vi.mocked(notifyLocalRun).mockClear();
     isolateStateDir();
     const root = makeRoot("codex-mcp-notify");
     const workspace = new Workspace(root);
@@ -204,14 +263,15 @@ describe("Codex MCP execution opt-in", () => {
       persistRuntime: false,
       trustedTunnelTokenFile: tokenState.file,
       codexExecution: true,
-      codexBinary: makeFakeCodex(),
+      runNotifier: (notice, logger) => notifyLocalRun(notice, logger),
+    codexBinary: makeFakeCodex(),
       completionNotifier: () => { notifications++; },
       authStoreFile: path.join(makeTmpDir("auth"), "notify.json"),
     });
     bridges.push(bridge);
     const client = await connect(bridge, { [TRUSTED_TUNNEL_HEADER]: token });
     expect(toolNames((await client.listTools()).tools)).toEqual(
-      [...DEFAULT_TOOLS, "codex_turn_start", "codex_turn_wait", "task_status", "task_resume_context", "task_reconcile_start", "task_reconcile_status", "completion_notify"].sort()
+      [...DEFAULT_TOOLS, "codex_mcp_elicitation_reply", "workspace_recovery_start", "workspace_recovery_status", "codex_turn_start", "codex_turn_wait", "codex_turn_reply", "codex_turn_approval_status", "codex_run_observation", "codex_runtime_status", "codex_execution_preflight", "task_status", "task_resume_context", "task_reconcile_start", "task_reconcile_status", "task_checkpoint_start", "git_publish_plan", "git_publish_checkpoint", "git_push_plan", "git_push_checkpoint", "completion_notify"].sort()
     );
     for (const [taskId, instruction, state] of [
       ["notify-complete", "ok", "completed"],
@@ -231,13 +291,18 @@ describe("Codex MCP execution opt-in", () => {
         });
         expect(waited.isError ?? false).toBe(false);
         expect(JSON.parse((waited.content as { text: string }[])[0].text).state).toBe(state);
-        expect(notifications).toBe(0);
+        expect(notifications).toBe(1);
+        expect(vi.mocked(notifyLocalRun).mock.calls.filter(([run]) => run.run_id === run_id)).toHaveLength(1);
+        const status = await client.callTool({ name: "task_status", arguments: { task_id: taskId } });
+        expect(JSON.parse((status.content as { text: string }[])[0].text)).toMatchObject({
+          tasks: [{ notifications: [{ event_id: "terminal", state, kind: state === "completed" ? "completion" : "owner_attention" }] }],
+        });
       }
     }
     const result = await client.callTool({ name: "completion_notify", arguments: {} });
     expect(result.isError ?? false).toBe(false);
     expect(JSON.parse((result.content as { text: string }[])[0].text)).toEqual({ notification: "requested" });
-    expect(notifications).toBe(1);
+    expect(notifications).toBe(2);
   });
 
   it("does not re-record a retained run after its record rotates out", async () => {
@@ -387,7 +452,8 @@ describe("Codex MCP execution opt-in", () => {
       persistRuntime: false,
       trustedTunnelTokenFile: tunnel.file,
       codexExecution: true,
-      codexBinary: makeFakeCodex(),
+      runNotifier: (notice, logger) => notifyLocalRun(notice, logger),
+    codexBinary: makeFakeCodex(),
       completionNotifier: () => { notifications++; },
       authStoreFile: path.join(makeTmpDir("auth"), "oauth.json"),
     });
@@ -398,7 +464,7 @@ describe("Codex MCP execution opt-in", () => {
     }).accessToken;
     const client = await connect(bridge, { authorization: `Bearer ${token}` });
     expect(toolNames((await client.listTools()).tools)).toEqual(
-      [...DEFAULT_TOOLS, "codex_turn_start", "codex_turn_wait", "task_status", "task_resume_context", "task_reconcile_start", "task_reconcile_status", "completion_notify"].sort()
+      [...DEFAULT_TOOLS, "codex_mcp_elicitation_reply", "workspace_recovery_start", "workspace_recovery_status", "codex_turn_start", "codex_turn_wait", "codex_turn_reply", "codex_turn_approval_status", "codex_run_observation", "codex_runtime_status", "codex_execution_preflight", "task_status", "task_resume_context", "task_reconcile_start", "task_reconcile_status", "task_checkpoint_start", "git_publish_plan", "git_publish_checkpoint", "git_push_plan", "git_push_checkpoint", "completion_notify"].sort()
     );
     const denied = await client.callTool({
       name: "codex_turn_start",

@@ -27,7 +27,7 @@ process.stdout.write(JSON.stringify({ ok: true, result: request }) + "\\n");
       cleanup(root);
     }
   });
-  it("gives native approval requests enough time for the 30-second default-deny dialog", async () => {
+  it("gives native approval requests enough time for the 45-minute default-deny dialog", async () => {
     const root = makeTmpDir("desktop-client-approval-deadline");
     try {
       const rpcPath = write(root, "rpc.mjs", `
@@ -43,8 +43,8 @@ process.stdout.write(JSON.stringify({ ok: true, result: request }) + "\\n");
         const result = await client.call({ op }) as { requestDeadlineAt: string };
         const after = Date.now();
         const deadline = Date.parse(result.requestDeadlineAt);
-        expect(deadline).toBeGreaterThanOrEqual(before + 42_000);
-        expect(deadline).toBeLessThanOrEqual(after + 43_500);
+        expect(deadline).toBeGreaterThanOrEqual(before + 2_707_000);
+        expect(deadline).toBeLessThanOrEqual(after + 2_709_500);
       }
     } finally {
       cleanup(root);

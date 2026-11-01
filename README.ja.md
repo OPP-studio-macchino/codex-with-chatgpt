@@ -18,6 +18,16 @@ ChatGPT に、選択したローカル作業領域を読み取り専用 MCP 経�
 
 English: [README.md](README.md) · 中文: [README.zh-CN.md](README.zh-CN.md)
 
+## プロジェクト追加・登録解除（RC2検証候補）
+
+認証されたC2C接続では、workspace_register_startを使い、Macの本人がフォルダ選択と別の承認を行う。workspace_register_statusは結果確認専用。リモート側から任意のフォルダパスや許可フラグを渡す仕組みではない。
+
+登録解除は、workspace_profilesで得た登録済みprofile IDをworkspace_unregister_startに渡し、workspace_unregister_statusで結果を確認する。Mac本人の別ダイアログで対象を明示し、既定は「拒否」。**登録を解除してもプロジェクトのフォルダ・ファイル・Journal・実行履歴は削除しない**。default/anchor、現在選択中、実行中、承認待ち、状態不明のプロジェクトは解除できない。
+
+従来の固定16件上限は撤廃。ただしownerの設定ファイルには64KiBの容量上限が残り、100件超の一覧はページングされる。Mac本人承認の各画面は無応答なら最長45分で拒否する。
+
+**注意：ここに記した機能はRC2ソース候補の仕様。稼働中BridgeとChatGPT側の接続ツールへ反映されたという意味ではない。** 本番更新・実機受入は別工程。
+
 ## 先に知っておくべきこと
 
 ChatGPT が MCP ツールを呼ぶと、要求されたソース抜粋、検索結果、diff、パス、

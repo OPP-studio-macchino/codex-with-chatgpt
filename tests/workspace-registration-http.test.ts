@@ -28,7 +28,7 @@ let buffer='',t=0,u=0;const send=(v)=>process.stdout.write(JSON.stringify(v)+'\\
 process.stdin.setEncoding('utf8');process.stdin.on('data',c=>{buffer+=c;while(buffer.includes('\\n')){
  const i=buffer.indexOf('\\n'),l=buffer.slice(0,i);buffer=buffer.slice(i+1);if(!l.trim())continue;const m=JSON.parse(l);
  if(m.method==='initialize')send({id:m.id,result:{userAgent:'fixture'}});
- if(m.method==='thread/start')send({id:m.id,result:{thread:{id:'t'+(++t)}}});
+ if(m.method==='thread/start')send({id:m.id,result:{cwd: m.params.cwd, approvalPolicy: "on-request", approvalsReviewer: "user", sandbox: m.params.sandbox === "read-only" ? { type: "readOnly", networkAccess: false } : { type: "workspaceWrite", writableRoots: [], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true }, thread:{id:'t'+(++t)}}});
  if(m.method==='turn/start'){
   const id='u'+(++u),threadId=m.params.threadId;
   send({id:m.id,result:{turn:{id,status:'inProgress',items:[],error:null}}});
@@ -45,6 +45,7 @@ process.stdin.setEncoding('utf8');process.stdin.on('data',c=>{buffer+=c;while(bu
     const bridge = await startBridge({ workspaceRoot: alpha.root, workspaceProfilesFile: config,
       port: 0, persistRuntime: false, trustedTunnelTokenFile: tokenState.file,
       codexExecution: true, codexBinary: binary, authStoreFile: path.join(root, "auth.json"), folderOwner: owner,
+      runNotifier: async () => ({ outcome: "unavailable" }), completionNotifier: () => undefined,
     }); cleanups.push(() => bridge.close());
     const client = new Client({ name: "registration-fixture", version: "1" });
     await client.connect(new StreamableHTTPClientTransport(new URL(`${bridge.localBaseUrl()}/mcp`), {

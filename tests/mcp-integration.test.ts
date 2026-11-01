@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -6,17 +6,29 @@ import { startBridge, type Bridge } from "../src/bridge/server.js";
 import { appendExecutionRecord } from "../src/execution/records.js";
 import { makeTmpDir, cleanup, write, makeGitRepo, git, isolateStateDir } from "./helpers.js";
 
+// The explicit validation build supplies the real worker entry; Vitest's source
+// transform does not create the .js file launched by Node Worker.
+vi.mock("../src/workspace/git-read-worker.js", async original => {
+  const build = process.env.C2C_RECONCILIATION_TEST_BUILD;
+  if (!build) return original();
+  const { resolve } = await import("node:path");
+  const { pathToFileURL } = await import("node:url");
+  return import(pathToFileURL(resolve(build, "workspace/git-read-worker.js")).href);
+});
+
 let root: string;
 let bridge: Bridge;
 let client: Client;
 let accessToken: string;
 
-function textOf(result: { content?: unknown }): string {
-  const content = result.content as { type: string; text: string }[];
-  return content?.[0]?.text ?? "";
+function textOf(result: Awaited<ReturnType<Client["callTool"]>>): string {
+  if (!Array.isArray(result.content)) throw new Error("Expected immediate tool content");
+  const first = result.content[0];
+  if (first?.type !== "text" || typeof first.text !== "string") throw new Error("Expected tool text");
+  return first.text;
 }
 
-function jsonOf<T = Record<string, unknown>>(result: { content?: unknown }): T {
+function jsonOf<T = Record<string, unknown>>(result: Awaited<ReturnType<Client["callTool"]>>): T {
   return JSON.parse(textOf(result)) as T;
 }
 
@@ -43,6 +55,7 @@ beforeAll(async () => {
   write(root, "src/index.ts", "export const answer = 43; // changed\n");
 
   bridge = await startBridge({
+    completionNotifier: () => undefined, runNotifier: async () => ({ outcome: "unavailable" }),
     workspaceRoot: root,
     port: 0,
     persistRuntime: false,

@@ -1,13 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { getStateDir, readJsonIfExists, writeSecureJson } from "../config/paths.js";
 import { Workspace } from "./manager.js";
 import { normalizeCodexNetworkHosts } from "../codex/network-policy.js";
 
 const PROFILE_ID = /^[A-Za-z0-9_.-]{1,64}$/;
-const MAX_PROFILES = 16;
 const MAX_CONFIG_BYTES = 64 * 1024;
 
 interface RawProfile {
@@ -116,6 +115,11 @@ export interface WorkspaceAdditionCandidate {
   readonly alreadyRegistered: boolean;
 }
 
+export interface WorkspaceRemovalCandidate {
+  readonly profileId: string;
+  readonly workspace: Workspace;
+}
+
 interface AdditionSnapshot {
   bytes: Buffer;
   root: string;
@@ -135,6 +139,7 @@ function validateProfileId(value: unknown, label: string): string {
 
 export class WorkspaceProfiles {
   private readonly additions = new WeakMap<WorkspaceAdditionCandidate, AdditionSnapshot>();
+  private readonly removals = new WeakMap<WorkspaceRemovalCandidate, AdditionSnapshot>();
   private registrationUnavailable = false;
   private configBytes: Buffer;
   private readonly profiles = new Map<string, WorkspaceProfile>();
@@ -156,10 +161,10 @@ export class WorkspaceProfiles {
         "Workspace profiles config must use version 1 and a profiles array."
       );
     }
-    if (raw.profiles.length < 1 || raw.profiles.length > MAX_PROFILES) {
+    if (raw.profiles.length < 1) {
       throw new WorkspaceProfilesError(
         "INVALID_WORKSPACE_PROFILES_FILE",
-        `Workspace profiles config must contain 1-${MAX_PROFILES} profiles.`
+        "Workspace profiles config must contain at least one profile."
       );
     }
 
@@ -245,6 +250,12 @@ export class WorkspaceProfiles {
     return bytes;
   }
 
+  recoveryIdentity(): string {
+    const bytes = this.checkConfig();
+    const stat = fs.lstatSync(this.configFile);
+    return createHash("sha256").update(bytes).update(JSON.stringify([this.configFile, stat.dev, stat.ino, stat.mode, stat.uid, stat.nlink])).digest("hex");
+  }
+
   private validateAddition(root: string): fs.Stats {
     noSymlinks(root);
     const stat = fs.lstatSync(root);
@@ -268,7 +279,6 @@ export class WorkspaceProfiles {
     const root = fs.realpathSync.native(selectedPath);
     const identity = this.validateAddition(root);
     const existing = [...this.profiles.values()].find(profile => profile.workspace.root === root);
-    if (!existing && this.count >= MAX_PROFILES) failure("Workspace profile limit (16) reached.");
     const workspace = existing?.workspace ?? new Workspace(root);
     if (!sameIdentity(identity, this.validateAddition(root))) failure("Selected folder changed; select it again.");
     const stem = path.basename(root).replace(/[^A-Za-z0-9_.-]/g, "-").slice(0, 37) || "workspace";
@@ -293,7 +303,7 @@ export class WorkspaceProfiles {
     };
     revalidate();
     if (candidate.alreadyRegistered) return this.list().find(profile => profile.id === candidate.profileId)!;
-    if (this.count >= MAX_PROFILES || this.profiles.has(candidate.profileId)) failure("Profile limit or ID conflict; request approval again.");
+    if (this.profiles.has(candidate.profileId)) failure("Profile ID conflict; request approval again.");
     const directory = path.dirname(this.configFile);
     const parent = fs.lstatSync(directory);
     if (!parent.isDirectory() || (typeof process.getuid === "function" && parent.uid !== process.getuid()) || (parent.mode & 0o022) !== 0) {
@@ -334,6 +344,91 @@ export class WorkspaceProfiles {
       this.configBytes = bytes;
       this.profiles.set(candidate.profileId, { id: candidate.profileId, workspace: candidate.workspace, codexNetworkHosts: [] });
       return this.list().find(profile => profile.id === candidate.profileId)!;
+    } catch (error) {
+      if (renamed) {
+        this.registrationUnavailable = true;
+        failure("Registration durability is unknown; reload profiles before registering again.");
+      }
+      throw error;
+    } finally {
+      if (temp && !renamed) { try { fs.unlinkSync(temp); } catch { /* best effort */ } }
+      try {
+        noSymlinks(lock);
+        if (sameIdentity(fs.fstatSync(lockFd), fs.lstatSync(lock))) fs.unlinkSync(lock);
+      } finally { fs.closeSync(lockFd); }
+    }
+  }
+
+  /** A trusted controller may remove only a non-anchor, non-selected profile. */
+  prepareRemoval(profileId: string): WorkspaceRemovalCandidate {
+    const bytes = this.checkConfig();
+    const profile = this.get(profileId);
+    if (profile.id === this.defaultProfileId) {
+      failure("The default anchor workspace cannot be unregistered.");
+    }
+    if (profile.id === this.selectedProfileId) {
+      failure("Select another workspace before unregistering this project.");
+    }
+    const candidate = Object.freeze({ profileId: profile.id, workspace: profile.workspace });
+    this.removals.set(candidate, { bytes, root: profile.workspace.root,
+      identity: fs.lstatSync(this.configFile), state: fs.realpathSync.native(getStateDir()) });
+    return candidate;
+  }
+
+  /** Called only after a one-time local owner approval. It never touches workspace data. */
+  commitApprovedRemoval(candidate: WorkspaceRemovalCandidate): WorkspaceProfileSummary {
+    const snapshot = this.removals.get(candidate);
+    if (!snapshot) failure("Unknown or consumed removal candidate; request approval again.");
+    this.removals.delete(candidate);
+    const profile = this.profiles.get(candidate.profileId);
+    const revalidate = () => {
+      if (!this.checkConfig().equals(snapshot.bytes)) failure("Profiles changed; request approval again.");
+      if (!profile || profile.workspace !== candidate.workspace || candidate.workspace.root !== snapshot.root ||
+          candidate.profileId === this.defaultProfileId || candidate.profileId === this.selectedProfileId ||
+          fs.realpathSync.native(getStateDir()) !== snapshot.state) {
+        failure("Workspace selection or profiles changed; request approval again.");
+      }
+    };
+    revalidate();
+    const summary = this.list().find(item => item.id === candidate.profileId)!;
+    const directory = path.dirname(this.configFile);
+    const parent = fs.lstatSync(directory);
+    if (!parent.isDirectory() || (typeof process.getuid === "function" && parent.uid !== process.getuid()) || (parent.mode & 0o022) !== 0) {
+      failure("Profiles parent directory must be same-owner and not writable by others.");
+    }
+    const lock = `${this.configFile}.lock`;
+    let lockFd: number;
+    try {
+      lockFd = fs.openSync(lock, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW, 0o600);
+    } catch {
+      failure("Profiles registration is locked; retry after the other writer finishes. Existing locks are never removed automatically.");
+    }
+    let temp: string | undefined;
+    let renamed = false;
+    try {
+      privateFile(fs.fstatSync(lockFd));
+      revalidate();
+      const raw = JSON.parse(snapshot.bytes.toString("utf8")) as RawConfig;
+      const bytes = Buffer.from(JSON.stringify({ ...raw, profiles: (raw.profiles as RawProfile[]).filter(entry => entry.id !== candidate.profileId) }, null, 2) + "\n");
+      if (bytes.length > MAX_CONFIG_BYTES) failure("Profiles config would exceed its size limit.");
+      temp = `${this.configFile}.${randomBytes(12).toString("hex")}.tmp`;
+      const fd = fs.openSync(temp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW, 0o600);
+      try {
+        privateFile(fs.fstatSync(fd));
+        fs.writeFileSync(fd, bytes);
+        fs.fsyncSync(fd);
+      } finally { fs.closeSync(fd); }
+      revalidate();
+      noSymlinks(directory);
+      if (!sameIdentity(parent, fs.lstatSync(directory))) failure("Profiles parent changed; reload and retry.");
+      fs.renameSync(temp, this.configFile);
+      renamed = true;
+      const dirFd = fs.openSync(directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+      try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
+      if (!readOwnerConfig(this.configFile).equals(bytes)) failure("Persisted profiles changed; reload profiles.");
+      this.configBytes = bytes;
+      this.profiles.delete(candidate.profileId);
+      return summary;
     } catch (error) {
       if (renamed) {
         this.registrationUnavailable = true;

@@ -42,6 +42,16 @@ ephemeral context was lost fails closed with `TASK_CONTEXT_EXPIRED` on its next
 iteration, while a retained terminal result for the same task and iteration is
 returned idempotently.
 
+## Owner-approved workspace registration and removal (RC2 candidate)
+
+With an authenticated, owner-approved multi-workspace C2C connection, request a new project through workspace_register_start and inspect workspace_register_status. The Mac owner chooses a folder and separately approves it. No path or approval flag is accepted from the remote caller.
+
+To stop C2C access to a registered project, obtain its profile ID from workspace_profiles, then request workspace_unregister_start and check workspace_unregister_status. The local Mac shows a distinct, default-deny confirmation naming the target. Removal **only unregisters C2C access**; project directories, files, task journals, and execution history are never deleted. Default/anchor, selected, busy, unreconciled, or unknown-state projects cannot be unregistered. Approvals are never silently reused.
+
+The historical fixed 16-profile registration limit has been removed. The private owner configuration file remains bounded at 64 KiB, and lists are paginated after 100 entries. Each native owner dialog may remain available for up to 45 minutes, with default denial. Registration history is bounded separately from the number of profiles.
+
+**Release status:** These capabilities describe the RC2 source candidate. They do not imply the currently running bridge or this ChatGPT session has already been upgraded. Production rollout requires a separate release acceptance and host tool refresh.
+
 ## The data boundary, plainly stated
 
 When ChatGPT calls a tool, the selected source excerpts, search results, diffs,
@@ -173,10 +183,10 @@ Codex request on the user's behalf.
 
 C2C prepends a compact execution contract only to the first turn of a task,
 then reuses that task's context. Its default local limits are 8 KiB per
-instruction, 8 KiB per summary, and four iterations. Set
+instruction and 8 KiB per summary. There is no per-task iteration cap. Set
 `C2C_CODEX_MAX_INSTRUCTION_BYTES` (1024–16384),
-`C2C_CODEX_MAX_SUMMARY_BYTES` (1024–32768), or
-`C2C_CODEX_MAX_ITERATIONS` (1–12) to adjust each limit. Set
+`C2C_CODEX_MAX_SUMMARY_BYTES` (1024–32768) to adjust those limits.
+The retired `C2C_CODEX_MAX_ITERATIONS` and project `maxIterations` settings are ignored. Set
 `C2C_CODEX_ECONOMY_MODE=0` only to omit the first-turn contract. These
 mechanisms reduce repeated context and bound local output; actual token savings
 vary by task.
@@ -186,9 +196,32 @@ vary by task.
 Set `C2C_COMPLETION_SOUND_PATH=/absolute/path/to/sound-file` to an existing
 absolute local regular file. On macOS, C2C plays it with `/usr/bin/afplay`; no
 extra dependency is required. A successful Codex `turn/completed` plays it
-automatically exactly once, while failed or blocked work does not. Playback is
+automatically exactly once on transition, while failed or blocked work does not. Playback is
 best effort: a playback failure never changes a successful work result into a
 failure.
+
+Background Codex completion, failure, blocked requests (including unsupported
+approval, MCP elicitation and unknown server requests), live user input and
+local approval waits generate transition-only journal notification events.
+Repeated status polling does not alert again. `task_status` exposes
+`tasks[].notifications` on the next MCP interaction, including after journal
+reload; live questions and reply tokens are never persisted or restored.
+Events distinguish `completion` from `owner_attention`.
+
+On macOS each event requests a native notification with a distinct completion
+or owner-attention title, even without a configured sound. Other platforms
+emit a local bridge log notice. Native delivery is best effort and subject to
+OS notification settings; failures are logged. Events record the notification
+request, not proof that the owner saw it. Journal capacity and storage failures
+retain the existing fail-closed execution behavior; a recording failure emits
+a local attention notice. A crash between recording and local delivery can
+lose the local alert; saved events remain available and are not replayed as
+duplicate alerts on restart.
+
+C2C cannot push a message into an idle ChatGPT conversation. Durable journal
+events, local notifications/logs, and state returned on the next MCP interaction
+are separate surfaces. The timeout shield remains cooperative guidance to yield
+and resume, not a host-side timer or push mechanism.
 
 When both the trusted C2C Codex-execution connection and this sound are
 configured, C2C also advertises `completion_notify`. ChatGPT Web and the

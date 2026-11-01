@@ -14,6 +14,7 @@ beforeAll(async () => {
   root = makeTmpDir("oauth-ws");
   write(root, "hello.txt", "hello oauth\n");
   bridge = await startBridge({
+    completionNotifier: () => undefined, runNotifier: async () => ({ outcome: "unavailable" }),
     workspaceRoot: root,
     port: 0,
     persistRuntime: false,
@@ -81,7 +82,7 @@ async function createPendingRequest(clientId: string, challenge: string): Promis
   authorizeUrl.searchParams.set("code_challenge", challenge);
   authorizeUrl.searchParams.set("code_challenge_method", "S256");
   authorizeUrl.searchParams.set("scope", "workspace.read");
-  const response = await fetch(authorizeUrl);
+  const response = await fetch(authorizeUrl, { redirect: "manual" });
   expect(response.status).toBe(200);
   const html = await response.text();
   const requestId = html.match(/name="request_id" value="([a-f0-9]+)"/)?.[1];
@@ -314,7 +315,7 @@ describe("authorization + token flow", () => {
     url.searchParams.set("response_type", "code");
     url.searchParams.set("code_challenge", challenge);
     url.searchParams.set("code_challenge_method", "S256");
-    const page = await (await fetch(url)).text();
+    const page = await (await fetch(url, { redirect: "manual" })).text();
     expect(page).not.toContain('<script>alert("x")</script>');
     expect(page).toContain("&lt;script&gt;");
     expect(page).toContain("OAuth callback");

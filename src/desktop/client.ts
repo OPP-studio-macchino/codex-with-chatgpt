@@ -1,3 +1,4 @@
+import { OWNER_DIALOG_REQUEST_TIMEOUT_MS } from "../security/owner-dialog-timeouts.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -8,15 +9,16 @@ const MAX_REQUEST_BYTES = 1024 * 1024;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const PROCESS_REQUEST_TIMEOUT_MS = 125_000;
-const APPROVAL_REQUEST_TIMEOUT_MS = 45_000;
+const APPROVAL_REQUEST_TIMEOUT_MS = OWNER_DIALOG_REQUEST_TIMEOUT_MS;
 const DEFAULT_REQUEST_DEADLINE_MARGIN_MS = 2_000;
 const PROCESS_REQUEST_DEADLINE_MARGIN_MS = 5_000;
 const APPROVAL_REQUEST_DEADLINE_MARGIN_MS = 2_000;
 
 export type DesktopAgentRequest = Record<string, unknown>;
+export interface TrustedReadContext { authority: "c2c-owner:desktop.read"; scope: string }
 
 export interface DesktopAgent {
-  call(request: DesktopAgentRequest): Promise<unknown>;
+  call(request: DesktopAgentRequest, trustedRead?: TrustedReadContext): Promise<unknown>;
 }
 
 export class DesktopAgentError extends Error {
@@ -63,6 +65,10 @@ function defaultPaths(): { rpcPath: string; configPath: string } | null {
 }
 
 function requestTiming(request: DesktopAgentRequest): { timeoutMs: number; deadlineAt: string } {
+  if (request.op === "temporaryReadStatus" || request.op === "temporaryReadRequest") {
+    const timeoutMs = request.op === "temporaryReadStatus" ? 5_000 : OWNER_DIALOG_REQUEST_TIMEOUT_MS;
+    return { timeoutMs, deadlineAt: new Date(Date.now() + timeoutMs - 2_000).toISOString() };
+  }
   const processRun = request.op === "processRun";
   const approvalRequest = request.op === "accessibilityApprovalRequest" || request.op === "accessibilityTextApprovalRequest";
   const timeoutMs = processRun ? PROCESS_REQUEST_TIMEOUT_MS : approvalRequest ? APPROVAL_REQUEST_TIMEOUT_MS : DEFAULT_REQUEST_TIMEOUT_MS;
@@ -84,13 +90,28 @@ export class DesktopAgentClient implements DesktopAgent {
     this.nodeBinary = validateRegularFile(opts.nodeBinary ?? process.execPath, "Node executable");
   }
 
-  async call(request: DesktopAgentRequest): Promise<unknown> {
+  async call(request: DesktopAgentRequest, trustedRead?: TrustedReadContext): Promise<unknown> {
+    const temporary = ["temporaryReadStatus", "temporaryReadRequest", "temporaryRead", "temporaryReadRevoke"].includes(String(request.op));
+    if (temporary && (!trustedRead || trustedRead.authority !== "c2c-owner:desktop.read" || !/^[A-Za-z0-9:_-]{1,256}$/.test(trustedRead.scope))) {
+      throw new DesktopAgentError("TRUSTED_READ_REQUIRED", "Trusted read context required.");
+    }
+    if (temporary) {
+      const allowed = request.op === "temporaryReadStatus" ? ["op"] : request.op === "temporaryReadRequest" ? ["op", "absolutePath", "requestDeadlineAt"] : ["op", "grantId"];
+      if (Object.keys(request).some(key => !allowed.includes(key))) {
+        throw new DesktopAgentError("INVALID_TEMPORARY_READ_REQUEST", "Unexpected temporary read field.");
+      }
+    }
+    const env = childEnvironment();
+    if (temporary && trustedRead) {
+      env.OPP_DESKTOP_TRUSTED_READ_AUTHORITY = trustedRead.authority;
+      env.OPP_DESKTOP_TRUSTED_READ_SCOPE = trustedRead.scope;
+    }
     // The caller never controls this lease: leave time to return a fail-closed
     // response before the outer hard-kill fires.
     const timing = requestTiming(request);
     const payload = JSON.stringify({
       ...request,
-      requestDeadlineAt: timing.deadlineAt,
+      ...(!temporary || request.op === "temporaryReadRequest" ? { requestDeadlineAt: timing.deadlineAt } : {}),
     });
     if (Buffer.byteLength(payload, "utf8") > MAX_REQUEST_BYTES) {
       throw new DesktopAgentError("REQUEST_TOO_LARGE", "Desktop Agent request exceeds the local limit.");
@@ -104,7 +125,7 @@ export class DesktopAgentClient implements DesktopAgent {
           [this.rpcPath, "--config", this.configPath],
           {
             shell: false,
-            env: childEnvironment(),
+            env,
             stdio: ["pipe", "pipe", "pipe"],
             windowsHide: true,
           }

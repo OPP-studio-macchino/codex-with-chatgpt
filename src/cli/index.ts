@@ -1017,7 +1017,7 @@ session
     const file = sessionFile(workspace.id);
     const previous = readSavedSession(file);
     const iteration = opts.iteration ? Number.parseInt(opts.iteration, 10) : previous?.iteration;
-    if (iteration !== undefined && (!Number.isInteger(iteration) || iteration < 0 || iteration > 10_000)) {
+    if (iteration !== undefined && (!Number.isSafeInteger(iteration) || iteration < 0)) {
       throw new Error("Invalid session iteration.");
     }
     if (opts.task && !/^[A-Za-z0-9_.:-]{1,128}$/.test(opts.task)) throw new Error("Invalid session task id.");

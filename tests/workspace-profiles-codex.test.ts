@@ -43,7 +43,7 @@ process.stdin.on("data",(chunk)=>{ buffer+=chunk; while(buffer.includes("\\n")){
  const i=buffer.indexOf("\\n"); const line=buffer.slice(0,i); buffer=buffer.slice(i+1); if(!line.trim()) continue;
  const m=JSON.parse(line);
  if(m.method==="initialize") send({id:m.id,result:{userAgent:"fake"}});
- else if(m.method==="thread/start") send({id:m.id,result:{thread:{id:"t"+(++thread)}}});
+ else if(m.method==="thread/start") send({id:m.id,result:{cwd: m.params.cwd, approvalPolicy: "on-request", approvalsReviewer: "user", sandbox: m.params.sandbox === "read-only" ? { type: "readOnly", networkAccess: false } : { type: "workspaceWrite", writableRoots: [], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true }, thread:{id:"t"+(++thread)}}});
  else if(m.method==="turn/start"){
    const id="u"+(++turn);
    send({id:m.id,result:{turn:{id,status:"inProgress",items:[],error:null}}});
@@ -59,9 +59,11 @@ process.stdin.on("data",(chunk)=>{ buffer+=chunk; while(buffer.includes("\\n")){
   return binary;
 }
 
-function jsonOf<T>(result: { content?: unknown }): T {
-  const content = result.content as Array<{ text: string }>;
-  return JSON.parse(content[0]?.text ?? "{}") as T;
+function jsonOf<T>(result: Awaited<ReturnType<Client["callTool"]>>): T {
+  if (!Array.isArray(result.content)) throw new Error("Expected immediate tool content");
+  const first = result.content[0];
+  if (first?.type !== "text" || typeof first.text !== "string") throw new Error("Expected tool JSON text");
+  return JSON.parse(first.text) as T;
 }
 
 describe("workspace profiles with Codex execution", () => {
@@ -97,6 +99,7 @@ describe("workspace profiles with Codex execution", () => {
       persistRuntime: false,
       trustedTunnelTokenFile: tokenState.file,
       codexExecution: true,
+      runNotifier: async () => ({ outcome: "unavailable" }), completionNotifier: () => undefined,
       codexBinary: makeFakeCodex(),
       authStoreFile: path.join(makeTmpDir("profile-codex-auth"), "store.json"),
     });
@@ -204,12 +207,30 @@ describe("workspace profiles with Codex execution", () => {
     expect((await call(other, "codex_turn_wait", { task_id: "bound-alpha", run_id: a.run_id, workspace_id: betaId })).error).toBe("TASK_WORKSPACE_MISMATCH");
     const collision = await call(client, "codex_turn_start", { ...startArgs, task_id: "collision", workspace_id: alphaId });
     expect(collision.error).toBe("TURN_ACTIVE");
-    const [doneA, doneB] = await Promise.all([
+    const [firstA, firstB] = await Promise.all([
       call(client, "codex_turn_wait", { task_id: "bound-alpha", run_id: a.run_id, workspace_id: alphaId }),
       call(other, "codex_turn_wait", { task_id: "bound-beta", run_id: b.run_id, workspace_id: betaId }),
     ]);
+    // A timeout-shield response is non-terminal. Simulate the next host request
+    // after the recommended pause; never treat running as completed.
+    const awaitDeferredTerminal = async (
+      response: Record<string, any>, connection: Client, taskId: string, runId: string, workspaceId: string
+    ) => {
+      if (response.state === "completed") return response;
+      expect(response.state).toBe("running");
+      expect(response.timeout_shield?.yield_required).toBe(true);
+      expect(response.next_action?.kind).toBe("wait_same_run");
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      return call(connection, "codex_turn_wait", { task_id: taskId, run_id: runId, workspace_id: workspaceId });
+    };
+    const [doneA, doneB] = await Promise.all([
+      awaitDeferredTerminal(firstA, client, "bound-alpha", a.run_id, alphaId),
+      awaitDeferredTerminal(firstB, other, "bound-beta", b.run_id, betaId),
+    ]);
+    expect(doneA.state).toBe("completed");
+    expect(doneB.state).toBe("completed");
     expect(doneA.summary).toBe(`cwd-name:${path.basename(alpha)}`);
     expect(doneB.summary).toBe(`cwd-name:${path.basename(beta)}`);
 
-  });
+  }, 60_000);
 });

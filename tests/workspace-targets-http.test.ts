@@ -38,7 +38,7 @@ process.stdin.on('data',(chunk)=>{buffer+=chunk;while(buffer.includes('\\n')){
  const i=buffer.indexOf('\\n'),line=buffer.slice(0,i);buffer=buffer.slice(i+1);if(!line.trim())continue;
  const m=JSON.parse(line);
  if(m.method==='initialize')send({id:m.id,result:{userAgent:'fixture'}});
- if(m.method==='thread/start')send({id:m.id,result:{thread:{id:'t'+(++thread)}}});
+ if(m.method==='thread/start')send({id:m.id,result:{cwd: m.params.cwd, approvalPolicy: "on-request", approvalsReviewer: "user", sandbox: m.params.sandbox === "read-only" ? { type: "readOnly", networkAccess: false } : { type: "workspaceWrite", writableRoots: [], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true }, thread:{id:'t'+(++thread)}}});
  if(m.method==='turn/start'){
   const id='u'+(++turn),threadId=m.params.threadId;
   send({id:m.id,result:{turn:{id,status:'inProgress',items:[],error:null}}});
@@ -56,6 +56,7 @@ process.stdin.on('data',(chunk)=>{buffer+=chunk;while(buffer.includes('\\n')){
   const bridge = await startBridge({ workspaceRoot: alpha.root, workspaceProfilesFile: config,
     port: 0, persistRuntime: false, trustedTunnelTokenFile: tokenState.file,
     codexExecution: true, codexBinary: binary, authStoreFile: path.join(root, "auth.json"),
+    runNotifier: async () => ({ outcome: "unavailable" }), completionNotifier: () => undefined,
   });
   finalizers.push(() => bridge.close());
   async function connect() {
@@ -108,8 +109,10 @@ it("two HTTP clients run in their explicitly bound repos while the global select
 
 it("missing and unknown targets return actionable errors over HTTP without executing", async () => {
   const s = await setup();
-  const args = { task_id: "missing", iteration: 1, instruction: "fixture only", run_id: "a".repeat(32) };
   for (const name of ["codex_turn_start", "codex_turn_wait"]) {
+    const args = name === "codex_turn_start"
+      ? { task_id: "missing", iteration: 1, instruction: "fixture only" }
+      : { task_id: "missing", run_id: "a".repeat(32) };
     expect((await s.a(name, args)).error).toBe("WORKSPACE_ID_REQUIRED");
     expect((await s.a(name, { ...args, workspace_id: "0".repeat(24) })).error).toBe("WORKSPACE_ID_UNKNOWN");
   }

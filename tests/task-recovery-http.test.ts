@@ -41,7 +41,7 @@ process.stdin.on('data',chunk=>{buffer+=chunk;while(buffer.includes('\\n')){
  const i=buffer.indexOf('\\n'),line=buffer.slice(0,i);buffer=buffer.slice(i+1);if(!line.trim())continue;
  const m=JSON.parse(line);
  if(m.method==='initialize')send({id:m.id,result:{userAgent:'fake'}});
- if(m.method==='thread/start')send({id:m.id,result:{thread:{id:'t'+(++t)}}});
+ if(m.method==='thread/start')send({id:m.id,result:{cwd: m.params.cwd, approvalPolicy: "on-request", approvalsReviewer: "user", sandbox: m.params.sandbox === "read-only" ? { type: "readOnly", networkAccess: false } : { type: "workspaceWrite", writableRoots: [], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true }, thread:{id:'t'+(++t)}}});
  if(m.method==='turn/start'){
   fs.appendFileSync(log,JSON.stringify({event:'turn'})+'\\n');
   const id='u'+(++u),threadId=m.params.threadId;
@@ -60,6 +60,7 @@ process.stdin.on('data',chunk=>{buffer+=chunk;while(buffer.includes('\\n')){
     const bridge = await startBridge({ workspaceRoot: alpha.root, workspaceProfilesFile: config,
       port: 0, persistRuntime: false, trustedTunnelTokenFile: tokenState.file,
       codexExecution: true, codexBinary: binary, authStoreFile: path.join(root,"auth.json"),
+      runNotifier: async () => ({ outcome: "unavailable" }), completionNotifier: () => undefined,
     });
     cleanupActions.push(() => bridge.close());
     const client = new Client({ name: "restart-fixture", version: "1" });

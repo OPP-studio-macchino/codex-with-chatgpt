@@ -1,11 +1,15 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { nullLogger } from "../src/logger/index.js";
 import type { CodexAppServer } from "../src/codex/app-server.js";
 import { createMcpServer } from "../src/mcp/server.js";
 import { Workspace } from "../src/workspace/manager.js";
+import { cleanup, makeTmpDir } from "./helpers.js";
+
+const roots: string[] = [];
+afterEach(() => { for (const root of roots.splice(0)) cleanup(root); });
 
 async function connect(
   notifier?: () => void,
@@ -15,8 +19,9 @@ async function connect(
   client: Client;
   close: () => Promise<void>;
 }> {
+  const root = makeTmpDir("completion-mcp"); roots.push(root);
   const server = createMcpServer({
-    workspace: new Workspace(process.cwd()),
+    workspace: new Workspace(root),
     logger: nullLogger,
     codex,
     completionNotifier: notifier,

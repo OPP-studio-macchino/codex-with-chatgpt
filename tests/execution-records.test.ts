@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
-import { appendExecutionRecord, readExecutionRecords } from "../src/execution/records.js";
+import { appendExecutionRecord, readExecutionRecords, readLegacySnapshot } from "../src/execution/records.js";
 import { isolateStateDir } from "./helpers.js";
 
 let stateDir: string;
@@ -11,6 +11,18 @@ beforeEach(() => {
 });
 
 describe("execution record boundary", () => {
+  it("keeps malformed/null/legacy/large records bounded without fabricating diagnostics",()=>{
+    const workspaceId="continuity-legacy";
+    appendExecutionRecord(workspaceId,{taskId:"old",iteration:1,changedFiles:null,tests:null,exitStatus:"blocked",timestamp:new Date().toISOString()});
+    const file=path.join(stateDir,"executions",`${workspaceId}.jsonl`);
+    fs.appendFileSync(file,["null","{broken",JSON.stringify({taskId:"large",iteration:2,exitStatus:"ok",timestamp:new Date().toISOString(),notes:"x".repeat(100000),tests:null,changedFiles:Array(1000).fill("src/a.ts"),approval_diagnostic:{raw:"secret"}})].join("\n")+"\n");
+    for(const limit of [3,10,50]) {
+      const records=readExecutionRecords(workspaceId,limit);
+      expect(records).toHaveLength(limit===3?1:2);expect(records.at(-1)!.notes!.length).toBeLessThan(600);
+      expect(records.every(r=>r.approval_diagnostic_available===false)).toBe(true);
+      expect(JSON.stringify(records)).not.toContain("secret");
+    }
+  });
   it("redacts summaries and sensitive changed paths before persistence", () => {
     const token = "sk-proj-abcdefghijklmnopqrstuvwxyz1234567890";
     appendExecutionRecord("workspace-test", {
@@ -101,16 +113,16 @@ describe("execution record boundary", () => {
     fs.symlinkSync(external, path.join(recordsDir, `${workspaceId}.jsonl`));
 
     expect(readExecutionRecords(workspaceId)).toEqual([]);
-    appendExecutionRecord(workspaceId, {
+    expect(() => appendExecutionRecord(workspaceId, {
       taskId: "c2c_safe",
       iteration: 1,
       changedFiles: 0,
       tests: null,
       exitStatus: "ok",
       timestamp: new Date().toISOString(),
-    });
+    })).toThrow();
     expect(fs.readFileSync(external, "utf8")).toBe("private external content\n");
-    expect(fs.lstatSync(path.join(recordsDir, `${workspaceId}.jsonl`)).isSymbolicLink()).toBe(false);
+    expect(fs.lstatSync(path.join(recordsDir, `${workspaceId}.jsonl`)).isSymbolicLink()).toBe(true);
   });
 
   it("retains at most 100 bounded records", () => {
@@ -143,4 +155,15 @@ describe("execution record boundary", () => {
     });
     expect(readExecutionRecords(workspaceId, 1)[0].changedFiles).toHaveLength(51);
   });
+});
+
+
+it.each([13, 10001, Number.MAX_SAFE_INTEGER])("persists high iteration %s without truncating it", iteration => {
+  fs.chmodSync(stateDir, 0o700);
+  const workspace = "a".repeat(24);
+  const record = { taskId: "same", iteration, changedFiles: null, tests: null, exitStatus: "ok" as const, timestamp: new Date().toISOString() };
+  appendExecutionRecord(workspace, record);
+  expect(readExecutionRecords(workspace)[0].iteration).toBe(iteration);
+  expect(readLegacySnapshot(workspace, "same").records).toEqual([record]);
+  expect(() => appendExecutionRecord(workspace, { ...record, iteration: Number.MAX_SAFE_INTEGER + 1 })).toThrow("Invalid execution iteration");
 });

@@ -153,6 +153,47 @@ and `workspace_info` does not enter this data path at all.
   for the same task/iteration is still idempotently readable; a later iteration
   for that old task fails closed with `TASK_CONTEXT_EXPIRED`.
 
+## Per-task execution restriction (A-01 source candidate)
+
+`codex_turn_start` accepts only `execution_mode: "read_only" | "workspace_write"`;
+omission means `read_only`. Unknown values, null, and extra authority fields are
+rejected. Manual writers must explicitly pass `workspace_write` on every start.
+Instructions, roles, personas and providers cannot select writer mode. Existing
+execution scope and approved workspace admission remain necessary.
+
+The runtime pins both thread and turn to the approved workspace cwd. Readers
+request a read-only thread and a `readOnly` turn policy with network disabled.
+Writers request workspace-write with no additional writable roots, network
+disabled, and both temporary-directory exclusions enabled. Thread configuration
+explicitly overrides inherited writer defaults. Before any turn, the effective
+thread cwd, approval policy, reviewer and sandbox must exactly match; unsupported
+responses fail closed. These are source/protocol checks, not kernel denial proof.
+
+Mode is bound to the task and each run, including retained results, child
+rollover and checkpoint continuations. Durable evidence uses the existing
+extension ledger; historical canonical journal grammar, request hashes and
+reconciliation hashes are preserved. Missing historical mode evidence permits
+only a reader ceiling. Corrupt, conflicting or uncommitted evidence cannot
+authorize continuation. Runtime caches remain bounded; the journal admission
+hooks provide durable identity across eviction and restart. A bare App Server
+instance without these hooks does not provide durable task identity.
+
+Reader command, file-change, permission and network approval requests terminate
+without a native dialog or an approval reply. Writers retain existing exact
+one-time native approvals and owner-configured destination-scoped network
+approval behavior; selecting writer mode adds no grant. Input/elicitation replies,
+notification acknowledgement, completion sounds and result reads remain separate
+from execution authority. A mode restriction does not sandbox arbitrary external
+MCP providers or replace the OS process sandbox.
+
+This is an architecture-impacting source candidate, not an activated release.
+HTTP regressions and isolated kernel-denial acceptance are still required.
+An integrating orchestrator such as Agent Fabric must retain its own lease/task
+binding and pass only the bound mode plus the approved workspace ID (and normal
+task/instruction fields). C2C does not create, infer, or substitute for Fabric
+leases. Historical writer inference and caller-supplied roots/config/network
+settings are unsupported.
+
 ## Deliberately absent automation
 
 C2C does not install Node.js, pnpm, `tunnel-client`, or `cloudflared`; create or
@@ -160,3 +201,26 @@ delete Platform tunnels; manipulate credentials; silently operate ChatGPT;
 change Codex sandbox configuration during setup; update its checkout; or claim
 that a connector is working based only on local state. The separate sandbox
 command offers a non-mutating `--check` before any approved edit.
+
+## Bounded reconciliation snapshot diagnostics
+
+This is an architecture-impacting additive diagnostic contract. Process evidence
+may include `snapshot_diagnostics`: a total issue count, up to eight entries
+within 16 KiB, and a truncation flag. The entire process evidence remains bounded
+to 64 KiB and its existing hash covers these fields. Each entry records the
+observation phase, a closed reason, PID, before/after process identities, safe
+canonical cwd when observed, and observation time. No argv, environment,
+credentials, prompts, conversation data or exception text is retained.
+
+Diagnostics describe observation changes, not historical ownership or execution
+authority. Existing snapshot, quiescence and writer gates are unchanged:
+incomplete or unstable coverage stays UNKNOWN and BLOCKED, including changes
+outside the workspace. Disappeared PIDs can remain diagnostic observations but
+never become live candidates. There is no automatic retry, approval, replay,
+resume or process termination. Native approval remains burn-before-reinspection.
+
+The optional fields are accepted through the existing bounded worker and
+extension-journal evidence path. Old records without diagnostics remain valid.
+A release whose strict reader does not support the added fields cannot be used
+as an unconditional rollback after they have been persisted; do not remove or
+rewrite journal evidence to make a downgrade work.

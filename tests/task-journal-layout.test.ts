@@ -15,9 +15,17 @@ afterEach(() => {
   if (previous === undefined) delete process.env.C2C_STATE_DIR; else process.env.C2C_STATE_DIR = previous;
 });
 function seed(target = alpha, completed = false) {
-  const j = new TaskJournal(alpha);
+  const j = new TaskJournal(target);
   try { j.begin(target, run, "fixture only"); if (completed) j.complete(target, { ...run, state: "completed", summary: "saved result" }); }
   finally { j.close(); }
+  // Construct an anchor-era layout explicitly, without bypassing current target binding.
+  if (target !== alpha) {
+    const source = path.join(state, "task-journal", `${target}.json`);
+    const bytes = fs.readFileSync(source);
+    const legacy = path.join(state, "task-journal", `${alpha}.json`);
+    fs.renameSync(source, legacy);
+    expect(fs.readFileSync(legacy)).toEqual(bytes);
+  }
   return path.join(state, "task-journal", `${alpha}.json`);
 }
 function fingerprint(dir: string) {

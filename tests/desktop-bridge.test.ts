@@ -65,6 +65,7 @@ describe("Desktop Agent trusted-tunnel bridge", () => {
     const desktopAgent = new FakeDesktopAgent();
 
     const bridge = await startBridge({
+      completionNotifier: () => undefined, runNotifier: async () => ({ outcome: "unavailable" }),
       workspaceRoot: root,
       port: 0,
       persistRuntime: false,
@@ -257,6 +258,7 @@ describe("Desktop Agent trusted-tunnel bridge", () => {
     isolateStateDir();
     const root = makeRoot("desktop-bridge-none");
     const bridge = await startBridge({
+      completionNotifier: () => undefined, runNotifier: async () => ({ outcome: "unavailable" }),
       workspaceRoot: root,
       port: 0,
       persistRuntime: false,

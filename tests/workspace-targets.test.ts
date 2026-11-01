@@ -68,17 +68,47 @@ it("captures targets across two clients and selection changes, including asynchr
   expect((await b("workspace_profiles")).selectedProfileId).toBe("beta");
 });
 
+it("Timeout Shield yields after one short poll while background Codex keeps running", async () => {
+  const s = await setup(); const call = await s.connect();
+  s.wait.mockResolvedValueOnce({ state: "running", task_id: "shield-task", iteration: 1, run_id: "a".repeat(32) });
+  const started = await call("codex_turn_start", { task_id: "shield-task", iteration: 1, instruction: "long task", workspace_id: s.alpha });
+  expect(started.state).toBe("running");
+  expect(started.timeout_shield).toBeUndefined();
+  const pending = await call("codex_turn_wait", { task_id: "shield-task", run_id: started.run_id, workspace_id: s.alpha });
+  expect(pending).toMatchObject({
+    state: "running",
+    timeout_shield: {
+      version: 1,
+      risk_detected: true,
+      yield_required: true,
+      reason: "background_work_active",
+      background_continues: true,
+      recommended_next_check_ms: 5_000,
+      resume_tool: "codex_turn_wait",
+      do_not_poll_again_in_same_response: true,
+      host_timeout_observable: false,
+    },
+  });
+  s.wait.mockResolvedValueOnce({ state: "completed", task_id: "shield-task", iteration: 1, run_id: started.run_id });
+  const finished = await call("codex_turn_wait", { task_id: "shield-task", run_id: started.run_id, workspace_id: s.alpha });
+  expect(finished.state).toBe("completed");
+  expect(finished.timeout_shield).toBeUndefined();
+});
+
 it("fails closed before child actions for missing/unknown targets, OAuth and insufficient scopes", async () => {
   const s = await setup(); const a = await s.connect();
-  const args = { task_id: "task", iteration: 1, instruction: "inspect", run_id: "a".repeat(32) };
+  const startArgs = { task_id: "task", iteration: 1, instruction: "inspect" };
+  const waitArgs = { task_id: "task", run_id: "a".repeat(32) };
   for (const name of ["codex_turn_start", "codex_turn_wait"]) {
+    const args = name === "codex_turn_start" ? startArgs : waitArgs;
     expect((await a(name, args)).error).toBe("WORKSPACE_ID_REQUIRED");
     expect((await a(name, { ...args, workspace_id: "0".repeat(24) })).error).toBe("WORKSPACE_ID_UNKNOWN");
   }
   const oauth = await s.connect({ ...auth, token: "oauth", clientId: "oauth" });
   const unscoped = await s.connect({ ...auth, scopes: [] });
   for (const name of ["workspace_info", "list_directory", "read_file", "search_workspace", "git_status", "git_diff", "test_status", "execution_summary", "network_fetch_image", "codex_turn_start", "codex_turn_wait"]) {
-    const input = { ...args, workspace_id: s.beta, path: "target.txt", query: "marker", url: "https://beta.example/image" };
+    const input = name === "codex_turn_start" ? { ...startArgs, workspace_id: s.beta }
+      : { ...waitArgs, workspace_id: s.beta, path: "target.txt", query: "marker", url: "https://beta.example/image" };
     expect((await oauth(name, input)).error).toBe("TRUSTED_TUNNEL_REQUIRED");
     expect((await unscoped(name, input)).error).toBe("INSUFFICIENT_SCOPE");
     expect((await a(name, { ...input, workspace_id: "0".repeat(24) })).error).toBe("WORKSPACE_ID_UNKNOWN");

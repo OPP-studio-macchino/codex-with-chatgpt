@@ -3,14 +3,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
-import { gitDiff, gitInfo, gitStatus } from "../src/workspace/git.js";
+import { gitDiff, gitInfo, gitStatus, runGit } from "../src/workspace/git.js";
 import { makeTmpDir, cleanup, write, makeGitRepo, git } from "./helpers.js";
 
 let repo: string;
 let plain: string;
 
 const UNSAFE_GIT_CONFIGURATION =
-  "UNSAFE_GIT_CONFIGURATION: Git inspection is disabled for this repository.";
+  "UNSAFE_GIT_CONFIGURATION";
 
 function commandQuote(value: string): string {
   const portable = process.platform === "win32" ? value.replaceAll("\\", "/") : value;
@@ -49,12 +49,20 @@ function externalObjectFixture(name: string): { isolated: string; external: stri
 
 function expectObjectStoreFailure(root: string, marker: string): void {
   const residues = snapshotResidueCount();
-  const status = gitStatus(root);
-  expect(status.isRepo).toBe(false);
-  expect(JSON.stringify(status)).not.toContain(marker);
+  expect(() => gitStatus(root)).toThrow();
   expect(() => gitDiff(root, { mode: "unstaged" })).toThrow();
   expect(snapshotResidueCount()).toBe(residues);
 }
+
+it("distinguishes genuinely absent metadata from a present malformed Git layout",()=>{
+ const root=makeTmpDir("git-read-layout");
+ try {
+   expect(gitStatus(root).isRepo).toBe(false);expect(gitDiff(root).isRepo).toBe(false);
+   write(root,".git","gitdir: /unverified-fixture\n");
+   expect(()=>gitStatus(root)).toThrow("GIT_READ_FAILED: layout: unverified");
+   expect(()=>gitDiff(root)).toThrow("GIT_READ_FAILED: layout: unverified");
+ } finally {cleanup(root);}
+});
 
 function snapshotResidueCount(): number {
   return fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith("c2c-git-snapshot-")).length;
@@ -63,6 +71,11 @@ function snapshotResidueCount(): number {
 beforeAll(() => {
   repo = makeTmpDir("git-repo");
   makeGitRepo(repo);
+  // Match the committed modes to the real filesystem, including volumes where
+  // init detects core.filemode=false. Production still reports raw mode changes.
+  git(repo, "config", "core.filemode", "true");
+  git(repo, "add", "--renormalize", ".");
+  git(repo, "commit", "--allow-empty", "-m", "align fixture modes");
   plain = makeTmpDir("not-a-repo");
   // The test-tmp dir lives inside this project's own git repo; stop git from
   // walking up so `plain` is genuinely outside any repository.
@@ -80,6 +93,17 @@ afterEach(() => {
 });
 
 describe("gitInfo", () => {
+  it("keeps raw mode evidence dirty even when content is unchanged", () => {
+    const isolated = makeTmpDir("git-raw-mode");
+    try {
+      makeGitRepo(isolated);
+      const executable = Boolean(fs.statSync(path.join(isolated, "hello.txt")).mode & 0o111);
+      git(isolated, "update-index", executable ? "--chmod=-x" : "--chmod=+x", "hello.txt");
+      git(isolated, "commit", "--allow-empty", "-m", "opposite index mode");
+      expect(gitInfo(isolated).dirty).toBe(true);
+      expect(gitStatus(isolated).unstaged.some(entry => entry.path === "hello.txt")).toBe(true);
+    } finally { cleanup(isolated); }
+  });
   it("reports branch, commit and dirty state", () => {
     const clean = gitInfo(repo);
     expect(clean.isRepo).toBe(true);
@@ -106,7 +130,7 @@ describe("gitInfo", () => {
     fs.symlinkSync(path.join(victim, ".git"), path.join(exposed, ".git"), "dir");
 
     expect(gitInfo(exposed).isRepo).toBe(false);
-    expect(gitDiff(exposed, { mode: "head" }).diff).not.toContain("must-not-leak");
+    expect(()=>gitDiff(exposed, { mode: "head" })).toThrow("GIT_READ_FAILED: layout: unverified");
     cleanup(exposed);
     cleanup(victim);
   });
@@ -121,7 +145,7 @@ describe("gitInfo", () => {
     write(exposed, ".git", `gitdir: ${path.join(victim, ".git")}\n`);
 
     expect(gitInfo(exposed).isRepo).toBe(false);
-    expect(gitDiff(exposed, { mode: "head" }).diff).not.toContain("must-not-leak");
+    expect(()=>gitDiff(exposed, { mode: "head" })).toThrow("GIT_READ_FAILED: layout: unverified");
     cleanup(exposed);
     cleanup(victim);
   });
@@ -153,6 +177,19 @@ describe("gitInfo", () => {
 });
 
 describe("gitStatus", () => {
+  it("enumerates nested untracked files without disclosing protected children", () => {
+    const isolated = makeTmpDir("git-nested-status");
+    try {
+      makeGitRepo(isolated);
+      write(isolated, "new-directory/visible.txt", "visible\n");
+      write(isolated, "new-directory/.env", "synthetic-value\n");
+      const status = gitStatus(isolated);
+      expect(status.untracked).toContain("new-directory/visible.txt");
+      expect(JSON.stringify(status)).not.toContain("new-directory/.env");
+      expect(JSON.stringify(status)).not.toContain("synthetic-value");
+      expect(status.redactedPathCount).toBeGreaterThan(0);
+    } finally { cleanup(isolated); }
+  });
   it("ignores AppleDouble sidecars in the private Git object snapshot", () => {
     const packDir = path.join(repo, ".git", "objects", "pack");
     fs.mkdirSync(packDir, { recursive: true });
@@ -199,14 +236,18 @@ describe("gitStatus", () => {
   it("bounds large status responses", () => {
     for (let index = 0; index < 510; index++) {
       write(repo, `bulk-${String(index).padStart(3, "0")}.txt`, "x\n");
+      write(repo, `._bulk-${String(index).padStart(3, "0")}.txt`, "synthetic metadata\n");
     }
     const status = gitStatus(repo);
     const returned =
       status.staged.length + status.unstaged.length + status.untracked.length + status.conflicted.length;
     expect(returned).toBe(500);
     expect(status.truncated).toBe(true);
+    expect(status.redactedPathCount).toBeGreaterThanOrEqual(510);
+    expect(JSON.stringify(status.untracked)).not.toContain("._bulk-");
     for (let index = 0; index < 510; index++) {
       fs.rmSync(path.join(repo, `bulk-${String(index).padStart(3, "0")}.txt`), { force: true });
+      fs.rmSync(path.join(repo, `._bulk-${String(index).padStart(3, "0")}.txt`), { force: true });
     }
   });
 
@@ -289,6 +330,38 @@ describe.skipIf(process.platform === "win32")("Git object-store containment", ()
 
   afterEach(() => cleanup(snapshotTemp));
 
+  it("preserves bounded info/exclude semantics inside hardened snapshots", () => {
+    const isolated = makeTmpDir("git-info-exclude");
+    makeGitRepo(isolated);
+    fs.mkdirSync(path.join(isolated, ".git", "info"), { recursive: true });
+    fs.writeFileSync(path.join(isolated, ".git", "info", "exclude"), "local-only/\n");
+    write(isolated, "local-only/a.txt", "a\n");
+    write(isolated, "local-only/b.txt", "b\n");
+
+    const status = gitStatus(isolated);
+    expect(status.isRepo).toBe(true);
+    expect(status.untracked.some(file => file.startsWith("local-only/"))).toBe(false);
+    const others = runGit(isolated, ["ls-files", "--others", "--exclude-standard", "-z"]);
+    expect(others.ok).toBe(true);
+    expect(others.stdout).not.toContain("local-only/");
+    cleanup(isolated);
+  });
+
+  it("fails closed when info/exclude cannot be safely snapshotted", () => {
+    const isolated = makeTmpDir("git-info-exclude-symlink");
+    const external = makeTmpDir("git-info-exclude-external");
+    makeGitRepo(isolated);
+    const exclude = path.join(isolated, ".git", "info", "exclude");
+    fs.rmSync(exclude, { force: true });
+    const outside = write(external, "exclude", "local-only/\n");
+    fs.symlinkSync(outside, exclude);
+    write(isolated, "local-only/a.txt", "a\n");
+
+    expect(() => gitStatus(isolated)).toThrow();
+    cleanup(isolated);
+    cleanup(external);
+  });
+
   it("constructs one private object snapshot per gitDiff call", () => {
     const isolated = makeTmpDir("git-diff-one-snapshot");
     makeGitRepo(isolated);
@@ -312,10 +385,10 @@ describe.skipIf(process.platform === "win32")("Git object-store containment", ()
     const residues = snapshotResidueCount();
     const clock = vi.spyOn(performance, "now");
 
-    clock.mockReturnValueOnce(0).mockReturnValue(251);
-    expect(gitStatus(isolated).isRepo).toBe(false);
-    clock.mockReset().mockReturnValueOnce(0).mockReturnValue(251);
-    expect(() => gitDiff(isolated, { mode: "unstaged" })).toThrow(UNSAFE_GIT_CONFIGURATION);
+    clock.mockReturnValueOnce(0).mockReturnValue(10001);
+    expect(() => gitStatus(isolated)).toThrow();
+    clock.mockReset().mockReturnValueOnce(0).mockReturnValue(10001);
+    expect(() => gitDiff(isolated, { mode: "unstaged" })).toThrow("GIT_SNAPSHOT_FAILED: exclude: budget_exhausted");
     expect(snapshotResidueCount()).toBe(residues);
     cleanup(isolated);
   });
@@ -325,12 +398,35 @@ describe.skipIf(process.platform === "win32")("Git object-store containment", ()
     makeGitRepo(fileCap);
     const entries = path.join(fileCap, ".git", "objects", "cap-fixture");
     fs.mkdirSync(entries);
-    for (let index = 0; index <= 20_000; index++) {
-      fs.closeSync(fs.openSync(path.join(entries, String(index)), "wx"));
-    }
+    const empty = write(fileCap, "empty-fixture", "");
+    const metadata = fs.statSync(empty);
     const residues = snapshotResidueCount();
     const clock = vi.spyOn(performance, "now").mockReturnValue(0);
-    expect(gitStatus(fileCap).isRepo).toBe(false);
+    // Simulate only the 20,001 empty object entries and their descriptors. The
+    // production traversal/counter and cleanup execute; no 20,001-file setup.
+    const originals = { readdir: fs.readdirSync, lstat: fs.lstatSync, stat: fs.statSync,
+      open: fs.openSync, fstat: fs.fstatSync, close: fs.closeSync, realpath: fs.realpathSync.native };
+    const virtual = (p: unknown) => typeof p === "string" && p.startsWith(`${entries}/`);
+    let copied = 0;
+    vi.spyOn(fs, "readdirSync").mockImplementation(((p: string, ...args: unknown[]) =>
+      p === path.dirname(entries) ? ["cap-fixture"] : p === entries
+        ? Array.from({ length: 20_001 }, (_, i) => String(i))
+        : (originals.readdir as Function)(p, ...args)) as typeof fs.readdirSync);
+    vi.spyOn(fs, "lstatSync").mockImplementation(((p: string, ...args: unknown[]) => virtual(p) ? metadata : (originals.lstat as Function)(p, ...args)) as typeof fs.lstatSync);
+    vi.spyOn(fs, "statSync").mockImplementation(((p: string, ...args: unknown[]) => virtual(p) ? metadata : (originals.stat as Function)(p, ...args)) as typeof fs.statSync);
+    vi.spyOn(fs, "openSync").mockImplementation(((p: string, ...args: unknown[]) => {
+      if (virtual(p)) { copied++; return -20001; }
+      if (String(p).includes("/objects/cap-fixture/")) return -20002;
+      return (originals.open as Function)(p, ...args);
+    }) as typeof fs.openSync);
+    vi.spyOn(fs, "fstatSync").mockImplementation(((fd: number, ...args: unknown[]) => fd === -20001 ? metadata : (originals.fstat as Function)(fd, ...args)) as typeof fs.fstatSync);
+    vi.spyOn(fs, "closeSync").mockImplementation(fd => { if (fd !== -20001 && fd !== -20002) originals.close(fd); });
+    vi.spyOn(fs.realpathSync, "native").mockImplementation(((p: string, ...args: unknown[]) => virtual(p) ? p : (originals.realpath as Function)(p, ...args)) as typeof fs.realpathSync.native);
+    // History queries retain the eager fallback and its original ceilings.
+    expect(() => runGit(fileCap, ["rev-list", "HEAD"])).toThrow("GIT_SNAPSHOT_FAILED: objects: file_limit");
+    expect(copied).toBe(20_000);
+    vi.restoreAllMocks();
+    expect(gitStatus(fileCap).isRepo).toBe(true);
     expect(snapshotResidueCount()).toBe(residues);
     cleanup(fileCap);
     clock.mockRestore();
@@ -340,7 +436,8 @@ describe.skipIf(process.platform === "win32")("Git object-store containment", ()
     const oversized = path.join(byteCap, ".git", "objects", "oversized");
     fs.closeSync(fs.openSync(oversized, "wx"));
     fs.truncateSync(oversized, 512 * 1024 * 1024 + 1);
-    expect(gitStatus(byteCap).isRepo).toBe(false);
+    expect(() => runGit(byteCap, ["rev-list", "HEAD"])).toThrow();
+    expect(gitStatus(byteCap).isRepo).toBe(true);
     expect(snapshotResidueCount()).toBe(residues);
     cleanup(byteCap);
   }, 30_000);
@@ -368,7 +465,7 @@ describe.skipIf(process.platform === "win32")("Git object-store containment", ()
       git(isolated, "gc", "--prune=now");
       const packDir = path.join(isolated, ".git", "objects", "pack");
       if (extension === "rev") {
-        const pack = fs.readdirSync(packDir).find((name) => name.endsWith(".pack"));
+        const pack = fs.readdirSync(packDir).find((name) => !name.startsWith("._") && name.endsWith(".pack"));
         git(isolated, "index-pack", "--rev-index", path.join(packDir, pack!));
       } else if (extension === "multi-pack-index") {
         git(isolated, "multi-pack-index", "write");
@@ -379,7 +476,7 @@ describe.skipIf(process.platform === "win32")("Git object-store containment", ()
         ? path.join(isolated, ".git", "objects", "info", extension)
         : extension === "multi-pack-index"
           ? path.join(packDir, extension)
-          : path.join(packDir, fs.readdirSync(packDir).find((name) => name.endsWith(`.${extension}`))!);
+          : path.join(packDir, fs.readdirSync(packDir).find((name) => !name.startsWith("._") && name.endsWith(`.${extension}`))!);
       expect(fs.existsSync(target)).toBe(true);
       expect(gitStatus(isolated).isRepo).toBe(true);
       expect(gitDiff(isolated, { mode: "unstaged" }).diff).toContain("inside workspace change");
@@ -521,7 +618,7 @@ describe("gitDiff pagination", () => {
         if (driver === "process") git(isolated, "config", "filter.hostile.required", "true");
         write(isolated, "hello.txt", `changed for ${driver}\n`);
 
-        expect(gitStatus(isolated).isRepo).toBe(false);
+        expect(() => gitStatus(isolated)).toThrow();
         expect(() => gitDiff(isolated, { mode: "unstaged" })).toThrow(UNSAFE_GIT_CONFIGURATION);
         expect(fs.existsSync(marker)).toBe(false);
         cleanup(isolated);
@@ -636,4 +733,48 @@ describe("gitDiff pagination", () => {
     const diff = gitDiff(plain, { mode: "unstaged" });
     expect(diff.isRepo).toBe(false);
   });
+});
+
+it.each(["unstaged", "staged", "head"] as const)("scoped %s diff ignores oversized unrelated object history and preserves index/worktree", mode => {
+  const root = makeTmpDir("scoped-history");
+  const previousBudget = process.env.C2C_GIT_SNAPSHOT_MS; process.env.C2C_GIT_SNAPSHOT_MS = "10000";
+  try {
+    makeGitRepo(root); write(root, "hello.txt", "scoped change\n");
+    if (mode !== "unstaged") git(root, "add", "hello.txt");
+    write(root, "untracked.txt", "keep me\n");
+    const unrelated = path.join(root, ".git", "objects", "unused-history");
+    const fd = fs.openSync(unrelated, "wx"); fs.ftruncateSync(fd, 513 * 1024 * 1024); fs.closeSync(fd);
+    const index = fs.readFileSync(path.join(root, ".git", "index"));
+    const diff = gitDiff(root, { mode }, "hello.txt");
+    expect(diff.diff).toContain("+scoped change");
+    expect(fs.readFileSync(path.join(root, ".git", "index"))).toEqual(index);
+    expect(fs.readFileSync(path.join(root, "untracked.txt"), "utf8")).toBe("keep me\n");
+    expect(fs.statSync(unrelated).size).toBe(513 * 1024 * 1024);
+  } finally { cleanup(root); if (previousBudget === undefined) delete process.env.C2C_GIT_SNAPSHOT_MS; else process.env.C2C_GIT_SNAPSHOT_MS = previousBudget; }
+});
+it("full and directory diffs ignore unrelated history using verified current objects", () => {
+  const root = makeTmpDir("diff-current-history");
+  try {
+    makeGitRepo(root);
+    write(root, "src/index.ts", "current diff\n");
+    const unrelated = path.join(root, ".git/objects/unused-history");
+    const fd = fs.openSync(unrelated, "wx"); fs.ftruncateSync(fd, 513 * 1024 * 1024); fs.closeSync(fd);
+    const index = fs.readFileSync(path.join(root, ".git/index"));
+    expect(gitDiff(root, { mode: "unstaged" }).diff).toContain("+current diff");
+    expect(gitDiff(root, { mode: "unstaged" }, "src").diff).toContain("+current diff");
+    expect(fs.readFileSync(path.join(root, ".git/index"))).toEqual(index);
+    expect(fs.statSync(unrelated).size).toBe(513 * 1024 * 1024);
+  } finally { cleanup(root); }
+});
+
+it("scoped packed nested-file diff uses installed native pack index parsing", () => {
+  const root = makeTmpDir("scoped-packed"), budget = process.env.C2C_GIT_SNAPSHOT_MS; process.env.C2C_GIT_SNAPSHOT_MS = "10000";
+  try {
+    makeGitRepo(root); write(root, "nested/file.txt", "original\n"); git(root, "add", "."); git(root, "commit", "-m", "fixture nested"); git(root, "gc", "--prune=now");
+    write(root, ".git/objects/pack/pack-" + "f".repeat(40) + ".idx", "unrelated invalid index must not be read");
+    write(root, "nested/file.txt", "packed change\n");
+    expect(gitDiff(root, { mode: "head" }, "nested/file.txt").diff).toContain("+packed change");
+    fs.unlinkSync(path.join(root, "nested/file.txt"));
+    expect(gitDiff(root, { mode: "head" }, "nested/file.txt").diff).toContain("-original");
+  } finally { cleanup(root); if (budget === undefined) delete process.env.C2C_GIT_SNAPSHOT_MS; else process.env.C2C_GIT_SNAPSHOT_MS = budget; }
 });

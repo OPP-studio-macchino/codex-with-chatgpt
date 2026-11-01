@@ -29,7 +29,7 @@ let b='',t=0,u=0;const send=v=>process.stdout.write(JSON.stringify(v)+'\\n');
 process.stdin.setEncoding('utf8');process.stdin.on('data',c=>{b+=c;while(b.includes('\\n')){
  const i=b.indexOf('\\n'),l=b.slice(0,i);b=b.slice(i+1);if(!l.trim())continue;const m=JSON.parse(l);
  if(m.method==='initialize')send({id:m.id,result:{userAgent:'fixture'}});
- if(m.method==='thread/start')send({id:m.id,result:{thread:{id:'t'+(++t)}}});
+ if(m.method==='thread/start')send({id:m.id,result:{cwd: m.params.cwd, approvalPolicy: "on-request", approvalsReviewer: "user", sandbox: m.params.sandbox === "read-only" ? { type: "readOnly", networkAccess: false } : { type: "workspaceWrite", writableRoots: [], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true }, thread:{id:'t'+(++t)}}});
  if(m.method==='turn/start'){
   fs.appendFileSync(${JSON.stringify(log)},'turn\\n');const id='u'+(++u),threadId=m.params.threadId;
   send({id:m.id,result:{turn:{id,status:'inProgress',items:[],error:null}}});
@@ -38,12 +38,13 @@ process.stdin.setEncoding('utf8');process.stdin.on('data',c=>{b+=c;while(b.inclu
 }});
 `);fs.chmodSync(binary,0o700);
  const tokenInfo=ensureTrustedTunnelToken(alpha.id),token=fs.readFileSync(tokenInfo.file,"utf8").trim();
- const evidence:ReconciliationEvidence={digest:"b".repeat(64),head:"c".repeat(40),fileCount:2,changedCount:1,processScope:"same-user-cwd",fileScope:"tracked-and-nonignored-untracked"};
+ const evidence:ReconciliationEvidence={digest:"b".repeat(64),head:"c".repeat(40),fileCount:2,changedCount:1,processScope:"same-user-cwd",fileScope:"git-index-status-and-dirty-worktree-excluding-appledouble"};
  const inspect=vi.fn(async()=>({...evidence}));let decision!:(d:OwnerDecision)=>void;
  const approve=vi.fn(()=>new Promise<OwnerDecision>(resolve=>{decision=resolve;}));
  async function connect(){
   const bridge=await startBridge({workspaceRoot:alpha.root,workspaceProfilesFile:config,port:0,persistRuntime:false,
    trustedTunnelTokenFile:tokenInfo.file,codexExecution:true,codexBinary:binary,authStoreFile:path.join(root,"auth.json"),
+   runNotifier:async()=>({outcome:"unavailable"}),completionNotifier:()=>undefined,
    reconciliationInspect:inspect,reconciliationApprove:approve});actions.push(()=>bridge.close());
   const client=new Client({name:"reconcile-test",version:"1"});
   await client.connect(new StreamableHTTPClientTransport(new URL(bridge.localBaseUrl()+"/mcp"),{requestInit:{headers:{[TRUSTED_TUNNEL_HEADER]:token}}}));

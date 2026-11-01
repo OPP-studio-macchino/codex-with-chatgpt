@@ -1,10 +1,11 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { nullLogger } from "../src/logger/index.js";
 import { createMcpServer } from "../src/mcp/server.js";
 import { Workspace } from "../src/workspace/manager.js";
+import { makeTmpDir, cleanup } from "./helpers.js";
 import {
   DesktopAgentError,
   type DesktopAgent,
@@ -21,13 +22,16 @@ class FakeDesktopAgent implements DesktopAgent {
     return { echoed: request };
   }
 }
+const fixtureRoots: string[] = [];
+afterEach(() => { for (const root of fixtureRoots.splice(0)) cleanup(root); });
 
 async function connect(
   desktopAgent?: DesktopAgent,
   authInfo?: AuthInfo
 ): Promise<{ client: Client; close: () => Promise<void> }> {
+  const root = makeTmpDir("desktop-mcp"); fixtureRoots.push(root);
   const server = createMcpServer({
-    workspace: new Workspace(process.cwd()),
+    workspace: new Workspace(root),
     logger: nullLogger,
     desktopAgent,
   });

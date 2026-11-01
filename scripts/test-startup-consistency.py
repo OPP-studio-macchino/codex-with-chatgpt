@@ -1,6 +1,7 @@
 """Synthetic launch configurations only; no network or service mutations."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import plistlib
 import subprocess
@@ -14,8 +15,9 @@ SECRET = 'DO_NOT_PRINT_CREDENTIAL_SENTINEL'
 
 class StartupConsistencyTests(unittest.TestCase):
     def setUp(self):
-        (REPO / '.tooling').mkdir(exist_ok=True)
-        self.temp = tempfile.TemporaryDirectory(prefix='startup-unit-', dir=REPO / '.tooling')
+        base = Path(os.environ.get('C2C_TEST_TMP_ROOT', REPO / '.tooling'))
+        base.mkdir(parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(prefix='startup-unit-', dir=base)
         self.root = Path(self.temp.name)
         release = self.root / 'release'
         entry = release / 'dist/cli/index.js'

@@ -183,9 +183,10 @@ Independently review iteration 4 via git_diff and reply PLAN or DONE.
 
 ## Loop limits
 
-Remote Codex execution is hard-capped at 12 iterations per task. The execution
-tools do not accept a higher iteration value, and configuration cannot raise
-that ceiling. Only one Codex turn may be active at a time. `codex_turn_wait`
+Remote Codex execution has no per-task iteration cap. Iterations are positive
+safe integers and must advance exactly once in the same task. The retired
+`C2C_CODEX_MAX_ITERATIONS` setting is ignored. Only one Codex turn may be active
+at a time. `codex_turn_wait`
 short-polls a retained local run for 1 second by default, configurable from
 250 ms up to a hard maximum of 3 seconds; a Codex turn is bounded to 20 minutes.
 

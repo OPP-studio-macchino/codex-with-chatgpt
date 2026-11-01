@@ -7,7 +7,7 @@ import type { CodexRunResult } from "../src/codex/app-server.js";
 
 const workspace = "a".repeat(24);
 const other = "b".repeat(24);
-const run: CodexRunResult = { task_id: "task", iteration: 1, run_id: "c".repeat(32), state: "running" };
+const run: CodexRunResult = { task_id: "task", iteration: 1, run_id: "c".repeat(32), state: "running", execution_mode: "read_only" };
 let dir: string;
 let original: string | undefined;
 let journals: TaskJournal[];
@@ -28,6 +28,29 @@ afterEach(() => {
 });
 
 describe("durable task journal", () => {
+  it("does not terminalize live input or persist its questions and reply token", () => {
+    const journal = open(); journal.begin(workspace, run, "work");
+    const before = fs.readFileSync(file(), "utf8");
+    journal.complete(workspace, { ...run, state: "blocked", reason: "user_input_required", resumable: true,
+      input_request_id: "d".repeat(32), questions: [{ id: "choice", header: "Choice", question: "Choose", isOther: true, options: [] }] });
+    expect(fs.readFileSync(file(), "utf8")).toBe(before);
+    expect(journal.recoveredRun(workspace, "task", run.run_id)).toBeNull();
+    journal.complete(workspace, { ...run, state: "completed", summary: "done" });
+    expect(journal.recoveredRun(workspace, "task", run.run_id)).toMatchObject({ state: "completed" });
+  });
+
+  it("requires recovery for old stripped user-input blocked records after restart", () => {
+    const first = open(); first.begin(workspace, run, "work"); first.close();
+    const snapshot = JSON.parse(fs.readFileSync(file(), "utf8"));
+    Object.assign(snapshot.runs[0], { state: "blocked", reason: "user_input_required" });
+    fs.writeFileSync(file(), JSON.stringify(snapshot));
+    const next = open();
+    expect(next.status(workspace)).toMatchObject({ tasks: [{ execution_state: "interrupted", outcome_known: false,
+      requires_reconciliation: true, can_resume_original_context: false }] });
+    expect(() => next.recoveredRun(workspace, "task", run.run_id)).toThrow("TASK RECOVERY REQUIRED");
+    expect(() => next.checkStart(workspace, "task", 1, "work")).toThrow("TASK RECOVERY REQUIRED");
+  });
+
   it("persists completion without waiting and replays without mutation", () => {
     const first = open();
     first.begin(workspace, run, "do work");
@@ -36,8 +59,8 @@ describe("durable task journal", () => {
     first.close();
     const before = fs.readFileSync(file(), "utf8");
     const next = open();
-    expect(next.checkStart(workspace, "task", 1, "do work")).toEqual(terminal);
-    expect(next.recoveredRun(workspace, "task", run.run_id)).toEqual(terminal);
+    expect(next.checkStart(workspace, "task", 1, "do work")).toEqual({ ...terminal, execution_mode: "read_only" });
+    expect(next.recoveredRun(workspace, "task", run.run_id)).toEqual({ ...terminal, execution_mode: "read_only" });
     next.complete(workspace, terminal);
     next.status(workspace);
     expect(fs.readFileSync(file(), "utf8")).toBe(before);
@@ -47,7 +70,7 @@ describe("durable task journal", () => {
   it("reports unknown interrupted outcomes and blocks orphaned workspace work", () => {
     const first = open(); first.begin(workspace, run, "work");
     expect(first.recoveredRun(workspace, "task", run.run_id)).toBeNull();
-    expect(first.checkStart(workspace, "task", 1, "work")).toEqual(run);
+    expect(first.checkStart(workspace, "task", 1, "work")).toEqual({ ...run, execution_mode: "read_only" });
     first.close();
     const next = open();
     expect(next.status(workspace)).toMatchObject({ tasks: [{ execution_state: "interrupted", outcome_known: false,
@@ -57,7 +80,9 @@ describe("durable task journal", () => {
     expect(() => next.checkStart(workspace, "new", 1, "work")).toThrow("WORKSPACE RECOVERY REQUIRED");
     expect(() => next.recoveredRun(workspace, "task", run.run_id)).toThrow("TASK RECOVERY REQUIRED");
     expect(() => next.complete(workspace, { ...run, state: "failed" })).toThrow("TASK RECOVERY REQUIRED");
-    expect(next.checkStart(other, "new", 1, "work")).toBeNull();
+    expect(() => next.checkStart(other, "new", 1, "work")).toThrow("TASK WORKSPACE MISMATCH");
+    const independent = new TaskJournal(other); journals.push(independent);
+    expect(independent.checkStart(other, "new", 1, "work")).toBeNull();
   });
 
   it("rejects changed requests, cross-workspace binding, duplicates and fabricated results", () => {
@@ -162,7 +187,7 @@ describe("durable task journal", () => {
     const journal = open();
     expect(() => journal.checkStart("../outside", "task", 1, "work")).toThrow();
     expect(() => journal.checkStart(workspace, "bad/task", 1, "work")).toThrow();
-    for (const turn of [0, 13, 1.5]) expect(() => journal.checkStart(workspace, "task", turn, "work")).toThrow();
+    for (const turn of [0, Number.MAX_SAFE_INTEGER + 1, 1.5, NaN, Infinity]) expect(() => journal.checkStart(workspace, "task", turn, "work")).toThrow();
     expect(() => journal.begin(workspace, { ...run, run_id: "bad" }, "work")).toThrow();
     for (const limit of [0, 51, NaN]) expect(() => journal.status(workspace, undefined, limit)).toThrow();
   });
@@ -199,4 +224,23 @@ describe("durable task journal", () => {
     journal.complete(workspace, { ...run, state: "completed" });
     expect(fs.existsSync(path.join(dir, "unused"))).toBe(false);
   });
+});
+
+it.each([
+  ["completed", undefined, "completion"],
+  ["blocked", "approval_required", "owner_attention"],
+  ["blocked", "user_input_required", "owner_attention"],
+  ["blocked", "mcp_elicitation_required", "owner_attention"],
+  ["failed", "child_exit", "owner_attention"],
+] as const)("durably deduplicates %s/%s notifications through reload", (state, reason, kind) => {
+  const first = open(); first.begin(workspace, run, "work");
+  const result = { ...run, state, ...(reason ? { reason } : {}) };
+  expect(first.recordNotification(workspace, result, "event")).toBe(true);
+  expect(first.recordNotification(workspace, result, "event")).toBe(false);
+  first.close();
+  const next = open();
+  expect(next.status(workspace)).toMatchObject({ tasks: [{ notifications: [
+    { event_id: "event", state, kind, reason: reason === "child_exit" ? "failed" : reason ?? state },
+  ] }] });
+  expect(next.recordNotification(workspace, result, "event")).toBe(false);
 });

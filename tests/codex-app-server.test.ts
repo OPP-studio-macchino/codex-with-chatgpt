@@ -1,10 +1,17 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as childProcess from "node:child_process";
 import { CodexAppServer, CodexAppServerError } from "../src/codex/app-server.js";
 import { nullLogger } from "../src/logger/index.js";
 import { cleanup, makeTmpDir } from "./helpers.js";
+
+vi.mock("node:child_process", async original => {
+  const actual = await original<typeof import("node:child_process")>();
+  return { ...actual, spawn: vi.fn(actual.spawn) };
+});
+const realSpawn = (await vi.importActual<typeof import("node:child_process")>("node:child_process")).spawn;
 
 const externalDirs: string[] = [];
 const workspaceDirs: string[] = [];
@@ -20,7 +27,7 @@ function makeWorkspace(): string {
   return dir;
 }
 
-function makeFakeBinary(ignoreSigterm = false): { binary: string; log: string } {
+function makeFakeBinary(ignoreSigterm = false, rejectConfig = false, threadOverrides = {}): { binary: string; log: string } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "c2c-fake-codex-"));
   externalDirs.push(dir);
   const binary = path.join(dir, "codex-fake.mjs");
@@ -53,8 +60,9 @@ process.stdin.on("data", (chunk) => {
     }
     if (message.method === "initialized") continue;
     if (message.method === "thread/start") {
+      ${rejectConfig ? 'send({ id: message.id, error: { code: -32602, message: "Unsupported feature config" } }); continue;' : ""}
       const id = "thread-" + process.pid + "-" + (++threadCounter);
-      send({ id: message.id, result: { thread: { id } } });
+      send({ id: message.id, result: { cwd: message.params.cwd, approvalPolicy: "on-request", approvalsReviewer: "user", sandbox: message.params.sandbox === "read-only" ? { type: "readOnly", networkAccess: false } : { type: "workspaceWrite", writableRoots: [], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true }, thread: { id }, ...${JSON.stringify(threadOverrides)} } });
       continue;
     }
     if (message.method === "turn/start") {
@@ -119,15 +127,62 @@ async function completed(
   client: CodexAppServer,
   task: string,
   iteration: number,
-  instruction: string
+  instruction: string,
+  executionMode?: "read_only" | "workspace_write"
 ) {
-  const started = await client.startTurn(task, iteration, instruction);
+  const started = await client.startTurn(task, iteration, instruction, executionMode);
   const result = await client.wait(task, started.run_id);
   expect(result.state).toBe("completed");
   return result;
 }
 
 describe("Codex App Server execution boundary", () => {
+  it.each([null, "writer", "read-only", "", true, 1, [], { execution_mode: "workspace_write" }])("rejects malformed direct and checkpoint modes before admission: %j", async mode => {
+    const fake = makeFakeBinary(), client = makeClient(makeWorkspace(), fake.binary);
+    let admitted = false;
+    try {
+      await expect(client.startTurn("bad-mode", 1, "write files", mode as any)).rejects.toMatchObject({ code: "INVALID_EXECUTION_MODE" });
+      await expect(client.startCheckpointTurn("bad-mode", 2, "write files", () => { admitted = true; }, mode as any)).rejects.toMatchObject({ code: "INVALID_EXECUTION_MODE" });
+      expect(admitted).toBe(false);
+      expect(readLog(fake.log)).toEqual([]);
+    } finally { await client.close(); }
+  });
+
+  it.each(["read_only", "workspace_write"] as const)("binds duplicates, iterations and checkpoint starts to %s", async mode => {
+    const fake = makeFakeBinary(), client = makeClient(makeWorkspace(), fake.binary);
+    try {
+      const first = await completed(client, "bound-mode", 1, "role: writer; instruction: modify all files", mode);
+      expect(await client.startTurn("bound-mode", 1, "ignored duplicate", mode)).toEqual(first);
+      const other = mode === "read_only" ? "workspace_write" : "read_only";
+      for (const iteration of [1, 2]) {
+        await expect(client.startTurn("bound-mode", iteration, "continue", other)).rejects.toMatchObject({ code: "EXECUTION_MODE_MISMATCH" });
+      }
+      let admitted = false;
+      await expect(client.startCheckpointTurn("bound-mode", 2, "continue", () => { admitted = true; }, other)).rejects.toMatchObject({ code: "EXECUTION_MODE_MISMATCH" });
+      expect(admitted).toBe(false);
+      expect(readLog(fake.log).filter(e => e.value.method === "turn/start")).toHaveLength(1);
+    } finally { await client.close(); }
+  });
+
+  it.each([
+    { sandbox: null }, { sandbox: { type: "dangerFullAccess" } },
+    { sandbox: { type: "readOnly", networkAccess: true } },
+    { sandbox: { type: "readOnly", networkAccess: false, writableRoots: ["/tmp"] } },
+    { sandbox: { type: "workspaceWrite", writableRoots: ["/tmp"], networkAccess: false, excludeTmpdirEnvVar: true, excludeSlashTmp: true } },
+    { sandbox: { type: "workspaceWrite", writableRoots: [], networkAccess: true, excludeTmpdirEnvVar: true, excludeSlashTmp: true } },
+    { sandbox: { type: "workspaceWrite", writableRoots: [], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false } },
+    { cwd: "/unrelated" }, { approvalsReviewer: "auto_review" }, { approvalPolicy: "never" },
+  ])("rejects unverified effective thread response without a turn or fallback: %j", async overrides => {
+    for (const mode of ["read_only", "workspace_write"] as const) {
+      const fake = makeFakeBinary(false, false, overrides), client = makeClient(makeWorkspace(), fake.binary);
+      try {
+        await expect(client.startTurn("bad-policy", 1, "inspect", mode)).rejects.toMatchObject({ code: "UNSUPPORTED_SANDBOX_POLICY" });
+        expect(readLog(fake.log).filter(e => e.value.method === "thread/start")).toHaveLength(1);
+        expect(readLog(fake.log).some(e => e.value.method === "turn/start")).toBe(false);
+      } finally { await client.close(); }
+    }
+  });
+
   it("uses economy defaults for local limits and summaries", async () => {
     await withEnv({
       C2C_CODEX_MAX_INSTRUCTION_BYTES: undefined,
@@ -140,9 +195,11 @@ describe("Codex App Server execution boundary", () => {
       const fake = makeFakeBinary();
       const client = makeClient(workspace, fake.binary);
       try {
-        await expect(client.startTurn("default-iterations", 5, "nope")).rejects.toMatchObject({
-          code: "INVALID_ITERATION",
-        } satisfies Partial<CodexAppServerError>);
+        for (let iteration = 1; iteration <= 14; iteration++) {
+          expect(await completed(client, "default-iterations", iteration, "continue")).toMatchObject({ state: "completed", iteration });
+        }
+        expect(readLog(fake.log).filter(entry => entry.value.method === "thread/start")).toHaveLength(1);
+        await expect(client.startTurn("default-iterations", 16, "skip")).rejects.toMatchObject({ code: "INVALID_ITERATION" });
         await expect(client.startTurn("default-bytes", 1, "x".repeat(8 * 1024 + 1))).rejects.toMatchObject({
           code: "INVALID_INSTRUCTION",
         } satisfies Partial<CodexAppServerError>);
@@ -203,9 +260,7 @@ describe("Codex App Server execution boundary", () => {
         logger: { warn: (message: string) => warnings.push(message) } as unknown as typeof nullLogger,
       });
       try {
-        await expect(client.startTurn("invalid", 5, "nope")).rejects.toMatchObject({
-          code: "INVALID_ITERATION",
-        } satisfies Partial<CodexAppServerError>);
+        for (let iteration = 1; iteration <= 5; iteration++) await completed(client, "invalid", iteration, "continue");
         expect(warnings).toEqual(["Invalid C2C Codex economy configuration; safe defaults applied."]);
       } finally {
         await client.close();
@@ -241,29 +296,40 @@ describe("Codex App Server execution boundary", () => {
     });
   });
 
-  it("enforces the remote thread and turn policy floor", async () => {
+  it.each([undefined, "read_only", "workspace_write"] as const)("enforces exact thread and turn policies for %s (mock protocol only)", async mode => {
     const workspace = makeWorkspace();
     const fake = makeFakeBinary();
     const client = makeClient(workspace, fake.binary);
     try {
-      const result = await completed(client, "task-policy", 1, "hello");
+      const result = await completed(client, "task-policy", 1, "hello", mode);
+      expect(result.execution_mode).toBe(mode ?? "read_only");
       expect(result.summary).toContain("done:Execution contract:");
       expect(result.summary).toContain("hello");
       const messages = readLog(fake.log).map((entry) => entry.value);
       const thread = messages.find((value) => value.method === "thread/start") as any;
       const turn = messages.find((value) => value.method === "turn/start") as any;
-      expect(thread.params).toMatchObject({
+      expect(thread.params).toEqual({
         cwd: workspace,
         approvalPolicy: "on-request",
         approvalsReviewer: "user",
-        sandbox: "read-only",
+        sandbox: mode === "workspace_write" ? "workspace-write" : "read-only",
         ephemeral: true,
+        config: {
+          "features.exec_permission_approvals": true,
+          "features.default_mode_request_user_input": true,
+          "sandbox_workspace_write.writable_roots": [],
+          "sandbox_workspace_write.network_access": false,
+          "sandbox_workspace_write.exclude_tmpdir_env_var": true,
+          "sandbox_workspace_write.exclude_slash_tmp": true,
+        },
       });
-      expect(turn.params).toMatchObject({
+      expect(turn.params).toEqual({
+        threadId: turn.params.threadId,
+        input: [{ type: "text", text: turn.params.input[0].text, text_elements: [] }],
         cwd: workspace,
         approvalPolicy: "on-request",
         approvalsReviewer: "user",
-        sandboxPolicy: {
+        sandboxPolicy: mode !== "workspace_write" ? { type: "readOnly", networkAccess: false } : {
           type: "workspaceWrite",
           writableRoots: [],
           networkAccess: false,
@@ -272,6 +338,40 @@ describe("Codex App Server execution boundary", () => {
         },
       });
       expect(messages.some((value) => value.method === "thread/delete")).toBe(false);
+      await completed(client, "task-policy", 2, "next", mode);
+      expect(readLog(fake.log).filter((entry) => entry.value.method === "thread/start")).toHaveLength(1);
+      const checkpoint = await client.startCheckpointTurn("checkpoint-policy", 2, "checkpoint", () => {}, mode);
+      expect((await client.wait("checkpoint-policy", checkpoint.run_id)).state).toBe("completed");
+      const threads = readLog(fake.log).filter((entry) => entry.value.method === "thread/start");
+      expect(threads).toHaveLength(2);
+      expect(threads[1]!.value.params).toEqual(thread.params);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("fails closed when thread feature config is rejected", async () => {
+    const workspace = makeWorkspace();
+    const fake = makeFakeBinary(false, true);
+    const client = makeClient(workspace, fake.binary);
+    try {
+      await expect(client.startTurn("rejected-config", 1, "hello")).rejects.toThrow("Codex App Server request failed.");
+      const messages = readLog(fake.log).map((entry) => entry.value);
+      const threads = messages.filter((value) => value.method === "thread/start");
+      expect(threads).toHaveLength(1);
+      expect(threads[0]!.params).toEqual({
+        cwd: workspace, approvalPolicy: "on-request", approvalsReviewer: "user",
+        sandbox: "read-only", ephemeral: true,
+        config: {
+          "features.exec_permission_approvals": true,
+          "features.default_mode_request_user_input": true,
+          "sandbox_workspace_write.writable_roots": [],
+          "sandbox_workspace_write.network_access": false,
+          "sandbox_workspace_write.exclude_tmpdir_env_var": true,
+          "sandbox_workspace_write.exclude_slash_tmp": true,
+        },
+      });
+      expect(messages.filter((value) => value.method === "turn/start")).toEqual([]);
     } finally {
       await client.close();
     }
@@ -288,6 +388,21 @@ describe("Codex App Server execution boundary", () => {
       }
       const logs = readLog(fake.log);
       const threadStarts = logs.filter((entry) => entry.value.method === "thread/start");
+      expect(threadStarts).toHaveLength(9);
+      for (const entry of threadStarts) {
+        expect(entry.value.params).toEqual({
+          cwd: workspace, approvalPolicy: "on-request", approvalsReviewer: "user",
+          sandbox: "read-only", ephemeral: true,
+          config: {
+            "features.exec_permission_approvals": true,
+            "features.default_mode_request_user_input": true,
+            "sandbox_workspace_write.writable_roots": [],
+            "sandbox_workspace_write.network_access": false,
+            "sandbox_workspace_write.exclude_tmpdir_env_var": true,
+            "sandbox_workspace_write.exclude_slash_tmp": true,
+          },
+        });
+      }
       const perPid = new Map<number, number>();
       for (const entry of threadStarts) {
         perPid.set(entry.pid, (perPid.get(entry.pid) ?? 0) + 1);
@@ -319,6 +434,10 @@ describe("Codex App Server execution boundary", () => {
       await expect(client.wait("bulk-100", runIds.at(-1)!)).resolves.toMatchObject({
         state: "completed",
       });
+      let admitted = false;
+      await expect(client.startCheckpointTurn("bulk-1", 2, "continue", () => { admitted = true; }, "workspace_write"))
+        .rejects.toMatchObject({ code: "EXECUTION_MODE_MISMATCH" });
+      expect(admitted).toBe(false);
       const threadStarts = readLog(fake.log).filter((entry) => entry.value.method === "thread/start");
       const perPid = new Map<number, number>();
       for (const entry of threadStarts) {
@@ -336,24 +455,42 @@ describe("Codex App Server execution boundary", () => {
     const workspace = makeWorkspace();
     const fake = makeFakeBinary(true);
     const client = makeClient(workspace, fake.binary);
+    const owned: Array<{ child: childProcess.ChildProcess; closed: Promise<void> }> = [];
+    const observation = vi.mocked(childProcess.spawn).mockImplementation((...args: Parameters<typeof realSpawn>) => {
+      const child = realSpawn(...args);
+      if (args[0] === fake.binary) owned.push({ child, closed: new Promise(resolve => child.once("close", () => resolve())) });
+      return child;
+    });
     try {
       for (let i = 1; i <= 9; i++) await completed(client, `stop-${i}`, 1, "ok");
       let pids = [...new Set(readLog(fake.log).map((entry) => entry.pid))];
       expect(pids).toHaveLength(2);
-      expect(() => process.kill(pids[0]!, 0)).toThrow();
+      expect(owned).toHaveLength(2);
+      await owned[0]!.closed;
+      expect(owned[0]!.child.signalCode).toBe("SIGKILL");
 
       const started = await client.startTurn("stop-9", 2, "APPROVAL");
       expect(await client.wait("stop-9", started.run_id)).toMatchObject({ state: "blocked" });
       await completed(client, "after-block", 1, "ok");
       pids = [...new Set(readLog(fake.log).map((entry) => entry.pid))];
       expect(pids).toHaveLength(3);
-      expect(() => process.kill(pids[1]!, 0)).toThrow();
+      expect(owned).toHaveLength(3);
+      await owned[1]!.closed;
+      expect(owned[1]!.child.signalCode).toBe("SIGKILL");
       await client.close();
-      for (const pid of pids) expect(() => process.kill(pid, 0)).toThrow();
+      await Promise.all(owned.map(entry => entry.closed));
+      expect(owned.map(entry => entry.child.pid)).toEqual(pids);
+      for (const { child } of owned) expect(child.signalCode).toBe("SIGKILL");
     } finally {
-      await client.close().catch(() => undefined);
-      for (const pid of new Set(readLog(fake.log).map((entry) => entry.pid))) {
-        try { process.kill(pid, "SIGKILL"); } catch { /* Already reaped. */ }
+      try {
+        await client.close();
+      } finally {
+        try {
+          for (const { child } of owned) {
+            if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+          }
+          await Promise.all(owned.map(entry => entry.closed));
+        } finally { observation.mockImplementation(realSpawn); }
       }
     }
   }, 10_000);
@@ -402,7 +539,7 @@ describe("Codex App Server execution boundary", () => {
     const fake = makeFakeBinary();
     const client = makeClient(workspace, fake.binary);
     try {
-      const approvalStart = await client.startTurn("approval-task", 1, "APPROVAL");
+      const approvalStart = await client.startTurn("approval-task", 1, "APPROVAL", "workspace_write");
       const approval = await client.wait("approval-task", approvalStart.run_id);
       expect(approval).toMatchObject({ state: "blocked", reason: "approval_required" });
 
@@ -466,5 +603,29 @@ describe("Codex App Server execution boundary", () => {
     } finally {
       await client.close();
     }
+  });
+});
+
+describe("background run transitions", () => {
+  it.each([
+    ["ok", "completed", undefined],
+    ["APPROVAL", "blocked", "approval_required"],
+    ["UNKNOWN", "blocked", "unknown_server_request"],
+    ["EXIT", "failed", "child_exit"],
+  ])("notifies %s without polling and never repeats on polls", async (instruction, state, reason) => {
+    const fake = makeFakeBinary();
+    const events: Array<{ state: string; reason?: string }> = [];
+    const client = new CodexAppServer({ workspaceRoot: makeWorkspace(), binary: fake.binary, logger: nullLogger,
+      onRunNotification: run => { events.push(run); } });
+    try {
+      const run = await client.startTurn("notify", 1, instruction!, instruction === "APPROVAL" ? "workspace_write" : undefined);
+      const deadline = Date.now() + 3000;
+      while (!events.length && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ state, ...(reason ? { reason } : {}) });
+      await client.wait("notify", run.run_id);
+      await client.wait("notify", run.run_id);
+      expect(events).toHaveLength(1);
+    } finally { await client.close(); }
   });
 });

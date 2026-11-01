@@ -138,6 +138,14 @@ recovery backup when a config already exists. Run the modifying form only after
 showing the paths and receiving approval. It is not required to inspect or
 build the project.
 
+## Register or unregister a project (only when the host exposes the tools)
+
+For an explicit request to add a project, call the host-provided workspace_register_start; wait for the Mac owner to select the folder and grant access, then read workspace_register_status. Never ask the user to edit JSON or provide an internal ID.
+
+For an explicit request to stop access to a registered project, obtain the profile ID through workspace_profiles and call workspace_unregister_start with profile_id only if the tool is exposed. Read workspace_unregister_status with registration_id afterward. A Mac-native confirmation is mandatory and default-deny; do not supply a path, synthesize consent, or confuse a pending result with approval. Only the registration is removed; do not delete project files or task history. Respect default/anchor, selected, active and unknown-state safeguards.
+
+These tool names reflect the candidate implementation, not a guarantee that a given ChatGPT host has exposed them. Missing tools require a supported connection/release action, not a substitute remote shell.
+
 ## Planning and review loop
 
 Use one saved conversation per workspace when practical, but do not create,
@@ -166,6 +174,27 @@ Do not put raw logs, provider payloads, secrets, personal data, or sensitive
 paths in `--tests` or `--notes`.
 
 ## Diagnosis
+
+`codex_turn_approval_status` is read-only (`execution.read`). A live
+`approval_required` result with `resumable:true` waits for a local native Git
+decision; continue polling the same run. Never send approval through
+`codex_turn_reply`, which accepts question answers only. Terminal blocked runs
+remain nonresumable. The candidate supports only its exact hermetic Git prefix,
+explicit file paths and inline local filesystem scope; metadata is not proof of
+native UI visibility or actual sandbox enforcement.
+For the fixed Git route, request `exec_command` with `shell:'/bin/sh'`,
+`login:false`, `tty:false`, canonical `workdir`, the exact inner `cmd` and the
+same `.git`-only permissions. Only the exact `/bin/sh -c "<inner>"` presentation
+is additionally supported; zsh/bash and other wrappers remain unsupported.
+
+`test_status` retains the latest task's explicit test result. Its independent
+`owner_validation` branch reads a private fixed-owner-runner receipt; it does not
+run tests, upload evidence, or attach owner results to the latest task. Check
+`current_match` and `stale` before using historical counts. Unavailable or stale
+evidence must never be reported as a current candidate PASS.
+Owner evidence reports explicit `counts` and `test_files` from the fixed test
+command. A claimed PASS without complete file counts is unavailable, not upgraded
+from source-tree file counts. Mocked tests do not establish native enforcement.
 
 ```text
 c2c status -w <workspace> --json

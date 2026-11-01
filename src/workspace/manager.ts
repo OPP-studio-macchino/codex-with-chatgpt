@@ -68,7 +68,6 @@ export interface VerifiedDirectory {
 
 export interface ProjectConfig {
   name?: string;
-  maxIterations?: number;
 }
 
 export interface ProjectInfo {
@@ -152,14 +151,6 @@ function loadProjectConfig(root: string): ProjectConfig {
       .replace(/\s+/g, " ")
       .trim();
     if (name) config.name = redactAndTruncate(name, 100).text;
-  }
-  if (
-    typeof raw.maxIterations === "number" &&
-    Number.isInteger(raw.maxIterations) &&
-    raw.maxIterations >= 1 &&
-    raw.maxIterations <= 100
-  ) {
-    config.maxIterations = raw.maxIterations;
   }
   return config;
 }
@@ -658,9 +649,17 @@ export class Workspace {
       else if (await has("package-lock.json")) packageManager = "npm";
     }
     if (await has("tsconfig.json")) languages.add("TypeScript");
-    if ((await has("pyproject.toml")) || (await has("requirements.txt")) || (await has("setup.py"))) {
+    const hasDjangoProject = await has("manage.py");
+    const hasPythonProject =
+      hasDjangoProject || (await has("pyproject.toml")) || (await has("requirements.txt")) || (await has("setup.py"));
+    if (hasPythonProject) {
       languages.add("Python");
-      if (projectType === "unknown") projectType = "python";
+      if (hasDjangoProject) {
+        frameworks.add("Django");
+        projectType = "python";
+      } else if (projectType === "unknown") {
+        projectType = "python";
+      }
     }
     if (await has("Cargo.toml")) {
       languages.add("Rust");
