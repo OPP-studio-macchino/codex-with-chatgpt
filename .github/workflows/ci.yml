@@ -22,9 +22,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      C2C_TEST_TMP_ROOT: ${{ runner.temp }}/c2c-test-fixtures
-      C2C_STATE_DIR: ${{ runner.temp }}/c2c-state
-      C2C_RECONCILIATION_TEST_BUILD: ${{ github.workspace }}/dist
       C2C_GIT_SNAPSHOT_MS: '10000'
     strategy:
       fail-fast: false
@@ -56,7 +53,11 @@ jobs:
         run: pnpm build
 
       - name: Prepare isolated test directories
-        run: mkdir -p "$C2C_TEST_TMP_ROOT" "$C2C_STATE_DIR"
+        run: |
+          mkdir -p "$RUNNER_TEMP/c2c-test-fixtures" "$RUNNER_TEMP/c2c-state"
+          echo "C2C_TEST_TMP_ROOT=$RUNNER_TEMP/c2c-test-fixtures" >> "$GITHUB_ENV"
+          echo "C2C_STATE_DIR=$RUNNER_TEMP/c2c-state" >> "$GITHUB_ENV"
+          echo "C2C_RECONCILIATION_TEST_BUILD=$GITHUB_WORKSPACE/dist" >> "$GITHUB_ENV"
 
       - name: Linux-compatible Vitest suites (macOS-only suites gated separately)
         run: |
