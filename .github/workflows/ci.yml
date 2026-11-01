@@ -18,9 +18,14 @@ concurrency:
 
 jobs:
   validate:
-    name: Node ${{ matrix.node }}
+    name: Node ${{ matrix.node }} (Linux-compatible)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      C2C_TEST_TMP_ROOT: ${{ runner.temp }}/c2c-test-fixtures
+      C2C_STATE_DIR: ${{ runner.temp }}/c2c-state
+      C2C_RECONCILIATION_TEST_BUILD: ${{ github.workspace }}/dist
+      C2C_GIT_SNAPSHOT_MS: '10000'
     strategy:
       fail-fast: false
       matrix:
@@ -47,11 +52,23 @@ jobs:
       - name: Typecheck
         run: pnpm typecheck
 
-      - name: Test
-        run: pnpm test
-
-      - name: Build
+      - name: Build compiled Git worker for test runner
         run: pnpm build
+
+      - name: Prepare isolated test directories
+        run: mkdir -p "$C2C_TEST_TMP_ROOT" "$C2C_STATE_DIR"
+
+      - name: Linux-compatible Vitest suites (macOS-only suites gated separately)
+        run: |
+          # Five excluded suites test macOS-specific native approval, Git publish
+          # and ps/lsof process identity; macOS RC2 testing covers all 102 files.
+          # Do not claim those suites were run on Ubuntu.
+          pnpm exec vitest run --maxWorkers=2 \
+            --exclude tests/codex-approval-scope.test.ts \
+            --exclude tests/git-publish.test.ts \
+            --exclude tests/git-push-recovery.test.ts \
+            --exclude tests/local-approval.test.ts \
+            --exclude tests/reconciliation-processes.test.ts
 
       - name: Validate Skill consent boundaries
         run: pnpm validate:skill
